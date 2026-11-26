@@ -1,5 +1,6 @@
 use crate::ctl_proto::{CtlEnvelope, CtlResponse};
 use crate::service_proto::{ServiceEnvelope, ServiceResponse};
+#[cfg(windows)]
 use crate::WINDOWS_PIPE_SDDL;
 use anyhow::{anyhow, Context, Result};
 use std::future::Future;
@@ -8,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
+#[cfg(windows)]
+use tracing::warn;
 
 /// Access-control policy applied to a local IPC listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -622,7 +622,7 @@ fn extract_singbox_from_targz(bytes: &[u8]) -> Result<Vec<u8>> {
                 !line.is_empty()
                     && !line.contains("..")
                     && !line.starts_with('/')
-                    && (line == "sing-box" || line.ends_with("/sing-box"))
+                    && (*line == "sing-box" || line.ends_with("/sing-box"))
             })
             .ok_or_else(|| anyhow!("sing-box binary not found inside tar.gz archive"))?
             .to_string();

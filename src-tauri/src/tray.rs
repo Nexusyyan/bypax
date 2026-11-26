@@ -162,7 +162,7 @@ fn load_tray_icon(active: bool, warn: bool) -> Option<(Image<'static>, bool)> {
         } else {
             (TRAY_TEMPLATE_IDLE, true)
         };
-        return Image::from_bytes(bytes).ok().map(|img| (img, as_template));
+        Image::from_bytes(bytes).ok().map(|img| (img, as_template))
     }
 
     #[cfg(not(target_os = "macos"))]

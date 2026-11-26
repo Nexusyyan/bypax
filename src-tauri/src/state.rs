@@ -1513,24 +1513,27 @@ impl AppState {
         #[cfg(all(unix, not(target_os = "macos")))]
         {
             let _ = svc_bin;
-            return Err(format!(
+            Err(format!(
                 "Privileged service action '{}' is not automated on this OS; run bypax-service daemon-run manually",
                 action
-            ));
+            ))
         }
 
-        // Poll until connected for start / restart / start_worker / install.
-        if matches!(action, "install" | "start" | "restart" | "start_worker") {
-            for _ in 0..16 {
-                let st = self.query_service_status().await;
-                if st.connected {
-                    return Ok(st);
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            // Poll until connected for start / restart / start_worker / install.
+            if matches!(action, "install" | "start" | "restart" | "start_worker") {
+                for _ in 0..16 {
+                    let st = self.query_service_status().await;
+                    if st.connected {
+                        return Ok(st);
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(250)).await;
             }
-        }
 
-        Ok(self.query_service_status().await)
+            Ok(self.query_service_status().await)
+        }
     }
 
     pub fn shutdown_cleanly(&self) {

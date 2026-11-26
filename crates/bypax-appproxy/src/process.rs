@@ -625,23 +625,13 @@ fn take_os_process_snapshot() -> HashMap<u32, ProcessInfo> {
     map
 }
 
-// --- macOS Process Implementation (libproc proc_pidpath + sysctl kp_eproc.e_ppid) ---
-
-#[cfg(target_os = "macos")]
-extern "C" {
-    fn proc_pidpath(
-        pid: libc::c_int,
-        buffer: *mut libc::c_void,
-        buffersize: u32,
-    ) -> libc::c_int;
-}
+// --- macOS Process Implementation (libproc proc_pidpath + proc_pidinfo + proc_listallpids) ---
 
 #[cfg(target_os = "macos")]
 fn macos_proc_path(pid: u32) -> Option<String> {
-    const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
-    let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let ret = unsafe {
-        proc_pidpath(
+        libc::proc_pidpath(
             pid as libc::c_int,
             buf.as_mut_ptr().cast::<libc::c_void>(),
             buf.len() as u32,
@@ -651,7 +641,9 @@ fn macos_proc_path(pid: u32) -> Option<String> {
         return None;
     }
     let slice = &buf[..(ret as usize).min(buf.len())];
-    let s = String::from_utf8_lossy(slice).trim_end_matches('\0').to_string();
+    let s = String::from_utf8_lossy(slice)
+        .trim_end_matches('\0')
+        .to_string();
     if s.is_empty() {
         None
     } else {
@@ -661,32 +653,28 @@ fn macos_proc_path(pid: u32) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn query_single_process(pid: u32) -> Option<ProcessInfo> {
-    let mut mib: [libc::c_int; 4] = [
-        libc::CTL_KERN,
-        libc::KERN_PROC,
-        libc::KERN_PROC_PID,
-        pid as libc::c_int,
-    ];
-    let mut kp: libc::kinfo_proc = unsafe { std::mem::zeroed() };
-    let mut size = std::mem::size_of::<libc::kinfo_proc>();
-    let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as libc::c_uint,
-            (&mut kp as *mut libc::kinfo_proc).cast::<libc::c_void>(),
-            &mut size,
-            std::ptr::null_mut(),
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
             0,
+            (&mut info as *mut libc::proc_bsdinfo).cast::<libc::c_void>(),
+            size,
         )
     };
-    if rc != 0 || size == 0 {
+    if ret <= 0 {
         return None;
     }
-    let parent_pid = kp.kp_eproc.e_ppid.max(0) as u32;
+    let parent_pid = info.pbi_ppid;
     let exe_path = macos_proc_path(pid);
-    let comm_bytes: Vec<u8> = kp
-        .kp_proc
-        .p_comm
+    let comm_slice = if info.pbi_name[0] != 0 {
+        &info.pbi_name[..]
+    } else {
+        &info.pbi_comm[..]
+    };
+    let comm_bytes: Vec<u8> = comm_slice
         .iter()
         .take_while(|&&c| c != 0)
         .map(|&c| c as u8)
@@ -711,76 +699,30 @@ fn query_single_process(pid: u32) -> Option<ProcessInfo> {
 #[cfg(target_os = "macos")]
 fn take_os_process_snapshot() -> HashMap<u32, ProcessInfo> {
     let mut map = HashMap::new();
-    let mut mib: [libc::c_int; 3] = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
-    let mut size: libc::size_t = 0;
-
-    let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as libc::c_uint,
-            std::ptr::null_mut(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 || size == 0 {
+    let expected = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if expected <= 0 {
         return map;
     }
-
-    let entry_size = std::mem::size_of::<libc::kinfo_proc>();
-    let count = (size / entry_size) + 32;
-    let mut buf: Vec<libc::kinfo_proc> = vec![unsafe { std::mem::zeroed() }; count];
-    let mut actual_size = count * entry_size;
-
-    let rc2 = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as libc::c_uint,
-            buf.as_mut_ptr().cast::<libc::c_void>(),
-            &mut actual_size,
-            std::ptr::null_mut(),
-            0,
+    let capacity = (expected as usize).saturating_add(64).max(128);
+    let mut pids: Vec<libc::c_int> = vec![0; capacity];
+    let filled = unsafe {
+        libc::proc_listallpids(
+            pids.as_mut_ptr().cast::<libc::c_void>(),
+            (pids.len() * std::mem::size_of::<libc::c_int>()) as libc::c_int,
         )
     };
-    if rc2 != 0 {
+    if filled <= 0 {
         return map;
     }
-
-    let filled = actual_size / entry_size;
-    for kp in &buf[..filled] {
-        let pid = kp.kp_proc.p_pid;
-        if pid <= 0 {
+    let count = (filled as usize).min(pids.len());
+    for &raw_pid in &pids[..count] {
+        if raw_pid <= 0 {
             continue;
         }
-        let pid_u32 = pid as u32;
-        let parent_pid = kp.kp_eproc.e_ppid.max(0) as u32;
-        let exe_path = macos_proc_path(pid_u32);
-        let comm_bytes: Vec<u8> = kp
-            .kp_proc
-            .p_comm
-            .iter()
-            .take_while(|&&c| c != 0)
-            .map(|&c| c as u8)
-            .collect();
-        let comm = String::from_utf8_lossy(&comm_bytes).to_string();
-        let name = exe_path
-            .as_deref()
-            .and_then(|p| Path::new(p).file_name())
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or(comm);
-
-        map.insert(
-            pid_u32,
-            ProcessInfo {
-                pid: pid_u32,
-                parent_pid,
-                name,
-                exe_path,
-            },
-        );
+        let pid_u32 = raw_pid as u32;
+        if let Some(info) = query_single_process(pid_u32) {
+            map.insert(pid_u32, info);
+        }
     }
     map
 }

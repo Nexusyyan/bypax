@@ -63,7 +63,7 @@ mod unix_stub {
 
     pub fn resolve_windivert_dir(preferred: Option<&Path>) -> PathBuf {
         preferred
-            .map(|p| p.to_path_buf())
+            .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("runtime/windivert"))
     }
 

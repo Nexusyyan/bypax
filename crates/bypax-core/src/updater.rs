@@ -1580,6 +1580,7 @@ pub trait ServiceLifecycleController {
 }
 
 pub struct OsServiceLifecycleController {
+    #[cfg_attr(not(windows), allow(dead_code))]
     service_name: String,
 }
 

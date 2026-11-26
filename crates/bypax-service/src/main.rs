@@ -27,11 +27,17 @@ enum Commands {
         parent_pid: u32,
         #[arg(long)]
         endpoint: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Foreground / macOS launchd LaunchDaemon run loop.
     DaemonRun {
         #[arg(long)]
+        parent_pid: Option<u32>,
+        #[arg(long)]
         endpoint: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Installs the Windows Service (`BypaxService`) or macOS LaunchDaemon.
     Install {
@@ -59,22 +65,31 @@ fn main() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let cli = Cli::parse();
 
-    match cli.command.unwrap_or(Commands::DaemonRun { endpoint: None }) {
+    match cli.command.unwrap_or(Commands::DaemonRun {
+        parent_pid: None,
+        endpoint: None,
+        token: None,
+    }) {
         Commands::ServiceRun => platform_svc::run_windows_service(),
         Commands::WorkerRun {
             parent_pid,
             endpoint,
+            token,
         } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(run_daemon_loop(endpoint, Some(parent_pid)))
+            rt.block_on(run_daemon_loop(endpoint, Some(parent_pid), token))
         }
-        Commands::DaemonRun { endpoint } => {
+        Commands::DaemonRun {
+            parent_pid,
+            endpoint,
+            token,
+        } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(run_daemon_loop(endpoint, None))
+            rt.block_on(run_daemon_loop(endpoint, parent_pid, token))
         }
         Commands::Install { autostart } => {
             let exe = std::env::current_exe()?;
@@ -123,9 +138,15 @@ fn main() -> Result<()> {
     }
 }
 
-async fn run_daemon_loop(endpoint_override: Option<String>, parent_pid: Option<u32>) -> Result<()> {
+async fn run_daemon_loop(
+    endpoint_override: Option<String>,
+    parent_pid: Option<u32>,
+    token_override: Option<String>,
+) -> Result<()> {
     let paths = DataPaths::resolve()?;
-    let token = resolve_or_create_ipc_token(Some(&paths.runtime_dir));
+    let token = token_override
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| resolve_or_create_ipc_token(Some(&paths.runtime_dir)));
     let controller = ServiceController::new(&paths, token);
     let _watchdog = controller.spawn_watchdog();
 

@@ -1,4 +1,6 @@
-use bypax_appproxy::engine::{AppProxyEngine, AppProxyHandle};
+#[cfg(windows)]
+use bypax_appproxy::engine::AppProxyEngine;
+use bypax_appproxy::engine::AppProxyHandle;
 use bypax_appproxy::process::{ProcessTracker, SnapshotProcessTracker};
 use bypax_appproxy::rules::RuleEngine;
 use bypax_core::netguard::NetGuard;
@@ -8,7 +10,9 @@ use bypax_ipc::{
     AppProxyStartConfig, AppProxyStatusDto, CoreStatusDto, ProcessInfoDto, ServiceCommand,
     ServiceEnvelope, ServiceHandler, ServiceResponse, HEARTBEAT_TIMEOUT_SECS,
 };
-use bypax_windivert::{is_elevated, probe_windivert, WinDivertCaptureEngine};
+#[cfg(windows)]
+use bypax_windivert::WinDivertCaptureEngine;
+use bypax_windivert::{is_elevated, probe_windivert};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -17,6 +21,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
+#[cfg_attr(not(windows), allow(dead_code))]
 struct RunningAppProxy {
     handle: AppProxyHandle,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -165,7 +170,7 @@ impl ServiceController {
                 "Non-Windows platforms use sing-box utun path routing via StartCore",
             );
             resp.app_proxy_status = Some(self.build_app_proxy_status());
-            return resp;
+            resp
         }
 
         #[cfg(windows)]

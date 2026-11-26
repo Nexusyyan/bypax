@@ -148,7 +148,7 @@ fn stdio_mcp_e2e_offline_all_20_tools_and_zero_stdout_pollution() {
     let dead_ep = if cfg!(windows) {
         format!(r"\\.\pipe\bypax-e2e-dead-{}", std::process::id())
     } else {
-        dir.path().join("dead.sock").to_string_lossy().to_string()
+        dir.path().join("d.sock").to_string_lossy().to_string()
     };
 
     let requests = [
@@ -234,18 +234,12 @@ async fn stdio_mcp_e2e_live_plane2_mode_routes_through_gui_server() {
             &uuid::Uuid::new_v4().simple().to_string()[..6]
         )
     } else {
-        dir.path()
-            .join("bypax-ctl.sock")
-            .to_string_lossy()
-            .to_string()
+        dir.path().join("c.sock").to_string_lossy().to_string()
     };
     let dead_svc = if cfg!(windows) {
         format!(r"\\.\pipe\bypax-svc-dead-{}", std::process::id())
     } else {
-        dir.path()
-            .join("dead-svc.sock")
-            .to_string_lossy()
-            .to_string()
+        dir.path().join("s.sock").to_string_lossy().to_string()
     };
 
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -257,7 +251,16 @@ async fn stdio_mcp_e2e_live_plane2_mode_routes_through_gui_server() {
     );
     let (tx, rx) = oneshot::channel();
     let srv_task = tokio::spawn(server.run(rx));
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    if cfg!(windows) {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    } else {
+        for _ in 0..40 {
+            if std::path::Path::new(&live_ep).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
 
     let data_dir = dir.path().to_path_buf();
     let live_ep_for_child = live_ep.clone();
@@ -309,7 +312,7 @@ fn cli_ctl_json_schema_and_offline_commands_emit_clean_json() {
     let dead_ep = if cfg!(windows) {
         format!(r"\\.\pipe\bypax-cli-dead-{}", std::process::id())
     } else {
-        dir.path().join("dead.sock").to_string_lossy().to_string()
+        dir.path().join("d.sock").to_string_lossy().to_string()
     };
     let bin = env!("CARGO_BIN_EXE_bypax-cli");
 
