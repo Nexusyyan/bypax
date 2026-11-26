@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(windows)]
 pub const SERVICE_NAME: &str = "BypaxService";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

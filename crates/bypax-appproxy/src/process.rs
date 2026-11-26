@@ -376,7 +376,7 @@ pub fn detect_external_children(
 
 /// Lists installed desktop applications for the GUI App Picker modal.
 pub fn list_installed_apps() -> Vec<InstalledAppItem> {
-    let mut items = Vec::new();
+    let mut items: Vec<InstalledAppItem> = Vec::new();
 
     #[cfg(target_os = "macos")]
     {
