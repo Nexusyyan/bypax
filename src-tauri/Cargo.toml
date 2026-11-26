@@ -1,0 +1,37 @@
+[package]
+name = "bypax"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "bypax_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow.workspace = true
+bypax-appproxy = { path = "../crates/bypax-appproxy" }
+bypax-core = { path = "../crates/bypax-core" }
+bypax-ipc = { path = "../crates/bypax-ipc" }
+bypax-windivert = { path = "../crates/bypax-windivert" }
+chrono.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

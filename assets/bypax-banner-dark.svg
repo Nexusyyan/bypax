@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" fill="none">
+  <defs>
+    <radialGradient id="bypax-banner-dark-icon-halo" cx="160" cy="150" r="140" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#33BFFD" stop-opacity="0.28" />
+      <stop offset="52%" stop-color="#A851FB" stop-opacity="0.10" />
+      <stop offset="100%" stop-color="#3681FB" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+  <circle cx="160" cy="150" r="136" fill="url(#bypax-banner-dark-icon-halo)" />
+  <svg x="48" y="38" width="224" height="224" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <linearGradient id="bypax-banner-dark-icon-sq-bg" x1="120" y1="100" x2="900" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="72%" stop-color="#FDFEFF" />
+      <stop offset="100%" stop-color="#F4F7FB" />
+    </linearGradient>
+    <linearGradient id="bypax-banner-dark-icon-sq-rim" x1="100" y1="100" x2="924" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.95" />
+      <stop offset="100%" stop-color="#CBD5E1" stop-opacity="0.6" />
+    </linearGradient>
+    <mask id="bypax-banner-dark-icon-mask-lower" maskUnits="userSpaceOnUse" x="80" y="80" width="864" height="864">
+      <path d="M 318 346 C 390 346 446 446 512 512 C 578 578 634 678 706 678" fill="none" stroke="#FFFFFF" stroke-width="108" stroke-linecap="round" />
+      <path d="M 318 678 C 390 678 446 578 512 512 C 578 446 634 346 706 346" fill="none" stroke="#000000" stroke-width="176" stroke-linecap="round" />
+    </mask>
+    <mask id="bypax-banner-dark-icon-mask-upper" maskUnits="userSpaceOnUse" x="80" y="80" width="864" height="864">
+      <path d="M 318 678 C 390 678 446 578 512 512 C 578 446 634 346 706 346" fill="none" stroke="#FFFFFF" stroke-width="108" stroke-linecap="round" />
+    </mask>
+    <linearGradient id="bypax-banner-dark-icon-vec-lower" x1="300" y1="320" x2="720" y2="700" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#46E27F" />
+      <stop offset="35%" stop-color="#FFCF10" />
+      <stop offset="68%" stop-color="#3681FB" />
+      <stop offset="100%" stop-color="#33BFFD" />
+    </linearGradient>
+    <linearGradient id="bypax-banner-dark-icon-vec-upper" x1="300" y1="690" x2="720" y2="330" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#33BFFD" />
+      <stop offset="28%" stop-color="#46E27F" />
+      <stop offset="52%" stop-color="#FFCF10" />
+      <stop offset="76%" stop-color="#FF9238" />
+      <stop offset="100%" stop-color="#F93A5B" />
+    </linearGradient>
+    <radialGradient id="bypax-banner-dark-icon-vec-highlight" cx="512" cy="512" r="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3681FB" stop-opacity="0.34" />
+      <stop offset="100%" stop-color="#3681FB" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+  <!-- Ceramic-white macOS G2 squircle tile (pure vector, zero filter) -->
+  <g>
+    <path d="M 512 100 L 702 100 C 842 100 924 182 924 322 L 924 702 C 924 842 842 924 702 924 L 322 924 C 182 924 100 842 100 702 L 100 322 C 100 182 182 100 322 100 Z" transform="translate(0 12)" fill="#0F172A" fill-opacity="0.07" />
+    <path d="M 512 100 L 702 100 C 842 100 924 182 924 322 L 924 702 C 924 842 842 924 702 924 L 322 924 C 182 924 100 842 100 702 L 100 322 C 100 182 182 100 322 100 Z" fill="url(#bypax-banner-dark-icon-sq-bg)" />
+    <path d="M 512 100 L 702 100 C 842 100 924 182 924 322 L 924 702 C 924 842 842 924 702 924 L 322 924 C 182 924 100 842 100 702 L 100 322 C 100 182 182 100 322 100 Z" fill="none" stroke="#E2E8F0" stroke-width="4" />
+  </g>
+  <!-- Bypax Rainbow Overpass X -->
+  <g>
+    <g mask="url(#bypax-banner-dark-icon-mask-lower)">
+      <path d="M 318 346 C 390 346 446 446 512 512 C 578 578 634 678 706 678" fill="none" stroke="url(#bypax-banner-dark-icon-vec-lower)" stroke-width="108" stroke-linecap="round" />
+    </g>
+    <g>
+      <path d="M 318 678 C 390 678 446 578 512 512 C 578 446 634 346 706 346" fill="none" stroke="url(#bypax-banner-dark-icon-vec-upper)" stroke-width="108" stroke-linecap="round" />
+      <path d="M 318 678 C 390 678 446 578 512 512 C 578 446 634 346 706 346" fill="none" stroke="url(#bypax-banner-dark-icon-vec-highlight)" stroke-width="108" stroke-linecap="round" />
+    </g>
+  </g>
+</svg>
+  <text x="302" y="116" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', system-ui, sans-serif" font-size="76" font-weight="700" letter-spacing="-0.035em">Bypax</text>
+  <text x="305" y="162" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif" font-size="24" font-weight="400">Cross-platform app routing &amp; proxy workbench</text>
+  <g transform="translate(304, 194)">
+    <g transform="translate(0, 0)">
+      <rect x="0" y="0" width="112" height="34" rx="17" fill="rgba(255, 255, 255, 0.06)" stroke="rgba(255, 255, 255, 0.13)" stroke-width="1.2" />
+      <circle cx="18" cy="17" r="4.5" fill="#33BFFD" />
+      <text x="31" y="22" fill="#CBD5E1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif" font-size="14" font-weight="500">Windows</text>
+    </g>
+    <g transform="translate(124, 0)">
+      <rect x="0" y="0" width="102" height="34" rx="17" fill="rgba(255, 255, 255, 0.06)" stroke="rgba(255, 255, 255, 0.13)" stroke-width="1.2" />
+      <circle cx="18" cy="17" r="4.5" fill="#46E27F" />
+      <text x="31" y="22" fill="#CBD5E1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif" font-size="14" font-weight="500">macOS</text>
+    </g>
+    <g transform="translate(238, 0)">
+      <rect x="0" y="0" width="132" height="34" rx="17" fill="rgba(255, 255, 255, 0.06)" stroke="rgba(255, 255, 255, 0.13)" stroke-width="1.2" />
+      <circle cx="18" cy="17" r="4.5" fill="#FFCF10" />
+      <text x="31" y="22" fill="#CBD5E1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif" font-size="14" font-weight="500">App Routing</text>
+    </g>
+    <g transform="translate(382, 0)">
+      <rect x="0" y="0" width="124" height="34" rx="17" fill="rgba(255, 255, 255, 0.06)" stroke="rgba(255, 255, 255, 0.13)" stroke-width="1.2" />
+      <circle cx="18" cy="17" r="4.5" fill="#FF9238" />
+      <text x="31" y="22" fill="#CBD5E1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif" font-size="14" font-weight="500">Proxy Core</text>
+    </g>
+    <g transform="translate(518, 0)">
+      <rect x="0" y="0" width="118" height="34" rx="17" fill="rgba(255, 255, 255, 0.06)" stroke="rgba(255, 255, 255, 0.13)" stroke-width="1.2" />
+      <circle cx="18" cy="17" r="4.5" fill="#F93A5B" />
+      <text x="31" y="22" fill="#CBD5E1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif" font-size="14" font-weight="500">CLI &amp; MCP</text>
+    </g>
+  </g>
+</svg>

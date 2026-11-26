@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <linearGradient id="bypax-mesh-sq-bg" x1="120" y1="100" x2="900" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="72%" stop-color="#FDFEFF" />
+      <stop offset="100%" stop-color="#F4F7FB" />
+    </linearGradient>
+    <linearGradient id="bypax-mesh-sq-rim" x1="100" y1="100" x2="924" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.95" />
+      <stop offset="100%" stop-color="#CBD5E1" stop-opacity="0.6" />
+    </linearGradient>
+    <mask id="bypax-mesh-mask-lower" maskUnits="userSpaceOnUse" x="80" y="80" width="864" height="864">
+      <path d="M 318 346 C 390 346 446 446 512 512 C 578 578 634 678 706 678" fill="none" stroke="#FFFFFF" stroke-width="108" stroke-linecap="round" />
+      <path d="M 318 678 C 390 678 446 578 512 512 C 578 446 634 346 706 346" fill="none" stroke="#000000" stroke-width="176" stroke-linecap="round" />
+    </mask>
+    <mask id="bypax-mesh-mask-upper" maskUnits="userSpaceOnUse" x="80" y="80" width="864" height="864">
+      <path d="M 318 678 C 390 678 446 578 512 512 C 578 446 634 346 706 346" fill="none" stroke="#FFFFFF" stroke-width="108" stroke-linecap="round" />
+    </mask>
+    <filter id="bypax-mesh-sq-shadow" x="30" y="42" width="964" height="964" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="18" stdDeviation="24" flood-color="#0F172A" flood-opacity="0.13" />
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#0F172A" flood-opacity="0.06" />
+    </filter>
+    <filter id="bypax-mesh-mesh-blur" x="120" y="120" width="784" height="784" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="74" />
+    </filter>
+    <filter id="bypax-mesh-glyph-float" x="180" y="210" width="664" height="624" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="14" stdDeviation="16" flood-color="#3681FB" flood-opacity="0.18" />
+    </filter>
+    <filter id="bypax-mesh-bridge-cast" x="200" y="200" width="624" height="624" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="16" stdDeviation="18" flood-color="#0F172A" flood-opacity="0.22" />
+    </filter>
+  </defs>
+  <!-- Ceramic-white macOS G2 squircle tile (10% safe margin) -->
+  <g filter="url(#bypax-mesh-sq-shadow)">
+    <path d="M 512 100 L 702 100 C 842 100 924 182 924 322 L 924 702 C 924 842 842 924 702 924 L 322 924 C 182 924 100 842 100 702 L 100 322 C 100 182 182 100 322 100 Z" fill="url(#bypax-mesh-sq-bg)" />
+    <path d="M 512 100 L 702 100 C 842 100 924 182 924 322 L 924 702 C 924 842 842 924 702 924 L 322 924 C 182 924 100 842 100 702 L 100 322 C 100 182 182 100 322 100 Z" fill="none" stroke="url(#bypax-mesh-sq-rim)" stroke-width="3" />
+  </g>
+  <!-- Bypax Rainbow Overpass X -->
+  <g><path d="M 318 678 C 390 678 446 578 512 512 C 578 446 634 346 706 346" fill="none" stroke="#33BFFD" stroke-opacity="0.16" stroke-width="116" stroke-linecap="round" filter="url(#bypax-mesh-glyph-float)" />
+    <g mask="url(#bypax-mesh-mask-lower)">
+        <rect x="200" y="200" width="624" height="624" fill="#3681FB" />
+        <g filter="url(#bypax-mesh-mesh-blur)">
+          <circle cx="315" cy="690" r="195" fill="#33BFFD" />
+          <circle cx="330" cy="405" r="205" fill="#46E27F" />
+          <circle cx="505" cy="295" r="185" fill="#FFCF10" />
+          <circle cx="655" cy="360" r="190" fill="#FF9238" />
+          <circle cx="710" cy="475" r="175" fill="#F93A5B" />
+          <circle cx="535" cy="545" r="175" fill="#3681FB" />
+          <circle cx="715" cy="695" r="185" fill="#33BFFD" />
+        </g></g>
+    <g filter="url(#bypax-mesh-glyph-float)"><g mask="url(#bypax-mesh-mask-upper)">
+        <rect x="200" y="200" width="624" height="624" fill="#3681FB" />
+        <g filter="url(#bypax-mesh-mesh-blur)">
+          <circle cx="315" cy="690" r="195" fill="#33BFFD" />
+          <circle cx="330" cy="405" r="205" fill="#46E27F" />
+          <circle cx="505" cy="295" r="185" fill="#FFCF10" />
+          <circle cx="655" cy="360" r="190" fill="#FF9238" />
+          <circle cx="710" cy="475" r="175" fill="#F93A5B" />
+          <circle cx="535" cy="545" r="175" fill="#3681FB" />
+          <circle cx="715" cy="695" r="185" fill="#33BFFD" />
+        </g></g></g>
+  </g>
+</svg>

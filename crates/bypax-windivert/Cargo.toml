@@ -1,0 +1,19 @@
+[package]
+name = "bypax-windivert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bypax-appproxy = { path = "../bypax-appproxy" }
+bypax-core = { path = "../bypax-core" }
+bypax-ipc = { path = "../bypax-ipc" }
+dashmap.workspace = true
+libloading.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

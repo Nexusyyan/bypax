@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <linearGradient id="bypax-fav-sq-bg" x1="120" y1="100" x2="900" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="72%" stop-color="#FDFEFF" />
+      <stop offset="100%" stop-color="#F4F7FB" />
+    </linearGradient>
+    <linearGradient id="bypax-fav-sq-rim" x1="100" y1="100" x2="924" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.95" />
+      <stop offset="100%" stop-color="#CBD5E1" stop-opacity="0.6" />
+    </linearGradient>
+    <mask id="bypax-fav-mask-lower" maskUnits="userSpaceOnUse" x="80" y="80" width="864" height="864">
+      <path d="M 244 282 C 344 282 420 420 512 512 C 604 604 680 742 780 742" fill="none" stroke="#FFFFFF" stroke-width="142" stroke-linecap="round" />
+      <path d="M 244 742 C 344 742 420 604 512 512 C 604 420 680 282 780 282" fill="none" stroke="#000000" stroke-width="230" stroke-linecap="round" />
+    </mask>
+    <mask id="bypax-fav-mask-upper" maskUnits="userSpaceOnUse" x="80" y="80" width="864" height="864">
+      <path d="M 244 742 C 344 742 420 604 512 512 C 604 420 680 282 780 282" fill="none" stroke="#FFFFFF" stroke-width="142" stroke-linecap="round" />
+    </mask>
+    <linearGradient id="bypax-fav-vec-lower" x1="300" y1="320" x2="720" y2="700" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#46E27F" />
+      <stop offset="35%" stop-color="#FFCF10" />
+      <stop offset="68%" stop-color="#3681FB" />
+      <stop offset="100%" stop-color="#33BFFD" />
+    </linearGradient>
+    <linearGradient id="bypax-fav-vec-upper" x1="300" y1="690" x2="720" y2="330" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#33BFFD" />
+      <stop offset="28%" stop-color="#46E27F" />
+      <stop offset="52%" stop-color="#FFCF10" />
+      <stop offset="76%" stop-color="#FF9238" />
+      <stop offset="100%" stop-color="#F93A5B" />
+    </linearGradient>
+    <radialGradient id="bypax-fav-vec-highlight" cx="512" cy="512" r="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3681FB" stop-opacity="0.34" />
+      <stop offset="100%" stop-color="#3681FB" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+  <!-- Ceramic-white macOS G2 squircle tile (pure vector, zero filter) -->
+  <g>
+    <path d="M 512 40 L 730 40 C 890 40 984 134 984 294 L 984 730 C 984 890 890 984 730 984 L 294 984 C 134 984 40 890 40 730 L 40 294 C 40 134 134 40 294 40 Z" fill="url(#bypax-fav-sq-bg)" />
+    <path d="M 512 40 L 730 40 C 890 40 984 134 984 294 L 984 730 C 984 890 890 984 730 984 L 294 984 C 134 984 40 890 40 730 L 40 294 C 40 134 134 40 294 40 Z" fill="none" stroke="#CBD5E1" stroke-width="20" />
+  </g>
+  <!-- Bypax Rainbow Overpass X -->
+  <g>
+    <g mask="url(#bypax-fav-mask-lower)">
+      <path d="M 244 282 C 344 282 420 420 512 512 C 604 604 680 742 780 742" fill="none" stroke="url(#bypax-fav-vec-lower)" stroke-width="142" stroke-linecap="round" />
+    </g>
+    <g>
+      <path d="M 244 742 C 344 742 420 604 512 512 C 604 420 680 282 780 282" fill="none" stroke="url(#bypax-fav-vec-upper)" stroke-width="142" stroke-linecap="round" />
+      <path d="M 244 742 C 344 742 420 604 512 512 C 604 420 680 282 780 282" fill="none" stroke="url(#bypax-fav-vec-highlight)" stroke-width="142" stroke-linecap="round" />
+    </g>
+  </g>
+</svg>

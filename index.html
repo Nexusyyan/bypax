@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>Bypax</title>
+    <script>
+      (function () {
+        try {
+          var params = new URLSearchParams(window.location.search);
+          var urlTheme = params.get("theme");
+          var stored = window.localStorage.getItem("bypax-theme");
+          var mode =
+            urlTheme === "light" || urlTheme === "dark"
+              ? urlTheme
+              : stored === "light" || stored === "dark" || stored === "system"
+                ? stored
+                : "system";
+          var isDark =
+            mode === "dark" ||
+            (mode === "system" &&
+              window.matchMedia &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          var isTray = params.get("view") === "tray";
+          var root = document.documentElement;
+          root.classList.toggle("dark", isDark);
+          root.style.backgroundColor = isTray
+            ? isDark
+              ? "#161B22"
+              : "#FFFFFF"
+            : isDark
+              ? "#0B1120"
+              : "#F6F7F9";
+          root.style.colorScheme = isDark ? "dark" : "light";
+        } catch (e) {
+          // Ignore storage access errors in restricted frames.
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

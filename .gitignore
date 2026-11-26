@@ -1,0 +1,32 @@
+# Rust / Cargo
+/target/
+**/target/
+
+# Node / Frontend
+/node_modules/
+/dist/
+/dist-release/
+/release-artifacts/
+/release-stage/
+.vite/
+
+# Tauri generated schemas
+src-tauri/gen/schemas/
+
+# Anchored runtime binaries and portable user data
+# Anchored with leading slash so source paths such as src/features/core/CoreView.tsx are never ignored
+/core/
+/runtime/windivert/
+/runtime/
+/bypax-data/
+*.db
+*.db-shm
+*.db-wal
+
+# OS / Editor / Scratch
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
+.tmp/
