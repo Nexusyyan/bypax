@@ -504,7 +504,11 @@ export function formatConnectionRule(
     };
   }
 
-  if (trimmed.includes("ip_is_private")) {
+  if (
+    trimmed.includes("ip_is_private") ||
+    (trimmed.includes("100.64.0.0/10") && trimmed.includes("route(direct)")) ||
+    (trimmed.includes("netbird.selfhosted") && trimmed.includes("route(direct)"))
+  ) {
     return { label: labels.lanDirect, raw: trimmed, kind: "lan" };
   }
 

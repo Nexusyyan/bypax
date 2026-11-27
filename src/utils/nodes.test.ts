@@ -304,6 +304,21 @@ describe("Bypax frontend utilities, brand hygiene & i18n parity", () => {
     const lanRule = formatConnectionRule("ip_is_private=true => route(direct)", rules, [], ruleLabels, {}, true);
     expect(lanRule.label).toBe("LAN Direct");
 
+    const cgnatRule = formatConnectionRule("ip_cidr=[100.64.0.0/10] => route(direct)", rules, [], ruleLabels, {}, true);
+    expect(cgnatRule.label).toBe("LAN Direct");
+    expect(cgnatRule.kind).toBe("lan");
+
+    const meshRule = formatConnectionRule(
+      "domain_suffix=[local lan ... netbird.selfhosted netbird.cloud] => route(direct)",
+      rules,
+      [],
+      ruleLabels,
+      {},
+      true
+    );
+    expect(meshRule.label).toBe("LAN Direct");
+    expect(meshRule.kind).toBe("lan");
+
     const humanized = humanizeLogMessage(
       "outbound/vless[n-vless-c36e1afb]: outbound connection via [auto-au]",
       nodeById,

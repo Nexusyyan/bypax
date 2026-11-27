@@ -280,6 +280,7 @@ export function RoutingView({
   const displayDns = (() => {
     if (!testResult) return "--";
     if (testResult.dnsServer === "none") return "IP";
+    if (testResult.dnsServer === "dns-system") return dict.dns.ruleServerSystem;
     if (testResult.dnsServer === "dns-local") return dict.dns.ruleServerLocal;
     if (testResult.dnsServer === "dns-remote") return dict.dns.ruleServerRemote;
     if (testResult.dnsServer === "dns-fakeip") return dict.dns.ruleServerFakeip;
