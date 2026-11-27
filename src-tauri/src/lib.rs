@@ -41,11 +41,25 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.show();
                 let _ = win.unminimize();
                 let _ = win.set_focus();
+            }
+            if let Ok(running_exe) = std::env::current_exe() {
+                if let Some(payload) = detect_instance_path_conflict(&running_exe, &args, &cwd) {
+                    if let Some(state) = app.try_state::<AppState>() {
+                        state.push_log(
+                            "WARN",
+                            format!(
+                                "single-instance: launch attempted from [{}] while active instance runs from [{}]",
+                                payload.attempted_cwd, payload.running_path
+                            ),
+                        );
+                    }
+                    let _ = app.emit("bypax-instance-conflict", payload);
+                }
             }
         }))
         .manage(app_state)
@@ -236,47 +250,59 @@ pub fn run() {
                                 };
                                 let mut core_ready = false;
 
-                                if settings.tun_enabled {
-                                    match st.apply_capture_mode(CaptureMode::Tun).await {
-                                        Ok(_) => {
-                                            core_ready = true;
-                                        }
-                                        Err(err) => {
-                                            clear_persisted_capture_flags(&st);
-                                            log_startup_capture_fallback(&st, "TUN", &err);
-                                            if settings.system_proxy_enabled
-                                                || settings.auto_start_core
-                                            {
-                                                core_ready = st
-                                                    .start_local_core_only()
-                                                    .await
-                                                    .map(|(_, rep)| rep.ok)
-                                                    .unwrap_or(false);
+                                match select_startup_restore_plan(&settings) {
+                                    StartupRestorePlan::Tun => {
+                                        match st.apply_capture_mode(CaptureMode::Tun).await {
+                                            Ok(_) => {
+                                                core_ready = true;
+                                            }
+                                            Err(err) => {
+                                                clear_persisted_capture_flags(&st);
+                                                log_startup_capture_fallback(&st, "TUN", &err);
+                                                if settings.system_proxy_enabled
+                                                    || settings.auto_start_core
+                                                {
+                                                    core_ready = st
+                                                        .start_local_core_only()
+                                                        .await
+                                                        .map(|(_, rep)| rep.ok)
+                                                        .unwrap_or(false);
+                                                }
                                             }
                                         }
                                     }
-                                } else {
-                                    core_ready = st
-                                        .start_local_core_only()
-                                        .await
-                                        .map(|(_, rep)| rep.ok)
-                                        .unwrap_or(false);
-                                    if core_ready && settings.system_proxy_enabled {
-                                        if let Ok(guard) = st.netguard.lock() {
-                                            let _ = guard.enable_system_proxy(
-                                                "127.0.0.1",
-                                                settings.mixed_port,
-                                            );
+                                    StartupRestorePlan::AppProxy => {
+                                        match st.apply_capture_mode(CaptureMode::Apps).await {
+                                            Ok(_) => {
+                                                core_ready = true;
+                                            }
+                                            Err(err) => {
+                                                clear_persisted_capture_flags(&st);
+                                                log_startup_capture_fallback(
+                                                    &st,
+                                                    "App Proxy",
+                                                    &err,
+                                                );
+                                                if settings.auto_start_core
+                                                    || settings.system_proxy_enabled
+                                                {
+                                                    core_ready = st
+                                                        .start_local_core_only()
+                                                        .await
+                                                        .map(|(_, rep)| rep.ok)
+                                                        .unwrap_or(false);
+                                                }
+                                            }
                                         }
                                     }
-                                    if settings.app_proxy_enabled {
-                                        if let Err(err) =
-                                            st.apply_capture_mode(CaptureMode::Apps).await
-                                        {
-                                            clear_persisted_capture_flags(&st);
-                                            log_startup_capture_fallback(&st, "App Proxy", &err);
-                                        }
+                                    StartupRestorePlan::LocalCoreOnly => {
+                                        core_ready = st
+                                            .start_local_core_only()
+                                            .await
+                                            .map(|(_, rep)| rep.ok)
+                                            .unwrap_or(false);
                                     }
+                                    StartupRestorePlan::None => {}
                                 }
 
                                 if core_ready && settings.system_proxy_enabled {
@@ -341,13 +367,16 @@ pub fn run() {
                 if missing_tags.is_empty() {
                     return;
                 }
-                let mut synced = 0usize;
-                for tag in &missing_tags {
-                    let st = state.rule_cache.refresh_rule_set_auto(tag, proxy_port).await;
-                    if st.cached_locally && !st.fallback_mode {
-                        synced += 1;
-                    }
-                }
+                let statuses = futures::future::join_all(
+                    missing_tags
+                        .iter()
+                        .map(|tag| state.rule_cache.refresh_rule_set_auto(tag, proxy_port)),
+                )
+                .await;
+                let synced = statuses
+                    .iter()
+                    .filter(|st| st.cached_locally && !st.fallback_mode)
+                    .count();
                 if synced > 0 {
                     state.push_log(
                         "INFO",
@@ -646,6 +675,284 @@ fn log_startup_capture_fallback(st: &AppState, label: &str, err: &str) {
         st.push_log(
             "WARN",
             format!("startup: {label} auto-restore failed ({err}); fell back to capture off"),
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupRestorePlan {
+    Tun,
+    AppProxy,
+    LocalCoreOnly,
+    None,
+}
+
+fn select_startup_restore_plan(settings: &bypax_core::model::AppSettings) -> StartupRestorePlan {
+    if settings.tun_enabled {
+        StartupRestorePlan::Tun
+    } else if settings.app_proxy_enabled {
+        StartupRestorePlan::AppProxy
+    } else if settings.auto_start_core || settings.system_proxy_enabled {
+        StartupRestorePlan::LocalCoreOnly
+    } else {
+        StartupRestorePlan::None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstanceConflictPayload {
+    running_path: String,
+    attempted_cwd: String,
+}
+
+fn clean_display_path(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+            return stripped.to_string();
+        }
+    }
+    raw
+}
+
+fn normalize_dir_for_compare(path: &std::path::Path) -> String {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut s = resolved.to_string_lossy().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            s = stripped.to_string();
+        }
+        s = s.replace('/', "\\");
+        while s.len() > 3 && s.ends_with('\\') {
+            s.pop();
+        }
+        s.to_ascii_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        while s.len() > 1 && s.ends_with('/') {
+            s.pop();
+        }
+        s
+    }
+}
+
+fn is_generic_system_cwd(norm_dir: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        matches!(
+            norm_dir,
+            "c:\\windows\\system32" | "c:\\windows\\syswow64" | "c:\\windows"
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        norm_dir == "/"
+    }
+}
+
+fn resolve_attempted_exe_dir(
+    args: &[String],
+    cwd: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let raw = args.first()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let candidate = std::path::Path::new(raw);
+    let resolved = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else if candidate.components().count() > 1 {
+        cwd.join(candidate)
+    } else {
+        let in_cwd = cwd.join(candidate);
+        if in_cwd.is_file() {
+            in_cwd
+        } else {
+            return None;
+        }
+    };
+    resolved.parent().map(|p| p.to_path_buf())
+}
+
+fn detect_instance_path_conflict(
+    running_exe: &std::path::Path,
+    args: &[String],
+    cwd: &str,
+) -> Option<InstanceConflictPayload> {
+    let running_dir = running_exe.parent()?;
+    let norm_running = normalize_dir_for_compare(running_dir);
+    let cwd_trimmed = cwd.trim();
+    let cwd_path = std::path::Path::new(cwd_trimmed);
+
+    if let Some(attempted_dir) = resolve_attempted_exe_dir(args, cwd_path) {
+        let norm_attempted = normalize_dir_for_compare(&attempted_dir);
+        if norm_attempted == norm_running {
+            return None;
+        }
+        let reported_cwd = if cwd_trimmed.is_empty() {
+            clean_display_path(&attempted_dir)
+        } else {
+            cwd_trimmed.to_string()
+        };
+        return Some(InstanceConflictPayload {
+            running_path: clean_display_path(running_exe),
+            attempted_cwd: reported_cwd,
+        });
+    }
+
+    if cwd_trimmed.is_empty() {
+        return None;
+    }
+
+    let norm_cwd = normalize_dir_for_compare(cwd_path);
+    if norm_cwd == norm_running {
+        return None;
+    }
+
+    let exe_name = if cfg!(target_os = "windows") {
+        "bypax.exe"
+    } else {
+        "bypax"
+    };
+    let cwd_contains_exe = cwd_path.join(exe_name).is_file();
+    if !cwd_contains_exe && is_generic_system_cwd(&norm_cwd) {
+        return None;
+    }
+
+    Some(InstanceConflictPayload {
+        running_path: clean_display_path(running_exe),
+        attempted_cwd: cwd_trimmed.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bypax_core::model::AppSettings;
+    use std::path::PathBuf;
+
+    #[test]
+    fn startup_restore_plan_eliminates_double_start_for_app_proxy() {
+        let mut s = AppSettings {
+            tun_enabled: false,
+            app_proxy_enabled: true,
+            auto_start_core: true,
+            system_proxy_enabled: true,
+            ..AppSettings::default()
+        };
+        assert_eq!(select_startup_restore_plan(&s), StartupRestorePlan::AppProxy);
+
+        s.tun_enabled = true;
+        assert_eq!(select_startup_restore_plan(&s), StartupRestorePlan::Tun);
+
+        s.tun_enabled = false;
+        s.app_proxy_enabled = false;
+        assert_eq!(
+            select_startup_restore_plan(&s),
+            StartupRestorePlan::LocalCoreOnly
+        );
+
+        s.auto_start_core = false;
+        s.system_proxy_enabled = false;
+        assert_eq!(select_startup_restore_plan(&s), StartupRestorePlan::None);
+    }
+
+    #[test]
+    fn single_instance_conflict_ignores_same_dir_and_same_binary() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir_a = tmp.path().join("BypaxA");
+        let dir_b = tmp.path().join("BypaxB");
+        std::fs::create_dir_all(&dir_a).expect("mkdir a");
+        std::fs::create_dir_all(&dir_b).expect("mkdir b");
+        let exe_name = if cfg!(target_os = "windows") {
+            "bypax.exe"
+        } else {
+            "bypax"
+        };
+        let exe_a = dir_a.join(exe_name);
+        std::fs::write(&exe_a, b"stub").expect("write exe a");
+
+        // Same directory -> no conflict.
+        assert_eq!(
+            detect_instance_path_conflict(&exe_a, &[], &dir_a.to_string_lossy()),
+            None
+        );
+
+        // Trailing separator (and case variation on Windows) -> no conflict.
+        let mut same_variant = dir_a.to_string_lossy().to_string();
+        if cfg!(target_os = "windows") {
+            same_variant = format!("{}\\", same_variant.to_ascii_lowercase());
+        } else {
+            same_variant = format!("{}/", same_variant);
+        }
+        assert_eq!(detect_instance_path_conflict(&exe_a, &[], &same_variant), None);
+
+        // Same executable launched from another working directory -> no conflict.
+        let args_same = vec![exe_a.to_string_lossy().to_string()];
+        assert_eq!(
+            detect_instance_path_conflict(&exe_a, &args_same, &dir_b.to_string_lossy()),
+            None
+        );
+
+        // Empty cwd and empty args -> no conflict.
+        assert_eq!(detect_instance_path_conflict(&exe_a, &[], "   "), None);
+    }
+
+    #[test]
+    fn single_instance_conflict_detects_different_folder_and_serializes_payload() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir_a = tmp.path().join("BypaxMain");
+        let dir_b = tmp.path().join("BypaxPortable");
+        std::fs::create_dir_all(&dir_a).expect("mkdir a");
+        std::fs::create_dir_all(&dir_b).expect("mkdir b");
+        let exe_name = if cfg!(target_os = "windows") {
+            "bypax.exe"
+        } else {
+            "bypax"
+        };
+        let exe_a = dir_a.join(exe_name);
+        let exe_b = dir_b.join(exe_name);
+        std::fs::write(&exe_a, b"stub-a").expect("write exe a");
+        std::fs::write(&exe_b, b"stub-b").expect("write exe b");
+
+        let conflict = detect_instance_path_conflict(&exe_a, &[], &dir_b.to_string_lossy())
+            .expect("expected conflict for distinct portable dir");
+        assert_eq!(conflict.running_path, clean_display_path(&exe_a));
+        assert_eq!(conflict.attempted_cwd, dir_b.to_string_lossy());
+
+        let json_val = serde_json::to_value(&conflict).expect("serialize payload");
+        assert_eq!(json_val["runningPath"], clean_display_path(&exe_a));
+        assert_eq!(json_val["attemptedCwd"], dir_b.to_string_lossy().as_ref());
+
+        // Distinct binary passed in args[0] even from a third cwd -> conflict.
+        let dir_c = tmp.path().join("NeutralCwd");
+        std::fs::create_dir_all(&dir_c).expect("mkdir c");
+        let args_b = vec![exe_b.to_string_lossy().to_string()];
+        let conflict_args =
+            detect_instance_path_conflict(&exe_a, &args_b, &dir_c.to_string_lossy())
+                .expect("expected conflict when args[0] points to another binary");
+        assert_eq!(conflict_args.attempted_cwd, dir_c.to_string_lossy());
+    }
+
+    #[test]
+    fn single_instance_conflict_ignores_generic_system_cwd_without_binary() {
+        let running = if cfg!(target_os = "windows") {
+            PathBuf::from(r"D:\Bypax\bypax.exe")
+        } else {
+            PathBuf::from("/opt/bypax/bypax")
+        };
+        let generic_cwd = if cfg!(target_os = "windows") {
+            r"C:\Windows\System32"
+        } else {
+            "/"
+        };
+        assert_eq!(
+            detect_instance_path_conflict(&running, &[], generic_cwd),
+            None
         );
     }
 }

@@ -1179,6 +1179,108 @@ impl AppState {
         Ok((self.build_core_info(), report))
     }
 
+    /// Safely toggles the OS system proxy via NetGuard.
+    /// When `enabled == true`, verifies at least one node is configured, ensures the proxy core
+    /// is installed and running (auto-starting local core if stopped), and only then enables the
+    /// OS system proxy and persists `system_proxy_enabled = true`.
+    pub async fn toggle_system_proxy_safe(
+        &self,
+        enabled: bool,
+        log_prefix: &str,
+    ) -> Result<CoreInfo, String> {
+        if enabled {
+            let (has_nodes, mixed_port) = {
+                let store = self
+                    .store
+                    .lock()
+                    .map_err(|_| "store lock poisoned".to_string())?;
+                let has_nodes = !store.list_nodes().map_err(|e| e.to_string())?.is_empty();
+                let settings = store.load_settings().map_err(|e| e.to_string())?;
+                (has_nodes, settings.mixed_port)
+            };
+
+            if !has_nodes {
+                return Err("NO_NODES_CONFIGURED".to_string());
+            }
+
+            if !self.is_core_running() {
+                if !self.core_manager.is_installed() {
+                    return Err("CORE_NOT_INSTALLED".to_string());
+                }
+                let (_info, report) = self.start_local_core_only().await?;
+                if !report.ok {
+                    return Err(format!(
+                        "sing-box preflight failed (exit {}): {}",
+                        report.exit_code, report.stderr
+                    ));
+                }
+                if !self.is_core_running() {
+                    return Err(
+                        "Proxy core exited immediately after start; refusing to enable system proxy"
+                            .to_string(),
+                    );
+                }
+            }
+
+            {
+                let guard = self
+                    .netguard
+                    .lock()
+                    .map_err(|_| "netguard lock poisoned".to_string())?;
+                guard
+                    .enable_system_proxy("127.0.0.1", mixed_port)
+                    .map_err(|e| e.to_string())?;
+            }
+
+            let save_res = {
+                let store = self
+                    .store
+                    .lock()
+                    .map_err(|_| "store lock poisoned".to_string())?;
+                let mut settings = store.load_settings().map_err(|e| e.to_string())?;
+                settings.system_proxy_enabled = true;
+                store.save_settings(&settings).map_err(|e| e.to_string())
+            };
+            if let Err(err) = save_res {
+                if let Ok(guard) = self.netguard.lock() {
+                    let _ = guard.disable_system_proxy();
+                }
+                return Err(err);
+            }
+
+            self.push_log(
+                "INFO",
+                format!(
+                    "{}: enabled system proxy 127.0.0.1:{}",
+                    log_prefix, mixed_port
+                ),
+            );
+            return Ok(self.build_core_info());
+        }
+
+        {
+            let guard = self
+                .netguard
+                .lock()
+                .map_err(|_| "netguard lock poisoned".to_string())?;
+            guard.disable_system_proxy().map_err(|e| e.to_string())?;
+        }
+        {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| "store lock poisoned".to_string())?;
+            let mut settings = store.load_settings().map_err(|e| e.to_string())?;
+            settings.system_proxy_enabled = false;
+            store.save_settings(&settings).map_err(|e| e.to_string())?;
+        }
+        self.push_log(
+            "INFO",
+            format!("{}: disabled system proxy & restored snapshot", log_prefix),
+        );
+        Ok(self.build_core_info())
+    }
+
     pub async fn start_core_flow(&self) -> Result<(CoreInfo, PreflightReport), String> {
         let bin = self.require_core_binary()?;
         let (settings, app_rules) = {
@@ -2402,5 +2504,124 @@ mod tests {
             classify_service_error_kind("Unauthorized session token", true, false).as_deref(),
             Some("pipe_timeout")
         );
+    }
+
+    fn build_isolated_test_state(root: &std::path::Path) -> AppState {
+        let paths = DataPaths::from_root(root.to_path_buf(), true).expect("data paths");
+        let updates_dir = paths.runtime_dir.join("updates");
+        let update_result_file = paths.runtime_dir.join("last-update-result.json");
+        let _ = std::fs::create_dir_all(&updates_dir);
+        let store = Store::open(&paths.db_path).expect("open store");
+        let netguard = NetGuard::new(&paths.runtime_dir);
+        let logs = Arc::new(Mutex::new(LogRing::new(MAX_LOG_RING_ENTRIES)));
+        let rule_cache = RuleCache::new(paths.rule_sets_dir.clone());
+        let core_manager = CoreManager::new(paths.core_dir.clone());
+        let supervisor = CoreSupervisor::new(paths.runtime_dir.clone(), Arc::clone(&logs));
+        let process_tracker = Arc::new(SnapshotProcessTracker::new(Duration::from_millis(800)));
+
+        AppState {
+            paths,
+            updates_dir,
+            update_result_file,
+            store: Mutex::new(store),
+            netguard: Mutex::new(netguard),
+            rule_cache,
+            core_manager,
+            supervisor: Mutex::new(supervisor),
+            logs,
+            app_log_file: None,
+            control_secret: "test-secret".to_string(),
+            ipc_token: Mutex::new("test-token".to_string()),
+            service_endpoint: "test-endpoint".to_string(),
+            process_tracker,
+            core_via_service: AtomicBool::new(false),
+            app_proxy_active: AtomicBool::new(false),
+            tun_active: AtomicBool::new(false),
+            recovered_from_crash: false,
+            traffic_cursor: Mutex::new(TrafficCursor::default()),
+            conn_tracker: Mutex::new(ConnectionTracker::default()),
+            app_update_report: Mutex::new(None),
+            app_update_state: Mutex::new(AppUpdateState::default()),
+            app_update_cancel: Mutex::new(None),
+            last_update_result: Mutex::new(None),
+            last_service_error: Mutex::new(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn toggle_system_proxy_rejects_when_no_nodes_configured() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = build_isolated_test_state(tmp.path());
+
+        let err = state
+            .toggle_system_proxy_safe(true, "test")
+            .await
+            .expect_err("must reject enabling system proxy with 0 nodes");
+        assert_eq!(err, "NO_NODES_CONFIGURED");
+
+        let settings = state
+            .store
+            .lock()
+            .expect("store lock")
+            .load_settings()
+            .expect("load settings");
+        assert!(!settings.system_proxy_enabled);
+        assert!(!state.netguard.lock().expect("netguard lock").is_armed());
+    }
+
+    #[tokio::test]
+    async fn toggle_system_proxy_rejects_without_mutating_proxy_when_core_missing_or_fails() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = build_isolated_test_state(tmp.path());
+
+        let node = bypax_core::model::NodeIR::new(
+            "node-test-1",
+            bypax_core::model::Protocol::Socks,
+            "Test Node",
+            "127.0.0.1",
+            10808,
+            "Test",
+        );
+        state
+            .store
+            .lock()
+            .expect("store lock")
+            .upsert_nodes(&[node])
+            .expect("upsert node");
+
+        if !state.core_manager.is_installed() {
+            let err = state
+                .toggle_system_proxy_safe(true, "test")
+                .await
+                .expect_err("must reject enabling system proxy when core is not installed");
+            assert_eq!(err, "CORE_NOT_INSTALLED");
+            let settings = state
+                .store
+                .lock()
+                .expect("store lock")
+                .load_settings()
+                .expect("load settings");
+            assert!(!settings.system_proxy_enabled);
+            assert!(!state.netguard.lock().expect("netguard lock").is_armed());
+        }
+
+        // Write an unrunnable stub binary in the isolated core dir so resolve_binary_path()
+        // picks it first, and verify start failure never enables OS system proxy.
+        std::fs::write(state.core_manager.binary_path(), b"not-a-valid-binary")
+            .expect("write invalid stub binary");
+        let err = state
+            .toggle_system_proxy_safe(true, "test")
+            .await
+            .expect_err("must reject enabling system proxy when core fails to start");
+        assert!(!err.is_empty());
+
+        let settings = state
+            .store
+            .lock()
+            .expect("store lock")
+            .load_settings()
+            .expect("load settings");
+        assert!(!settings.system_proxy_enabled);
+        assert!(!state.netguard.lock().expect("netguard lock").is_armed());
     }
 }

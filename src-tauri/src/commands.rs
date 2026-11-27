@@ -125,6 +125,79 @@ fn notify_sync(app: &AppHandle) {
     let _ = app.emit("bypax-state-sync", ());
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostImportCoreAction {
+    AutoStart,
+    Reload,
+    None,
+}
+
+pub(crate) fn decide_post_import_core_action(
+    had_nodes_before: bool,
+    imported_count: usize,
+    auto_start_core: bool,
+    core_running: bool,
+    core_installed: bool,
+) -> PostImportCoreAction {
+    if imported_count == 0 {
+        return PostImportCoreAction::None;
+    }
+    if !had_nodes_before && auto_start_core && !core_running && core_installed {
+        PostImportCoreAction::AutoStart
+    } else if core_running {
+        PostImportCoreAction::Reload
+    } else {
+        PostImportCoreAction::None
+    }
+}
+
+async fn post_import_sync_core(
+    app: &AppHandle,
+    state: &AppState,
+    had_nodes_before: bool,
+    imported_count: usize,
+    auto_start_core: bool,
+) {
+    match decide_post_import_core_action(
+        had_nodes_before,
+        imported_count,
+        auto_start_core,
+        state.is_core_running(),
+        state.core_manager.is_installed(),
+    ) {
+        PostImportCoreAction::AutoStart => match state.start_local_core_only().await {
+            Ok((info, report)) if report.ok => {
+                state.push_log(
+                    "INFO",
+                    "import: auto-started local proxy core after first node import",
+                );
+                tray::update_tray_icon_state(app, info.running, false);
+            }
+            Ok((info, report)) => {
+                state.push_log(
+                    "WARN",
+                    format!(
+                        "import: auto-start core blocked by preflight (exit {}): {}",
+                        report.exit_code, report.stderr
+                    ),
+                );
+                tray::update_tray_icon_state(app, info.running, true);
+            }
+            Err(err) => {
+                state.push_log(
+                    "WARN",
+                    format!("import: auto-start core failed after first import: {}", err),
+                );
+                tray::update_tray_icon_state(app, state.is_core_running(), true);
+            }
+        },
+        PostImportCoreAction::Reload => {
+            let _ = state.reload_core_if_running_async().await;
+        }
+        PostImportCoreAction::None => {}
+    }
+}
+
 #[tauri::command]
 pub async fn get_bootstrap_state(state: State<'_, AppState>) -> Result<BootstrapPayload, String> {
     let (mut settings, nodes, subscriptions, rules, app_rules, extra_ports) = {
@@ -203,7 +276,7 @@ pub async fn get_bootstrap_state(state: State<'_, AppState>) -> Result<Bootstrap
 }
 
 #[tauri::command]
-pub fn import_nodes(
+pub async fn import_nodes(
     app: AppHandle,
     state: State<'_, AppState>,
     payload: String,
@@ -213,15 +286,19 @@ pub fn import_nodes(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "Imported".to_string());
     let summary = parse_payload(&payload, &group).map_err(|e| e.to_string())?;
+    let mut had_nodes_before = true;
+    let mut auto_start_core = false;
     if !summary.nodes.is_empty() {
         let mut store = state
             .store
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
+        had_nodes_before = !store.list_nodes().map_err(|e| e.to_string())?.is_empty();
         store
             .upsert_nodes(&summary.nodes)
             .map_err(|e| e.to_string())?;
         let mut settings = store.load_settings().map_err(|e| e.to_string())?;
+        auto_start_core = settings.auto_start_core;
         if settings.main_node_id.is_none() {
             settings.main_node_id = Some(summary.nodes[0].id.clone());
             store.save_settings(&settings).map_err(|e| e.to_string())?;
@@ -236,6 +313,16 @@ pub fn import_nodes(
             summary.skipped
         ),
     );
+    if !summary.nodes.is_empty() {
+        post_import_sync_core(
+            &app,
+            &state,
+            had_nodes_before,
+            summary.nodes.len(),
+            auto_start_core,
+        )
+        .await;
+    }
     notify_sync(&app);
     Ok(summary)
 }
@@ -275,11 +362,12 @@ pub async fn import_subscription(
         node_count: summary.nodes.len(),
     };
 
-    {
+    let (had_nodes_before, auto_start_core) = {
         let mut store = state
             .store
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
+        let had_before = !store.list_nodes().map_err(|e| e.to_string())?.is_empty();
         store
             .replace_group_nodes(&clean_name, &summary.nodes)
             .map_err(|e| e.to_string())?;
@@ -287,13 +375,15 @@ pub async fn import_subscription(
             .upsert_subscription(&sub)
             .map_err(|e| e.to_string())?;
         let mut settings = store.load_settings().map_err(|e| e.to_string())?;
+        let auto_start = settings.auto_start_core;
         if settings.main_node_id.is_none() {
             if let Some(first) = summary.nodes.first() {
                 settings.main_node_id = Some(first.id.clone());
                 store.save_settings(&settings).map_err(|e| e.to_string())?;
             }
         }
-    }
+        (had_before, auto_start)
+    };
 
     state.push_log(
         "INFO",
@@ -304,7 +394,16 @@ pub async fn import_subscription(
             via
         ),
     );
-    let _ = state.reload_core_if_running_async().await;
+    if !summary.nodes.is_empty() {
+        post_import_sync_core(
+            &app,
+            &state,
+            had_nodes_before,
+            summary.nodes.len(),
+            auto_start_core,
+        )
+        .await;
+    }
     notify_sync(&app);
     Ok(sub)
 }
@@ -516,45 +615,22 @@ pub async fn set_route_mode(
 }
 
 #[tauri::command]
-pub fn toggle_system_proxy(
+pub async fn toggle_system_proxy(
     app: AppHandle,
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<CoreInfo, String> {
-    let mixed_port = {
-        let store = state
-            .store
-            .lock()
-            .map_err(|_| "store lock poisoned".to_string())?;
-        let mut settings = store.load_settings().map_err(|e| e.to_string())?;
-        settings.system_proxy_enabled = enabled;
-        store.save_settings(&settings).map_err(|e| e.to_string())?;
-        settings.mixed_port
-    };
-
-    let guard = state
-        .netguard
+    let info = state.toggle_system_proxy_safe(enabled, "netguard").await?;
+    let active = info.netguard_armed || state.current_capture_mode() != CaptureMode::Off;
+    let warn = state
+        .last_service_error
         .lock()
-        .map_err(|_| "netguard lock poisoned".to_string())?;
-    if enabled {
-        guard
-            .enable_system_proxy("127.0.0.1", mixed_port)
-            .map_err(|e| e.to_string())?;
-        state.push_log(
-            "INFO",
-            format!("netguard: enabled system proxy 127.0.0.1:{}", mixed_port),
-        );
-    } else {
-        guard.disable_system_proxy().map_err(|e| e.to_string())?;
-        state.push_log(
-            "INFO",
-            "netguard: disabled system proxy & restored snapshot",
-        );
-    }
-    drop(guard);
-
+        .ok()
+        .and_then(|g| g.as_ref().map(|_| true))
+        .unwrap_or(false);
+    tray::update_tray_icon_state(&app, active, warn);
     notify_sync(&app);
-    Ok(state.build_core_info())
+    Ok(info)
 }
 
 #[tauri::command]
@@ -2342,4 +2418,53 @@ pub fn quit_app(app: AppHandle, state: State<'_, AppState>) -> Result<(), String
     state.shutdown_cleanly();
     app.exit(0);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_import_auto_starts_only_on_first_import_when_eligible() {
+        assert_eq!(
+            decide_post_import_core_action(false, 3, true, false, true),
+            PostImportCoreAction::AutoStart
+        );
+        // Auto-start disabled in settings -> stay stopped
+        assert_eq!(
+            decide_post_import_core_action(false, 3, false, false, true),
+            PostImportCoreAction::None
+        );
+        // Core not installed -> stay stopped
+        assert_eq!(
+            decide_post_import_core_action(false, 3, true, false, false),
+            PostImportCoreAction::None
+        );
+        // Empty import -> no action
+        assert_eq!(
+            decide_post_import_core_action(false, 0, true, false, true),
+            PostImportCoreAction::None
+        );
+        assert_eq!(
+            decide_post_import_core_action(true, 0, true, true, true),
+            PostImportCoreAction::None
+        );
+    }
+
+    #[test]
+    fn post_import_reloads_when_core_already_running() {
+        assert_eq!(
+            decide_post_import_core_action(true, 2, true, true, true),
+            PostImportCoreAction::Reload
+        );
+        assert_eq!(
+            decide_post_import_core_action(false, 1, true, true, true),
+            PostImportCoreAction::Reload
+        );
+        // Subsequent import while core is stopped does not force-start
+        assert_eq!(
+            decide_post_import_core_action(true, 2, true, false, true),
+            PostImportCoreAction::None
+        );
+    }
 }

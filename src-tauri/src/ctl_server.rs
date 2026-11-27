@@ -213,39 +213,13 @@ async fn dispatch_ctl_request(
         }
 
         CtlRequest::ToggleSystemProxy { enabled } => {
-            let mixed_port = {
-                let store = state
-                    .store
-                    .lock()
-                    .map_err(|_| "store lock poisoned".to_string())?;
-                let mut settings = store.load_settings().map_err(|e| e.to_string())?;
-                settings.system_proxy_enabled = enabled;
-                store.save_settings(&settings).map_err(|e| e.to_string())?;
-                settings.mixed_port
-            };
-            {
-                let guard = state
-                    .netguard
-                    .lock()
-                    .map_err(|_| "netguard lock poisoned".to_string())?;
-                if enabled {
-                    guard
-                        .enable_system_proxy("127.0.0.1", mixed_port)
-                        .map_err(|e| e.to_string())?;
-                } else {
-                    guard.disable_system_proxy().map_err(|e| e.to_string())?;
-                }
-            }
-            state.push_log(
-                "INFO",
-                format!("ctl: system proxy -> {}", if enabled { "ON" } else { "OFF" }),
-            );
+            let core_info = state.toggle_system_proxy_safe(enabled, "ctl").await?;
             Ok((
                 json!({
                     "controlMode": "live",
                     "ok": true,
                     "systemProxyEnabled": enabled,
-                    "coreInfo": state.build_core_info()
+                    "coreInfo": core_info
                 }),
                 true,
             ))

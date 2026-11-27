@@ -18,6 +18,7 @@ bypax-core = { path = "../crates/bypax-core" }
 bypax-ipc = { path = "../crates/bypax-ipc" }
 bypax-windivert = { path = "../crates/bypax-windivert" }
 chrono.workspace = true
+futures.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -31,6 +32,9 @@ uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [features]
 default = ["custom-protocol"]
