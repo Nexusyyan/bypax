@@ -399,6 +399,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Download all platform artifacts
         uses: actions/download-artifact@v4
         with:
@@ -442,6 +445,7 @@ jobs:
       - name: Publish idempotent GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
@@ -510,15 +514,16 @@ jobs:
             fs.writeFileSync("release-notes.md", text, "utf8");
           '
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
             echo "Release $TAG already exists; uploading updated assets..."
-            gh release upload "$TAG" release-artifacts/* --clobber
-            gh release edit "$TAG" --title "${APP_DISPLAY_NAME} ${TAG}" --notes-file release-notes.md
+            gh release upload "$TAG" release-artifacts/* --repo "$GH_REPO" --clobber
+            gh release edit "$TAG" --repo "$GH_REPO" --title "${APP_DISPLAY_NAME} ${TAG}" --notes-file release-notes.md
           else
             echo "Creating GitHub Release $TAG..."
             ARGS=(
               release create "$TAG"
               release-artifacts/*
+              --repo "$GH_REPO"
               --title "${APP_DISPLAY_NAME} ${TAG}"
               --notes-file release-notes.md
               --generate-notes
