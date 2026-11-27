@@ -1564,3 +1564,199 @@ proxies:
         );
     }
 }
+
+#[test]
+fn test_cgnat_mesh_vpn_bypass_compiler_dns_and_rule_set_mirrors() {
+    use bypax_core::netguard::DEFAULT_BYPASS_LIST;
+    use bypax_core::route_eval::evaluate_route_target;
+    use bypax_core::rule_cache::default_rule_set_urls;
+
+    // 1. Windows ProxyOverride must cover RFC 6598 100.64.0.0/10 exactly, link-local,
+    // and LAN/mesh internal domains while remaining well below WinINet's 2048-char limit.
+    assert!(DEFAULT_BYPASS_LIST.len() < 1500);
+    for octet in 64..=127 {
+        assert!(
+            DEFAULT_BYPASS_LIST.contains(&format!("100.{}.*", octet)),
+            "Missing CGNAT octet 100.{}.* in DEFAULT_BYPASS_LIST",
+            octet
+        );
+    }
+    assert!(!DEFAULT_BYPASS_LIST.contains("100.63.*"));
+    assert!(!DEFAULT_BYPASS_LIST.contains("100.128.*"));
+    for suffix in [
+        "169.254.*",
+        "*.local",
+        "*.lan",
+        "*.home.arpa",
+        "*.internal",
+        "*.ts.net",
+        "*.netbird.selfhosted",
+        "*.netbird.cloud",
+    ] {
+        assert!(
+            DEFAULT_BYPASS_LIST.contains(suffix),
+            "Missing {} in DEFAULT_BYPASS_LIST",
+            suffix
+        );
+    }
+
+    // 2. Service GeoIP tags must include MetaCubeX meta-rules-dat@sing mirror fallback.
+    let tg_urls = default_rule_set_urls("geoip-telegram");
+    assert!(
+        tg_urls
+            .iter()
+            .any(|u| u.contains("MetaCubeX/meta-rules-dat@sing/geo/geoip/telegram.srs")),
+        "geoip-telegram URLs missing MetaCubeX mirror: {:?}",
+        tg_urls
+    );
+    let google_urls = default_rule_set_urls("geoip-google");
+    assert!(
+        google_urls
+            .iter()
+            .any(|u| u.contains("MetaCubeX/meta-rules-dat@sing/geo/geoip/google.srs")),
+        "geoip-google URLs missing MetaCubeX mirror: {:?}",
+        google_urls
+    );
+
+    // 3. Compiler emits explicit 100.64.0.0/10 & mesh-domain direct rules plus dns-system
+    // and routes geosite-private/geosite-cn cleanly even when FakeIP is enabled.
+    let nodes = build_all_8_protocol_nodes();
+    let rules = default_simple_rules();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("geosite-private.srs"), b"stub").expect("write private stub");
+    std::fs::write(tmp.path().join("geosite-cn.srs"), b"stub").expect("write cn stub");
+    let cache = RuleCache::new(tmp.path().to_path_buf());
+    let settings = AppSettings {
+        main_node_id: Some("n-vless".to_string()),
+        dns_fake_ip: true,
+        ..Default::default()
+    };
+
+    let compiled = SingBox114Compiler::compile(&CompileInput {
+        nodes: &nodes,
+        rules: &rules,
+        app_rules: &[],
+        extra_ports: &[],
+        settings: &settings,
+        control_secret: "cgnat-test",
+        cache_db_path: None,
+        rule_cache: Some(&cache),
+        platform: CompilePlatform::Windows,
+    })
+    .expect("compile cgnat/mesh");
+
+    let route_rules = compiled.config["route"]["rules"].as_array().unwrap();
+    let cgnat_pos = route_rules
+        .iter()
+        .position(|r| {
+            r["ip_cidr"] == serde_json::json!(["100.64.0.0/10"]) && r["outbound"] == "direct"
+        })
+        .expect("route.rules must contain explicit 100.64.0.0/10 -> direct");
+    let mesh_pos = route_rules
+        .iter()
+        .position(|r| {
+            r["outbound"] == "direct"
+                && r["domain_suffix"]
+                    .as_array()
+                    .is_some_and(|arr| arr.iter().any(|v| v == "netbird.selfhosted"))
+        })
+        .expect("route.rules must contain mesh/local domain_suffix -> direct");
+    let global_pos = route_rules
+        .iter()
+        .position(|r| r["clash_mode"] == "global")
+        .expect("clash_mode global must exist");
+    assert!(cgnat_pos < global_pos);
+    assert!(mesh_pos < global_pos);
+
+    let dns_servers = compiled.config["dns"]["servers"].as_array().unwrap();
+    assert!(dns_servers
+        .iter()
+        .any(|s| s["tag"] == "dns-system" && s["type"] == "local"));
+
+    let dns_rules = compiled.config["dns"]["rules"].as_array().unwrap();
+    let fakeip_pos = dns_rules
+        .iter()
+        .position(|r| r["server"] == "dns-fakeip")
+        .expect("dns-fakeip rule must exist");
+    let dns_mesh_pos = dns_rules
+        .iter()
+        .position(|r| {
+            r["server"] == "dns-system"
+                && r["domain_suffix"]
+                    .as_array()
+                    .is_some_and(|arr| arr.iter().any(|v| v == "netbird.selfhosted"))
+        })
+        .expect("dns.rules must route mesh/local suffixes to dns-system");
+    let dns_priv_pos = dns_rules
+        .iter()
+        .position(|r| {
+            r["server"] == "dns-system" && r["rule_set"] == serde_json::json!(["geosite-private"])
+        })
+        .expect("dns.rules must route geosite-private to dns-system");
+    let dns_cn_pos = dns_rules
+        .iter()
+        .position(|r| {
+            r["server"] == "dns-local" && r["rule_set"] == serde_json::json!(["geosite-cn"])
+        })
+        .expect("dns.rules must route geosite-cn to dns-local even with FakeIP enabled");
+    assert!(dns_mesh_pos < fakeip_pos);
+    assert!(dns_priv_pos < fakeip_pos);
+    assert!(dns_cn_pos < fakeip_pos);
+
+    // 4. Route evaluator matches CGNAT IPs and NetBird/Tailscale domains consistently.
+    let res_cgnat = evaluate_route_target(
+        "100.64.0.101:18789",
+        None,
+        &settings,
+        &rules,
+        &nodes,
+        None,
+        None,
+    );
+    assert!(res_cgnat.is_private_ip);
+    assert_eq!(res_cgnat.target, "direct");
+    assert_eq!(res_cgnat.matched_by, "ip_cidr:100.64.0.0/10");
+
+    let mut global_settings = settings.clone();
+    global_settings.route_mode = RouteMode::Global;
+    let res_mesh = evaluate_route_target(
+        "peer.netbird.selfhosted",
+        None,
+        &global_settings,
+        &rules,
+        &nodes,
+        None,
+        None,
+    );
+    assert_eq!(res_mesh.target, "direct");
+    assert_eq!(res_mesh.dns_server, "dns-system");
+    assert_eq!(res_mesh.matched_by, "private_domain_suffix:netbird.selfhosted");
+
+    // 5. Real sing-box v1.14 check -c validation (without stub files).
+    if let Some(sb) = find_test_singbox() {
+        let compiled_real = SingBox114Compiler::compile(&CompileInput {
+            nodes: &nodes,
+            rules: &rules,
+            app_rules: &[],
+            extra_ports: &[],
+            settings: &settings,
+            control_secret: "cgnat-real-check",
+            cache_db_path: None,
+            rule_cache: None,
+            platform: CompilePlatform::Windows,
+        })
+        .expect("compile for sing-box check");
+        let report =
+            SingBox114Compiler::preflight_check(&sb, &compiled_real.config).expect("preflight");
+        assert!(
+            report.ok,
+            "sing-box check failed: stderr={} stdout={}",
+            report.stderr, report.stdout
+        );
+        assert!(
+            report.deprecated_warnings.is_empty(),
+            "Unexpected deprecation warnings: {:?}",
+            report.deprecated_warnings
+        );
+    }
+}

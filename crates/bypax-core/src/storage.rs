@@ -1430,6 +1430,7 @@ pub fn rule_preset_catalog() -> Vec<RulePresetSpec> {
         mk("r-apple", "tech", "Apple & iCloud", "geosite-apple", "geosite-apple", "direct", 37),
         mk("r-microsoft", "tech", "Microsoft Services", "geosite-microsoft", "geosite-microsoft", "direct", 38),
         mk("r-cloudflare-ip", "tech", "Cloudflare IPs (GeoIP)", "geoip-cloudflare", "geoip-cloudflare", "main", 38),
+        mk("r-steam-cn", "gaming", "Steam CN CDN (Direct)", "geosite-steam@cn", "geosite-steam@cn", "direct", 38),
         mk("r-steam", "gaming", "Steam", "geosite-steam", "geosite-steam", "main", 39),
         mk("r-paypal", "tech", "PayPal", "geosite-paypal", "geosite-paypal", "main", 39),
     ]

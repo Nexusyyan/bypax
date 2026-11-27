@@ -12,26 +12,59 @@ pub struct RuleSetStatus {
     pub fallback_mode: bool,
 }
 
-/// Builds candidate download URLs for official SagerNet sing-geosite / sing-geoip binary `.srs` files.
+/// Builds candidate download URLs for official SagerNet sing-geosite / sing-geoip binary `.srs`
+/// files with MetaCubeX `meta-rules-dat@sing` mirror fallback (which also hosts service GeoIP sets
+/// such as `geoip-telegram`, `geoip-google`, `geoip-netflix`, and `geoip-cloudflare` that are not
+/// published by SagerNet's country-only `sing-geoip` repo).
 pub fn default_rule_set_urls(tag: &str) -> Vec<String> {
     let clean = sanitize_tag(tag);
-    let repo = if clean.starts_with("geoip-") {
-        "sing-geoip"
-    } else {
-        "sing-geosite"
-    };
-    let raw_gh = format!(
-        "https://raw.githubusercontent.com/SagerNet/{}/rule-set/{}.srs",
-        repo, clean
+    if let Some(suffix) = clean.strip_prefix("geoip-") {
+        let sager_raw = format!(
+            "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/{}.srs",
+            clean
+        );
+        let meta_raw = format!(
+            "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/{}.srs",
+            suffix
+        );
+        return vec![
+            format!(
+                "https://cdn.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/{}.srs",
+                clean
+            ),
+            format!(
+                "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/{}.srs",
+                suffix
+            ),
+            sager_raw,
+            meta_raw.clone(),
+            format!("https://ghfast.top/{}", meta_raw),
+        ];
+    }
+
+    let sager_raw = format!(
+        "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/{}.srs",
+        clean
     );
-    vec![
-        format!(
-            "https://cdn.jsdelivr.net/gh/SagerNet/{}@rule-set/{}.srs",
-            repo, clean
-        ),
-        raw_gh.clone(),
-        format!("https://ghfast.top/{}", raw_gh),
-    ]
+    let mut urls = vec![format!(
+        "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/{}.srs",
+        clean
+    )];
+    if let Some(suffix) = clean.strip_prefix("geosite-") {
+        urls.push(format!(
+            "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/{}.srs",
+            suffix
+        ));
+    }
+    urls.push(sager_raw.clone());
+    if let Some(suffix) = clean.strip_prefix("geosite-") {
+        urls.push(format!(
+            "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/{}.srs",
+            suffix
+        ));
+    }
+    urls.push(format!("https://ghfast.top/{}", sager_raw));
+    urls
 }
 
 /// 3-tier `.srs` rule-set cache:
