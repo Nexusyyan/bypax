@@ -10,6 +10,25 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
+/// RFC 6598 Shared Address Space (CGNAT / Tailscale / NetBird / EasyTier / WireGuard mesh).
+/// sing-box `ip_is_private` covers RFC 1918, loopback, link-local, and IPv6 ULA (`fc00::/7`),
+/// but does NOT match `100.64.0.0/10`, so we emit an explicit direct rule alongside it.
+pub const CGNAT_MESH_CIDRS: &[&str] = &["100.64.0.0/10"];
+
+/// Standard LAN and mesh VPN internal DNS suffixes that must always bypass remote proxies
+/// and resolve through the host OS resolver rather than public DoH or FakeIP.
+pub const MESH_AND_LOCAL_DOMAIN_SUFFIXES: &[&str] = &[
+    "local",
+    "lan",
+    "localhost",
+    "localdomain",
+    "home.arpa",
+    "internal",
+    "ts.net",
+    "netbird.selfhosted",
+    "netbird.cloud",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompilePlatform {
     Windows,
@@ -470,6 +489,11 @@ impl SingBox114Compiler {
         }
         route_rules.push(json!({ "protocol": "dns", "action": "hijack-dns" }));
         route_rules.push(json!({ "ip_is_private": true, "outbound": "direct" }));
+        route_rules.push(json!({ "ip_cidr": CGNAT_MESH_CIDRS, "outbound": "direct" }));
+        route_rules.push(json!({
+            "domain_suffix": MESH_AND_LOCAL_DOMAIN_SUFFIXES,
+            "outbound": "direct"
+        }));
         route_rules.push(json!({ "clash_mode": "direct", "outbound": "direct" }));
 
         // Windows App Proxy single-port SOCKS5 `auth_user` routing (explicit non-follow pins).
@@ -771,6 +795,10 @@ impl SingBox114Compiler {
                 "server": boot_srv
             }));
         }
+        dns_servers.push(json!({
+            "type": "local",
+            "tag": "dns-system"
+        }));
         dns_servers.push(local_srv);
         dns_servers.push(remote_srv);
 
@@ -887,6 +915,17 @@ impl SingBox114Compiler {
         }
 
         dns_rules.push(json!({
+            "domain_suffix": MESH_AND_LOCAL_DOMAIN_SUFFIXES,
+            "server": "dns-system"
+        }));
+        if added_rule_sets.contains("geosite-private") {
+            dns_rules.push(json!({
+                "rule_set": ["geosite-private"],
+                "server": "dns-system"
+            }));
+        }
+
+        dns_rules.push(json!({
             "clash_mode": "direct",
             "server": "dns-local"
         }));
@@ -895,6 +934,12 @@ impl SingBox114Compiler {
                 "domain_suffix": direct_domains,
                 "server": "dns-local"
             }));
+            if added_rule_sets.contains("geosite-cn") {
+                dns_rules.push(json!({
+                    "rule_set": ["geosite-cn"],
+                    "server": "dns-local"
+                }));
+            }
             dns_rules.push(json!({
                 "clash_mode": "global",
                 "query_type": ["A", "AAAA"],
@@ -1526,7 +1571,8 @@ pub(crate) fn compile_dns_server(tag: &str, raw_spec: &str, detour: Option<&str>
 pub(crate) fn offline_srs_fallback_domains(tag: &str) -> Vec<&'static str> {
     match tag {
         "geosite-cn" => vec!["cn", "baidu.com", "qq.com", "bilibili.com", "taobao.com", "jd.com", "zhihu.com"],
-        "geosite-private" => vec!["local", "lan", "localhost", "home.arpa"],
+        "geosite-private" => MESH_AND_LOCAL_DOMAIN_SUFFIXES.to_vec(),
+        "geosite-steam@cn" => vec!["steamcontent.com", "steamserver.net", "dl.steam.clngaa.com"],
         "geosite-gfw" | "geosite-geolocation-!cn" => vec!["google.com", "youtube.com", "github.com", "openai.com"],
         "geosite-category-ai-!cn" | "geosite-openai" => vec!["openai.com", "chatgpt.com", "claude.ai", "anthropic.com"],
         "geosite-netflix" => vec!["netflix.com", "nflxvideo.net"],

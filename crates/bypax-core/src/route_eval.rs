@@ -1,4 +1,6 @@
-use crate::compiler::{match_auto_nodes, offline_srs_fallback_domains};
+use crate::compiler::{
+    match_auto_nodes, offline_srs_fallback_domains, MESH_AND_LOCAL_DOMAIN_SUFFIXES,
+};
 use crate::model::{AppSettings, NodeIR, RouteMode, RouteTestResult, SimpleRoutingRule};
 use crate::rule_cache::RuleCache;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -211,6 +213,17 @@ fn evaluate_dns_decision(
             return (custom.server.clone(), reason);
         }
     }
+    if let Some(suf) = MESH_AND_LOCAL_DOMAIN_SUFFIXES
+        .iter()
+        .find(|s| domain_matches_suffix(host, s))
+    {
+        return ("dns-system".to_string(), format!("private-domain:{}", suf));
+    }
+    if let (Some(cache), Some(sb)) = (rule_cache, sing_box_path) {
+        if cache.match_local_srs(sb, "geosite-private", host) == Some(true) {
+            return ("dns-system".to_string(), "rule_set:geosite-private".to_string());
+        }
+    }
     if settings.route_mode == RouteMode::Direct {
         return ("dns-local".to_string(), "mode:direct".to_string());
     }
@@ -258,8 +271,16 @@ pub fn evaluate_route_target(
     let (dns_server, dns_reason) =
         evaluate_dns_decision(&normalized, is_ip, settings, rules, rule_cache, sing_box_path);
 
-    // 1. Private IP always goes direct (matches `ip_is_private: true -> direct` preamble).
+    // 1. Private / CGNAT / Mesh IP always goes direct (matches `ip_is_private` + `100.64.0.0/10`).
     if private {
+        let matched_by = match parsed_ip {
+            Some(IpAddr::V4(v4))
+                if v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]) =>
+            {
+                "ip_cidr:100.64.0.0/10".to_string()
+            }
+            _ => "ip_is_private".to_string(),
+        };
         let (kind, label, node_id, region) =
             resolve_exit("direct", nodes, settings.main_node_id.as_deref());
         return RouteTestResult {
@@ -270,7 +291,7 @@ pub fn evaluate_route_target(
             route_mode: settings.route_mode,
             matched_rule_id: None,
             matched_rule_title: None,
-            matched_by: "ip_is_private".to_string(),
+            matched_by,
             target: "direct".to_string(),
             resolved_exit_kind: kind,
             resolved_exit_label: label,
@@ -279,6 +300,34 @@ pub fn evaluate_route_target(
             dns_server,
             dns_reason,
         };
+    }
+
+    // 1b. Standard LAN & Mesh VPN internal suffixes always go direct before clash_mode.
+    if !is_ip {
+        if let Some(suf) = MESH_AND_LOCAL_DOMAIN_SUFFIXES
+            .iter()
+            .find(|s| domain_matches_suffix(&normalized, s))
+        {
+            let (kind, label, node_id, region) =
+                resolve_exit("direct", nodes, settings.main_node_id.as_deref());
+            return RouteTestResult {
+                input: raw_input.to_string(),
+                normalized_host: normalized,
+                is_ip: false,
+                is_private_ip: true,
+                route_mode: settings.route_mode,
+                matched_rule_id: None,
+                matched_rule_title: None,
+                matched_by: format!("private_domain_suffix:{}", suf),
+                target: "direct".to_string(),
+                resolved_exit_kind: kind,
+                resolved_exit_label: label,
+                resolved_node_id: node_id,
+                resolved_node_region: region,
+                dns_server,
+                dns_reason,
+            };
+        }
     }
 
     // 2. Global / Direct clash_mode overrides rule list.
