@@ -1357,6 +1357,16 @@ fn test_updater_staging_swap_preserves_portable_data_and_results() -> Result<()>
                 "size": 7000000
             },
             {
+                "name": "bypax-v0.2.0-aarch64-macos.dmg",
+                "browser_download_url": "https://github.com/Nexusyyan/bypax/releases/download/v0.2.0/bypax-v0.2.0-aarch64-macos.dmg",
+                "size": 19000000
+            },
+            {
+                "name": "bypax-v0.2.0-x86_64-macos.dmg",
+                "browser_download_url": "https://github.com/Nexusyyan/bypax/releases/download/v0.2.0/bypax-v0.2.0-x86_64-macos.dmg",
+                "size": 19500000
+            },
+            {
                 "name": "SHA256SUMS.txt",
                 "browser_download_url": "https://github.com/Nexusyyan/bypax/releases/download/v0.2.0/SHA256SUMS.txt",
                 "size": 256
@@ -1365,10 +1375,44 @@ fn test_updater_staging_swap_preserves_portable_data_and_results() -> Result<()>
     }"#;
     let rep = parse_app_release_json("0.1.0", api_json, "proxy:bypax", true, true)?;
     assert!(rep.update_available);
-    assert_eq!(rep.selected_asset_kind.as_deref(), Some("standalone_exe"));
     if cfg!(target_os = "windows") {
+        assert_eq!(rep.selected_asset_kind.as_deref(), Some("standalone_exe"));
+        assert!(rep.in_app_update_supported);
+    } else if cfg!(target_os = "macos") {
+        assert_eq!(rep.selected_asset_kind.as_deref(), Some("macos_dmg"));
         assert!(rep.in_app_update_supported);
     }
+
+    let mac_arm_rep = bypax_core::updater::parse_app_release_json_for_platform(
+        "0.1.0",
+        api_json,
+        "proxy:bypax",
+        false,
+        false,
+        bypax_core::updater::UpdatePlatform::MacosArm64,
+        true,
+    )?;
+    assert_eq!(
+        mac_arm_rep.selected_asset_name.as_deref(),
+        Some("bypax-v0.2.0-aarch64-macos.dmg")
+    );
+    assert_eq!(mac_arm_rep.selected_asset_kind.as_deref(), Some("macos_dmg"));
+    assert!(mac_arm_rep.in_app_update_supported);
+
+    let mac_x64_rep = bypax_core::updater::parse_app_release_json_for_platform(
+        "0.1.0",
+        api_json,
+        "proxy:bypax",
+        false,
+        false,
+        bypax_core::updater::UpdatePlatform::MacosX64,
+        true,
+    )?;
+    assert_eq!(
+        mac_x64_rep.selected_asset_name.as_deref(),
+        Some("bypax-v0.2.0-x86_64-macos.dmg")
+    );
+    assert!(mac_x64_rep.in_app_update_supported);
 
     Ok(())
 }

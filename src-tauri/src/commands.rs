@@ -21,7 +21,8 @@ use bypax_core::rule_cache::RuleSetStatus;
 use bypax_core::storage::{classify_platform, extract_host, rule_preset_catalog};
 use bypax_core::tester::{batch_real_delay_with_progress, batch_tcping_with_progress};
 use bypax_core::updater::{
-    check_for_app_update, download_and_stage_update, fetch_text_via_channels, is_safe_release_url,
+    check_for_app_update, download_and_stage_update, fetch_text_via_channels,
+    find_macos_app_bundle_root, is_macos_translocated_path, is_safe_release_url,
     spawn_detached_update_helper, AppUpdateCheckReport, AppUpdateStage, AppUpdateState,
     UpdateApplyResult, UpdatePlan, CURRENT_APP_VERSION,
 };
@@ -1755,6 +1756,12 @@ pub async fn download_app_update(
     if !report.update_available {
         return Err("Bypax is already up to date".to_string());
     }
+    if !report.in_app_update_supported {
+        return Err(
+            "In-app auto-update is not supported for this installation; please download from GitHub Releases"
+                .to_string(),
+        );
+    }
 
     if let Ok(cur) = state.app_update_state.lock() {
         if matches!(
@@ -1770,6 +1777,11 @@ pub async fn download_app_update(
                 .as_deref()
                 .map(|p| PathBuf::from(p).is_file())
                 .unwrap_or(false)
+            && cur
+                .staged_app_bundle_path
+                .as_deref()
+                .map(|p| PathBuf::from(p).is_dir())
+                .unwrap_or(true)
         {
             return Ok(cur.clone());
         }
@@ -1894,6 +1906,15 @@ pub fn restart_to_update(app: AppHandle, state: State<'_, AppState>) -> Result<(
         .map(PathBuf::from)
         .filter(|p| p.is_file())
         .ok_or_else(|| "Staged update binary is missing; please download again".to_string())?;
+    let staged_app_bundle = staged
+        .staged_app_bundle_path
+        .as_deref()
+        .map(PathBuf::from);
+    if let Some(ref bundle_path) = staged_app_bundle {
+        if !bundle_path.is_dir() {
+            return Err("Staged macOS app bundle is missing; please download again".to_string());
+        }
+    }
     let staged_dir = staged
         .staged_dir
         .as_deref()
@@ -1906,10 +1927,27 @@ pub fn restart_to_update(app: AppHandle, state: State<'_, AppState>) -> Result<(
         });
 
     let target_exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let target_dir = target_exe
-        .parent()
-        .ok_or_else(|| "Unable to determine Bypax install directory".to_string())?
-        .to_path_buf();
+    let target_dir = if staged_app_bundle.is_some() {
+        let bundle = find_macos_app_bundle_root(&target_exe).ok_or_else(|| {
+            "Current executable is not inside a Bypax.app bundle; install Bypax.app in /Applications first"
+                .to_string()
+        })?;
+        if is_macos_translocated_path(&bundle) {
+            return Err(
+                "Bypax.app is running from macOS App Translocation; move Bypax.app to /Applications before updating"
+                    .to_string(),
+            );
+        }
+        bundle
+            .parent()
+            .ok_or_else(|| "Unable to determine Bypax.app parent directory".to_string())?
+            .to_path_buf()
+    } else {
+        target_exe
+            .parent()
+            .ok_or_else(|| "Unable to determine Bypax install directory".to_string())?
+            .to_path_buf()
+    };
 
     let resume_core = state.is_core_running();
     let resume_sys_proxy = state

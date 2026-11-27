@@ -25,12 +25,19 @@ pub const RESUME_APP_PROXY_ARG: &str = "--resume-app-proxy";
 pub const RESUME_TUN_ARG: &str = "--resume-tun";
 pub const CLEANUP_HELPER_ARG: &str = "--cleanup-helper";
 pub const BYPAX_SERVICE_NAME: &str = "BypaxService";
+pub const MACOS_LAUNCHD_PLIST_PATH: &str = "/Library/LaunchDaemons/com.bypax.service.plist";
 
 const MAX_RELEASE_NOTES_CHARS: usize = 4000;
 const MAX_ZIP_ENTRIES: usize = 512;
 const MAX_ZIP_UNPACKED_BYTES: u64 = 512 * 1024 * 1024;
 const MIN_PE_BYTES: u64 = 64 * 1024;
 const MIN_DRIVER_PE_BYTES: u64 = 8 * 1024;
+const MIN_MACHO_BYTES: u64 = 64 * 1024;
+const MH_MAGIC_64: u32 = 0xFEED_FACF;
+const FAT_MAGIC: u32 = 0xCAFE_BABE;
+const FAT_MAGIC_64: u32 = 0xCAFE_BABF;
+pub const MACHO_CPU_TYPE_X86_64: u32 = 0x0100_0007;
+pub const MACHO_CPU_TYPE_ARM64: u32 = 0x0100_000C;
 const PROGRESS_EMIT_INTERVAL_MS: u64 = 100;
 const DEFAULT_SWAP_MAX_ATTEMPTS: usize = 25;
 const DEFAULT_SWAP_RETRY_DELAY_MS: u64 = 200;
@@ -306,6 +313,8 @@ pub struct AppUpdateState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged_exe_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_app_bundle_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged_core_exe_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged_cli_exe_path: Option<String>,
@@ -333,6 +342,7 @@ impl Default for AppUpdateState {
             via: None,
             staged_dir: None,
             staged_exe_path: None,
+            staged_app_bundle_path: None,
             staged_core_exe_path: None,
             staged_cli_exe_path: None,
             staged_service_exe_path: None,
@@ -349,9 +359,13 @@ pub struct UpdatePlan {
     pub parent_pid: u32,
     pub target_exe: PathBuf,
     pub target_dir: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_app_bundle: Option<PathBuf>,
     pub portable_mode: bool,
     pub staged_dir: PathBuf,
     pub staged_exe: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_app_bundle: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged_core_exe: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -370,6 +384,8 @@ pub struct UpdatePlan {
     pub resume_tun: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_dir: Option<PathBuf>,
     pub from_version: String,
     pub to_version: String,
     pub to_tag: String,
@@ -393,13 +409,18 @@ impl UpdatePlan {
         resume_tun: bool,
         result_file: PathBuf,
     ) -> Self {
+        let target_app_bundle = find_macos_app_bundle_root(&target_exe);
+        let staged_app_bundle = staged.staged_app_bundle_path.as_ref().map(PathBuf::from);
+        let runtime_dir = result_file.parent().map(|p| p.to_path_buf());
         Self {
             parent_pid,
             target_exe,
             target_dir,
+            target_app_bundle,
             portable_mode,
             staged_dir,
             staged_exe,
+            staged_app_bundle,
             staged_core_exe: staged.staged_core_exe_path.as_ref().map(PathBuf::from),
             staged_cli_exe: staged.staged_cli_exe_path.as_ref().map(PathBuf::from),
             staged_service_exe: staged.staged_service_exe_path.as_ref().map(PathBuf::from),
@@ -410,6 +431,7 @@ impl UpdatePlan {
             resume_app_proxy,
             resume_tun,
             service_name: Some(BYPAX_SERVICE_NAME.to_string()),
+            runtime_dir,
             from_version: CURRENT_APP_VERSION.to_string(),
             to_version: staged
                 .target_version
@@ -584,6 +606,261 @@ pub fn validate_pe_header(path: &Path) -> Result<()> {
     validate_pe_image(path, MIN_PE_BYTES)
 }
 
+/// Returns the expected Mach-O 64-bit CPU type for the host macOS architecture.
+pub fn expected_host_macho_cputype() -> Option<u32> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Some(MACHO_CPU_TYPE_ARM64)
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        Some(MACHO_CPU_TYPE_X86_64)
+    }
+    #[cfg(not(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )))]
+    {
+        None
+    }
+}
+
+/// Validates that a file is a plausible 64-bit Mach-O or Universal (Fat) binary with at least
+/// `min_bytes` size, and matches `expected_cputype` when specified.
+pub fn validate_macho_binary(
+    path: &Path,
+    min_bytes: u64,
+    expected_cputype: Option<u32>,
+) -> Result<()> {
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("Missing Mach-O binary at {}", path.display()))?;
+    if meta.len() < min_bytes {
+        bail!(
+            "Mach-O binary too small ({} bytes; expected >= {} bytes)",
+            meta.len(),
+            min_bytes
+        );
+    }
+    let mut f = std::fs::File::open(path)?;
+    let mut hdr = [0u8; 8];
+    f.read_exact(&mut hdr)?;
+
+    let magic_le = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    let magic_be = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+
+    if magic_le == MH_MAGIC_64 {
+        let cputype = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        if let Some(exp) = expected_cputype {
+            if cputype != exp {
+                bail!(
+                    "Mach-O architecture mismatch for {} (expected 0x{:08x}, got 0x{:08x})",
+                    path.display(),
+                    exp,
+                    cputype
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if magic_be == MH_MAGIC_64 {
+        let cputype = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        if let Some(exp) = expected_cputype {
+            if cputype != exp {
+                bail!(
+                    "Mach-O architecture mismatch for {} (expected 0x{:08x}, got 0x{:08x})",
+                    path.display(),
+                    exp,
+                    cputype
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if magic_be == FAT_MAGIC || magic_be == FAT_MAGIC_64 {
+        let nfat = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+        if nfat == 0 || nfat > 16 {
+            bail!("Invalid Universal Mach-O slice count: {}", nfat);
+        }
+        let stride = if magic_be == FAT_MAGIC_64 { 32 } else { 20 };
+        let mut table = vec![0u8; nfat * stride];
+        f.read_exact(&mut table)?;
+        if let Some(exp) = expected_cputype {
+            let mut matched = false;
+            for i in 0..nfat {
+                let off = i * stride;
+                let cpu = u32::from_be_bytes([
+                    table[off],
+                    table[off + 1],
+                    table[off + 2],
+                    table[off + 3],
+                ]);
+                if cpu == exp {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                bail!(
+                    "Universal Mach-O binary {} does not contain required architecture 0x{:08x}",
+                    path.display(),
+                    exp
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    bail!(
+        "Invalid Mach-O header for {} (magic 0x{:08x})",
+        path.display(),
+        magic_le
+    );
+}
+
+/// Resolves the enclosing `*.app` bundle root when `exe_path` is located at
+/// `<App>.app/Contents/MacOS/<binary>`.
+pub fn find_macos_app_bundle_root(exe_path: &Path) -> Option<PathBuf> {
+    let macos_dir = exe_path.parent()?;
+    if macos_dir.file_name().and_then(|s| s.to_str()) != Some("MacOS") {
+        return None;
+    }
+    let contents_dir = macos_dir.parent()?;
+    if contents_dir.file_name().and_then(|s| s.to_str()) != Some("Contents") {
+        return None;
+    }
+    let app_bundle = contents_dir.parent()?;
+    let name = app_bundle.file_name().and_then(|s| s.to_str())?;
+    if name.len() > 4 && name.to_ascii_lowercase().ends_with(".app") {
+        Some(app_bundle.to_path_buf())
+    } else {
+        None
+    }
+}
+
+/// Returns `true` when `path` resides inside macOS Gatekeeper App Translocation
+/// (read-only randomized mount that cannot be replaced in place).
+pub fn is_macos_translocated_path(path: &Path) -> bool {
+    path.to_string_lossy().contains("/AppTranslocation/")
+}
+
+#[cfg(target_os = "macos")]
+fn is_dir_writable_fast(dir: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_dir_writable_fast(dir: &Path) -> bool {
+    std::fs::metadata(dir)
+        .map(|m| m.is_dir() && !m.permissions().readonly())
+        .unwrap_or(false)
+}
+
+/// Returns `true` when `exe_path` belongs to a writable, non-translocated macOS `.app` bundle
+/// that can be replaced in place.
+pub fn is_macos_app_bundle_updatable(exe_path: &Path) -> bool {
+    let Some(bundle) = find_macos_app_bundle_root(exe_path) else {
+        return false;
+    };
+    if is_macos_translocated_path(&bundle) {
+        return false;
+    }
+    let Some(parent) = bundle.parent() else {
+        return false;
+    };
+    is_dir_writable_fast(parent)
+}
+
+/// Validates the structure, Mach-O binaries, and (optionally on macOS) deep code signature
+/// of a staged `Bypax.app` bundle.
+pub fn validate_macos_app_bundle(
+    app_bundle: &Path,
+    expected_cputype: Option<u32>,
+    verify_codesign: bool,
+) -> Result<()> {
+    if !app_bundle.is_dir() {
+        bail!("Staged macOS app bundle missing: {}", app_bundle.display());
+    }
+    let info_plist = app_bundle.join("Contents").join("Info.plist");
+    if !info_plist.is_file() {
+        bail!("Staged macOS app bundle missing Contents/Info.plist");
+    }
+    let macos_dir = app_bundle.join("Contents").join("MacOS");
+    let main_exe = macos_dir.join("bypax");
+    validate_macho_binary(&main_exe, MIN_MACHO_BYTES, expected_cputype)
+        .context("Invalid main executable inside staged Bypax.app")?;
+
+    for companion in [
+        macos_dir.join("bypax-cli"),
+        macos_dir.join("bypax-service"),
+        macos_dir.join("core").join("sing-box"),
+    ] {
+        if companion.is_file() {
+            validate_macho_binary(&companion, MIN_MACHO_BYTES, expected_cputype)
+                .with_context(|| format!("Invalid companion Mach-O binary: {}", companion.display()))?;
+        }
+    }
+
+    if verify_codesign {
+        #[cfg(target_os = "macos")]
+        {
+            let out = std::process::Command::new("/usr/bin/codesign")
+                .args(["--verify", "--deep", "--strict"])
+                .arg(app_bundle)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .context("Failed to execute codesign --verify on staged Bypax.app")?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                bail!(
+                    "Staged Bypax.app failed codesign verification: {}",
+                    stderr.trim()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Target platform selector used for release asset matching and cross-platform tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdatePlatform {
+    WindowsX64,
+    MacosArm64,
+    MacosX64,
+    Other,
+}
+
+impl UpdatePlatform {
+    pub fn current() -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            Self::WindowsX64
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            Self::MacosArm64
+        }
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        {
+            Self::MacosX64
+        }
+        #[cfg(not(any(
+            target_os = "windows",
+            all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64"))
+        )))]
+        {
+            Self::Other
+        }
+    }
+}
+
 /// Detects whether companion binaries (`bypax-cli.exe`, `bypax-service.exe`, or `runtime/windivert`)
 /// are installed alongside the main executable, indicating a multi-binary bundle layout.
 pub fn has_companion_binaries_in(dir: &Path) -> bool {
@@ -592,20 +869,16 @@ pub fn has_companion_binaries_in(dir: &Path) -> bool {
         || dir.join("runtime").join("windivert").is_dir()
 }
 
-/// Parses GitHub Releases API JSON into a verified `AppUpdateCheckReport`.
-///
-/// Selection strategy:
-/// - Portable mode or multi-binary bundle installs always prefer `portable_zip` so
-///   `bypax.exe`, `bypax-cli.exe`, `bypax-service.exe`, core, drivers, and agent skills
-///   upgrade together cleanly.
-/// - Pure single-file standalone installs (no portable marker and no companion binaries)
-///   prefer the lightweight `standalone_exe`.
-pub fn parse_app_release_json_with_layout(
+/// Parses GitHub Releases API JSON into a verified `AppUpdateCheckReport` for an explicit target
+/// platform and installation writability state.
+pub fn parse_app_release_json_for_platform(
     current_version: &str,
     json_body: &str,
     via: &str,
     portable_mode: bool,
     has_companion_binaries: bool,
+    platform: UpdatePlatform,
+    macos_bundle_updatable: bool,
 ) -> Result<AppUpdateCheckReport> {
     let parsed: GithubReleaseResponse =
         serde_json::from_str(json_body).context("Invalid GitHub release JSON")?;
@@ -625,6 +898,9 @@ pub fn parse_app_release_json_with_layout(
     let mut nodriver_zip: Option<(String, String, u64)> = None;
     let mut fallback_zip: Option<(String, String, u64)> = None;
     let mut standalone_exe: Option<(String, String, u64)> = None;
+    let mut macos_arm64_dmg: Option<(String, String, u64)> = None;
+    let mut macos_x64_dmg: Option<(String, String, u64)> = None;
+    let mut macos_universal_dmg: Option<(String, String, u64)> = None;
     let mut checksums_url: Option<String> = None;
 
     for asset in parsed.assets {
@@ -644,26 +920,47 @@ pub fn parse_app_release_json_with_layout(
             || (lower.contains("windows") && lower.ends_with(".exe"))
         {
             standalone_exe = Some((asset.name, asset.browser_download_url, asset.size));
+        } else if lower.contains("macos") && lower.ends_with(".dmg") {
+            if lower.contains("aarch64") || lower.contains("arm64") {
+                macos_arm64_dmg = Some((asset.name, asset.browser_download_url, asset.size));
+            } else if lower.contains("x86_64") || lower.contains("amd64") || lower.contains("x64") {
+                macos_x64_dmg = Some((asset.name, asset.browser_download_url, asset.size));
+            } else if lower.contains("universal") {
+                macos_universal_dmg = Some((asset.name, asset.browser_download_url, asset.size));
+            }
         }
     }
 
     let preferred_zip = portable_zip.or(fallback_zip).or(nodriver_zip);
     let prefer_bundle = portable_mode || has_companion_binaries;
 
-    let (selected_asset_kind, selected) = if prefer_bundle {
-        if let Some(z) = preferred_zip {
-            (Some("portable_zip".to_string()), Some(z))
-        } else if let Some(e) = standalone_exe {
-            (Some("standalone_exe".to_string()), Some(e))
-        } else {
-            (None, None)
+    let (selected_asset_kind, selected) = match platform {
+        UpdatePlatform::WindowsX64 => {
+            if prefer_bundle {
+                if let Some(z) = preferred_zip {
+                    (Some("portable_zip".to_string()), Some(z))
+                } else if let Some(e) = standalone_exe {
+                    (Some("standalone_exe".to_string()), Some(e))
+                } else {
+                    (None, None)
+                }
+            } else if let Some(e) = standalone_exe {
+                (Some("standalone_exe".to_string()), Some(e))
+            } else if let Some(z) = preferred_zip {
+                (Some("portable_zip".to_string()), Some(z))
+            } else {
+                (None, None)
+            }
         }
-    } else if let Some(e) = standalone_exe {
-        (Some("standalone_exe".to_string()), Some(e))
-    } else if let Some(z) = preferred_zip {
-        (Some("portable_zip".to_string()), Some(z))
-    } else {
-        (None, None)
+        UpdatePlatform::MacosArm64 => match macos_arm64_dmg.or(macos_universal_dmg) {
+            Some(d) => (Some("macos_dmg".to_string()), Some(d)),
+            None => (None, None),
+        },
+        UpdatePlatform::MacosX64 => match macos_x64_dmg.or(macos_universal_dmg) {
+            Some(d) => (Some("macos_dmg".to_string()), Some(d)),
+            None => (None, None),
+        },
+        UpdatePlatform::Other => (None, None),
     };
 
     let (selected_asset_name, selected_asset_url, selected_asset_size) = match selected {
@@ -671,9 +968,33 @@ pub fn parse_app_release_json_with_layout(
         None => (None, None, None),
     };
 
-    let in_app_update_supported = cfg!(target_os = "windows")
-        && selected_asset_url.is_some()
-        && checksums_url.is_some();
+    let in_app_update_supported = match platform {
+        UpdatePlatform::WindowsX64 => selected_asset_url.is_some() && checksums_url.is_some(),
+        UpdatePlatform::MacosArm64 | UpdatePlatform::MacosX64 => {
+            macos_bundle_updatable
+                && selected_asset_kind.as_deref() == Some("macos_dmg")
+                && selected_asset_url.is_some()
+                && checksums_url.is_some()
+        }
+        UpdatePlatform::Other => false,
+    };
+
+    let install_mode = match platform {
+        UpdatePlatform::MacosArm64 | UpdatePlatform::MacosX64 => {
+            if macos_bundle_updatable {
+                "app_bundle".to_string()
+            } else {
+                "standalone".to_string()
+            }
+        }
+        _ => {
+            if portable_mode {
+                "portable".to_string()
+            } else {
+                "standalone".to_string()
+            }
+        }
+    };
 
     let release_notes = parsed
         .body
@@ -699,15 +1020,35 @@ pub fn parse_app_release_json_with_layout(
         selected_asset_size,
         selected_asset_kind,
         checksums_url,
-        install_mode: if portable_mode {
-            "portable".to_string()
-        } else {
-            "standalone".to_string()
-        },
+        install_mode,
         in_app_update_supported,
         checked_via: via.to_string(),
         checked_at_ms: now_epoch_ms(),
     })
+}
+
+/// Parses GitHub Releases API JSON into a verified `AppUpdateCheckReport`.
+///
+/// Selection strategy:
+/// - Windows portable mode or multi-binary bundle installs prefer `portable_zip`.
+/// - Windows single-file standalone installs prefer lightweight `standalone_exe`.
+/// - macOS Apple Silicon / Intel selects the arch-matched `macos_dmg`.
+pub fn parse_app_release_json_with_layout(
+    current_version: &str,
+    json_body: &str,
+    via: &str,
+    portable_mode: bool,
+    has_companion_binaries: bool,
+) -> Result<AppUpdateCheckReport> {
+    parse_app_release_json_for_platform(
+        current_version,
+        json_body,
+        via,
+        portable_mode,
+        has_companion_binaries,
+        UpdatePlatform::current(),
+        cfg!(target_os = "macos"),
+    )
 }
 
 /// Parses GitHub Releases API JSON into a verified `AppUpdateCheckReport`.
@@ -727,9 +1068,14 @@ pub async fn check_for_app_update(
     portable_mode: bool,
     _core_installed: bool,
 ) -> Result<AppUpdateCheckReport> {
-    let has_companions = std::env::current_exe()
-        .ok()
+    let current_exe = std::env::current_exe().ok();
+    let has_companions = current_exe
+        .as_deref()
         .and_then(|p| p.parent().map(has_companion_binaries_in))
+        .unwrap_or(false);
+    let macos_bundle_updatable = current_exe
+        .as_deref()
+        .map(is_macos_app_bundle_updatable)
         .unwrap_or(false);
     let channels = build_proxy_channels(local_proxy_port);
     let mut last_err = String::new();
@@ -771,7 +1117,9 @@ pub async fn check_for_app_update(
                 selected_asset_size: None,
                 selected_asset_kind: None,
                 checksums_url: None,
-                install_mode: if portable_mode {
+                install_mode: if cfg!(target_os = "macos") && macos_bundle_updatable {
+                    "app_bundle".to_string()
+                } else if portable_mode {
                     "portable".to_string()
                 } else {
                     "standalone".to_string()
@@ -795,12 +1143,14 @@ pub async fn check_for_app_update(
             }
         };
 
-        return parse_app_release_json_with_layout(
+        return parse_app_release_json_for_platform(
             CURRENT_APP_VERSION,
             &body,
             ch.label(),
             portable_mode,
             has_companions,
+            UpdatePlatform::current(),
+            macos_bundle_updatable,
         );
     }
 
@@ -993,6 +1343,143 @@ pub fn discover_staged_bundle_files(
     Ok(bundle)
 }
 
+#[cfg(target_os = "macos")]
+struct DmgMountGuard {
+    mount_point: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for DmgMountGuard {
+    fn drop(&mut self) {
+        let ok = std::process::Command::new("/usr/bin/hdiutil")
+            .args(["detach", "-quiet"])
+            .arg(&self.mount_point)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let _ = std::process::Command::new("/usr/bin/hdiutil")
+                .args(["detach", "-force", "-quiet"])
+                .arg(&self.mount_point)
+                .stdin(std::process::Stdio::null())
+                .status();
+        }
+        let _ = std::fs::remove_dir(&self.mount_point);
+    }
+}
+
+/// Mounts a verified macOS DMG read-only at a private mountpoint, copies `Bypax.app` into
+/// `dest_payload_dir`, unmounts cleanly, strips quarantine attributes, and validates the
+/// Mach-O binaries and deep code signature.
+#[cfg(target_os = "macos")]
+pub fn extract_macos_dmg_app(dmg_path: &Path, dest_payload_dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(dest_payload_dir)?;
+    let mount_root = dmg_path.parent().unwrap_or(dest_payload_dir);
+    let mount_point = mount_root.join(format!(
+        "dmg-mount-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    std::fs::create_dir_all(&mount_point)?;
+
+    let attach_out = std::process::Command::new("/usr/bin/hdiutil")
+        .args([
+            "attach",
+            "-nobrowse",
+            "-readonly",
+            "-noverify",
+            "-noautoopen",
+            "-mountpoint",
+        ])
+        .arg(&mount_point)
+        .arg(dmg_path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("Failed to execute hdiutil attach")?;
+    if !attach_out.status.success() {
+        let _ = std::fs::remove_dir(&mount_point);
+        let stderr = String::from_utf8_lossy(&attach_out.stderr);
+        bail!("Unable to mount macOS update DMG: {}", stderr.trim());
+    }
+
+    let guard = DmgMountGuard {
+        mount_point: mount_point.clone(),
+    };
+
+    let src_app = find_macos_app_in_mount(&mount_point)
+        .ok_or_else(|| anyhow!("Bypax.app not found inside macOS update DMG"))?;
+    let app_name = src_app
+        .file_name()
+        .ok_or_else(|| anyhow!("Invalid app bundle name in DMG"))?;
+    let dst_app = dest_payload_dir.join(app_name);
+    if dst_app.exists() {
+        let _ = std::fs::remove_dir_all(&dst_app);
+    }
+
+    let ditto_out = std::process::Command::new("/usr/bin/ditto")
+        .arg(&src_app)
+        .arg(&dst_app)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("Failed to copy Bypax.app from mounted DMG")?;
+    if !ditto_out.status.success() {
+        let _ = std::fs::remove_dir_all(&dst_app);
+        let stderr = String::from_utf8_lossy(&ditto_out.stderr);
+        bail!("Failed to extract Bypax.app via ditto: {}", stderr.trim());
+    }
+
+    // Explicitly detach before validating and returning.
+    drop(guard);
+
+    let _ = std::process::Command::new("/usr/bin/xattr")
+        .args(["-dr", "com.apple.quarantine"])
+        .arg(&dst_app)
+        .stdin(std::process::Stdio::null())
+        .output();
+
+    if let Err(e) = validate_macos_app_bundle(&dst_app, expected_host_macho_cputype(), true) {
+        let _ = std::fs::remove_dir_all(&dst_app);
+        return Err(e);
+    }
+
+    Ok(dst_app)
+}
+
+#[cfg(target_os = "macos")]
+fn find_macos_app_in_mount(mount_point: &Path) -> Option<PathBuf> {
+    let direct = mount_point.join("Bypax.app");
+    if let Ok(meta) = std::fs::symlink_metadata(&direct) {
+        if meta.file_type().is_dir() && direct.join("Contents").join("MacOS").join("bypax").is_file()
+        {
+            return Some(direct);
+        }
+    }
+    let entries = std::fs::read_dir(mount_point).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_dir() {
+            continue;
+        }
+        let is_app = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|n| n.to_ascii_lowercase().ends_with(".app"))
+            .unwrap_or(false);
+        if is_app && path.join("Contents").join("MacOS").join("bypax").is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn extract_macos_dmg_app(_dmg_path: &Path, _dest_payload_dir: &Path) -> Result<PathBuf> {
+    bail!("macOS DMG extraction is only supported on macOS");
+}
+
 /// Downloads, cryptographically verifies (mandatory SHA256SUMS.txt), and stages an app update.
 pub async fn download_and_stage_update<F>(
     report: &AppUpdateCheckReport,
@@ -1037,6 +1524,7 @@ where
         via: None,
         staged_dir: None,
         staged_exe_path: None,
+        staged_app_bundle_path: None,
         staged_core_exe_path: None,
         staged_cli_exe_path: None,
         staged_service_exe_path: None,
@@ -1219,53 +1707,84 @@ where
     let payload_dir = stage_dir.join("payload");
     std::fs::create_dir_all(&payload_dir)?;
 
-    let (staged_exe, staged_cli_exe, staged_service_exe, staged_core_exe, staged_extra_files) =
-        if asset_kind == "portable_zip" {
-            state.stage = AppUpdateStage::Extracting;
-            on_progress(state.clone());
-            if let Err(e) = extract_zip_safely(&part_path, &payload_dir) {
-                let _ = std::fs::remove_dir_all(&stage_dir);
-                return Err(e);
-            }
-            let _ = std::fs::remove_file(&part_path);
+    let (
+        staged_exe,
+        staged_app_bundle,
+        staged_cli_exe,
+        staged_service_exe,
+        staged_core_exe,
+        staged_extra_files,
+    ) = if asset_kind == "portable_zip" {
+        state.stage = AppUpdateStage::Extracting;
+        on_progress(state.clone());
+        if let Err(e) = extract_zip_safely(&part_path, &payload_dir) {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return Err(e);
+        }
+        let _ = std::fs::remove_file(&part_path);
 
-            let exe = find_file_in_staged(&payload_dir, "bypax.exe").ok_or_else(|| {
-                let _ = std::fs::remove_dir_all(&stage_dir);
-                anyhow!("bypax.exe not found inside update ZIP archive")
-            })?;
-            if let Err(e) = validate_pe_header(&exe) {
-                let _ = std::fs::remove_dir_all(&stage_dir);
-                return Err(e);
-            }
-            let payload_root = exe.parent().unwrap_or(&payload_dir);
-            let bundle = match discover_staged_bundle_files(payload_root, true) {
-                Ok(b) => b,
-                Err(e) => {
-                    let _ = std::fs::remove_dir_all(&stage_dir);
-                    return Err(e);
-                }
-            };
-            (
-                exe,
-                bundle.cli_exe,
-                bundle.service_exe,
-                bundle.core_exe,
-                bundle.extra_swaps,
-            )
-        } else {
-            if let Err(e) = validate_pe_header(&part_path) {
+        let exe = find_file_in_staged(&payload_dir, "bypax.exe").ok_or_else(|| {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            anyhow!("bypax.exe not found inside update ZIP archive")
+        })?;
+        if let Err(e) = validate_pe_header(&exe) {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return Err(e);
+        }
+        let payload_root = exe.parent().unwrap_or(&payload_dir);
+        let bundle = match discover_staged_bundle_files(payload_root, true) {
+            Ok(b) => b,
+            Err(e) => {
                 let _ = std::fs::remove_dir_all(&stage_dir);
                 return Err(e);
             }
-            let exe = payload_dir.join("bypax.exe");
-            std::fs::rename(&part_path, &exe)?;
-            (exe, None, None, None, Vec::new())
         };
+        (
+            exe,
+            None,
+            bundle.cli_exe,
+            bundle.service_exe,
+            bundle.core_exe,
+            bundle.extra_swaps,
+        )
+    } else if asset_kind == "macos_dmg" {
+        state.stage = AppUpdateStage::Extracting;
+        on_progress(state.clone());
+        let dmg_path = stage_dir.join("update.dmg");
+        if let Err(e) = std::fs::rename(&part_path, &dmg_path) {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return Err(e.into());
+        }
+        let staged_app = match extract_macos_dmg_app(&dmg_path, &payload_dir) {
+            Ok(app) => app,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&stage_dir);
+                return Err(e);
+            }
+        };
+        let _ = std::fs::remove_file(&dmg_path);
+
+        let macos_dir = staged_app.join("Contents").join("MacOS");
+        let exe = macos_dir.join("bypax");
+        let cli = Some(macos_dir.join("bypax-cli")).filter(|p| p.is_file());
+        let svc = Some(macos_dir.join("bypax-service")).filter(|p| p.is_file());
+        let core = Some(macos_dir.join("core").join("sing-box")).filter(|p| p.is_file());
+        (exe, Some(staged_app), cli, svc, core, Vec::new())
+    } else {
+        if let Err(e) = validate_pe_header(&part_path) {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return Err(e);
+        }
+        let exe = payload_dir.join("bypax.exe");
+        std::fs::rename(&part_path, &exe)?;
+        (exe, None, None, None, None, Vec::new())
+    };
 
     state.stage = AppUpdateStage::ReadyToRestart;
     state.via = Some(final_via);
     state.staged_dir = Some(stage_dir.to_string_lossy().to_string());
     state.staged_exe_path = Some(staged_exe.to_string_lossy().to_string());
+    state.staged_app_bundle_path = staged_app_bundle.map(|p| p.to_string_lossy().to_string());
     state.staged_core_exe_path = staged_core_exe.map(|p| p.to_string_lossy().to_string());
     state.staged_cli_exe_path = staged_cli_exe.map(|p| p.to_string_lossy().to_string());
     state.staged_service_exe_path = staged_service_exe.map(|p| p.to_string_lossy().to_string());
@@ -1297,10 +1816,17 @@ pub fn ensure_target_dir_writable(target_dir: &Path) -> Result<()> {
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     ));
     std::fs::write(&probe, b"ok").with_context(|| {
-        format!(
-            "Installation folder {} is not writable; move Bypax to a writable directory or run as administrator",
-            target_dir.display()
-        )
+        if cfg!(target_os = "macos") {
+            format!(
+                "Installation folder {} is not writable; move Bypax.app to a writable directory such as /Applications or ~/Applications",
+                target_dir.display()
+            )
+        } else {
+            format!(
+                "Installation folder {} is not writable; move Bypax to a writable directory or run as administrator",
+                target_dir.display()
+            )
+        }
     })?;
     let _ = std::fs::remove_file(&probe);
     Ok(())
@@ -1309,6 +1835,14 @@ pub fn ensure_target_dir_writable(target_dir: &Path) -> Result<()> {
 /// Copies the current executable into a detached helper binary and launches it to apply `plan`
 /// after this process exits.
 pub fn spawn_detached_update_helper(plan: &UpdatePlan) -> Result<()> {
+    if let Some(ref staged_app) = plan.staged_app_bundle {
+        if !staged_app.is_dir() {
+            bail!(
+                "Staged macOS app bundle missing: {}",
+                staged_app.display()
+            );
+        }
+    }
     if !plan.staged_exe.is_file() {
         bail!("Staged update binary missing: {}", plan.staged_exe.display());
     }
@@ -1317,17 +1851,45 @@ pub fn spawn_detached_update_helper(plan: &UpdatePlan) -> Result<()> {
     let current_exe = std::env::current_exe().context("Cannot resolve current executable")?;
     let temp_dir = std::env::temp_dir();
     let nonce = &uuid::Uuid::new_v4().simple().to_string()[..10];
-    let helper_exe = temp_dir.join(format!("bypax-updater-{}.exe", nonce));
+    let helper_name = if cfg!(windows) {
+        format!("bypax-updater-{}.exe", nonce)
+    } else {
+        format!("bypax-updater-{}", nonce)
+    };
+    let helper_exe = temp_dir.join(helper_name);
     let plan_path = temp_dir.join(format!("bypax-update-plan-{}.json", nonce));
 
     std::fs::copy(&current_exe, &helper_exe).context("Failed to copy updater helper binary")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&helper_exe, std::fs::Permissions::from_mode(0o755));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Re-sign the copied standalone helper binary ad-hoc so Apple Silicon accepts it
+        // even when the source binary carried bundle-bound CodeResources hashes.
+        let _ = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&helper_exe)
+            .stdin(std::process::Stdio::null())
+            .output();
+        let _ = std::process::Command::new("/usr/bin/xattr")
+            .args(["-d", "com.apple.quarantine"])
+            .arg(&helper_exe)
+            .stdin(std::process::Stdio::null())
+            .output();
+    }
     std::fs::write(&plan_path, serde_json::to_string_pretty(plan)?)
         .context("Failed to persist update plan")?;
 
     let mut cmd = std::process::Command::new(&helper_exe);
     cmd.arg(APPLY_UPDATE_ARG)
         .arg(&plan_path)
-        .current_dir(&temp_dir);
+        .current_dir(&temp_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
 
     #[cfg(windows)]
     {
@@ -1336,6 +1898,17 @@ pub fn spawn_detached_update_helper(plan: &UpdatePlan) -> Result<()> {
         const DETACHED_PROCESS: u32 = 0x00000008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
         cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
     }
 
     cmd.spawn()
@@ -1381,6 +1954,158 @@ fn sibling_tmp_path_for(target: &Path) -> PathBuf {
         .and_then(|s| s.to_str())
         .unwrap_or("bypax.exe");
     parent.join(format!(".{}.new.tmp", file_name))
+}
+
+/// Computes the hidden sibling `.prev.app` backup path for a macOS `.app` bundle so Finder and
+/// Launchpad do not surface a duplicate icon during an in-place swap.
+pub fn backup_app_bundle_path_for(target_app: &Path) -> PathBuf {
+    let parent = target_app.parent().unwrap_or_else(|| Path::new("."));
+    let stem = target_app
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Bypax");
+    let ext = target_app
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("app");
+    parent.join(format!(".{}.prev.{}", stem, ext))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let meta = std::fs::symlink_metadata(&src_path)?;
+        if meta.file_type().is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else if meta.file_type().is_file() {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_app_bundle_dir(src_app: &Path, dst_app: &Path) -> Result<()> {
+    if dst_app.exists() {
+        let _ = std::fs::remove_dir_all(dst_app);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("/usr/bin/ditto")
+            .arg(src_app)
+            .arg(dst_app)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .context("Failed to execute ditto while staging macOS app bundle")?;
+        if !out.status.success() {
+            let _ = std::fs::remove_dir_all(dst_app);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!("ditto failed to stage app bundle: {}", stderr.trim());
+        }
+        let _ = std::process::Command::new("/usr/bin/xattr")
+            .args(["-dr", "com.apple.quarantine"])
+            .arg(dst_app)
+            .stdin(std::process::Stdio::null())
+            .output();
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        copy_dir_recursive(src_app, dst_app)
+    }
+}
+
+/// Atomically replaces a macOS `.app` bundle with a staged bundle via same-volume pre-staging,
+/// hidden `.prev.app` backup, and automatic rollback on failure.
+pub fn replace_macos_app_bundle_atomically(staged_app: &Path, target_app: &Path) -> Result<()> {
+    replace_macos_app_bundle_atomically_internal(
+        staged_app,
+        target_app,
+        DEFAULT_SWAP_MAX_ATTEMPTS,
+        Duration::from_millis(DEFAULT_SWAP_RETRY_DELAY_MS),
+        |_| Ok(()),
+    )
+}
+
+fn replace_macos_app_bundle_atomically_internal<F>(
+    staged_app: &Path,
+    target_app: &Path,
+    max_attempts: usize,
+    retry_delay: Duration,
+    mut before_swap_hook: F,
+) -> Result<()>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
+    if !staged_app.is_dir() {
+        bail!("Staged app bundle missing: {}", staged_app.display());
+    }
+    if !staged_app.join("Contents").join("MacOS").join("bypax").is_file() {
+        bail!(
+            "Staged app bundle missing Contents/MacOS/bypax: {}",
+            staged_app.display()
+        );
+    }
+    let parent = target_app
+        .parent()
+        .ok_or_else(|| anyhow!("Target app bundle has no parent: {}", target_app.display()))?;
+    std::fs::create_dir_all(parent)?;
+
+    let sibling_tmp = sibling_tmp_path_for(target_app);
+    let backup = backup_app_bundle_path_for(target_app);
+
+    if sibling_tmp.exists() {
+        let _ = std::fs::remove_dir_all(&sibling_tmp);
+    }
+    copy_app_bundle_dir(staged_app, &sibling_tmp)?;
+
+    let attempts = max_attempts.max(1);
+    let mut last_err = String::new();
+    for attempt in 0..attempts {
+        if let Err(e) = before_swap_hook(target_app) {
+            let _ = std::fs::remove_dir_all(&sibling_tmp);
+            return Err(e);
+        }
+
+        if backup.exists() {
+            let _ = std::fs::remove_dir_all(&backup);
+        }
+
+        let existed_before = target_app.exists();
+        if existed_before {
+            if let Err(e) = std::fs::rename(target_app, &backup) {
+                last_err = format!("rename existing app bundle to backup: {}", e);
+                if attempt + 1 < attempts {
+                    std::thread::sleep(retry_delay);
+                }
+                continue;
+            }
+        }
+
+        match std::fs::rename(&sibling_tmp, target_app) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = format!("rename staged app bundle into place: {}", e);
+                if existed_before {
+                    let _ = std::fs::rename(&backup, target_app);
+                }
+                if attempt + 1 < attempts {
+                    std::thread::sleep(retry_delay);
+                }
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&sibling_tmp);
+    Err(anyhow!(
+        "Failed to replace {} after {} attempts: {}",
+        target_app.display(),
+        attempts,
+        last_err
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -1582,12 +2307,32 @@ pub trait ServiceLifecycleController {
 pub struct OsServiceLifecycleController {
     #[cfg_attr(not(windows), allow(dead_code))]
     service_name: String,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    runtime_dir: Option<PathBuf>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    target_app_bundle: Option<PathBuf>,
+    #[cfg(target_os = "macos")]
+    last_pid: std::sync::Mutex<Option<u32>>,
 }
 
 impl OsServiceLifecycleController {
     pub fn new(service_name: impl Into<String>) -> Self {
         Self {
             service_name: service_name.into(),
+            runtime_dir: None,
+            target_app_bundle: None,
+            #[cfg(target_os = "macos")]
+            last_pid: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn for_plan(service_name: impl Into<String>, plan: &UpdatePlan) -> Self {
+        Self {
+            service_name: service_name.into(),
+            runtime_dir: plan.runtime_dir.clone(),
+            target_app_bundle: plan.target_app_bundle.clone(),
+            #[cfg(target_os = "macos")]
+            last_pid: std::sync::Mutex::new(None),
         }
     }
 }
@@ -1788,7 +2533,131 @@ impl ServiceLifecycleController for OsServiceLifecycleController {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn plist_references_app_bundle(plist_path: &Path, target_app: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(plist_path) else {
+        return false;
+    };
+    let check_candidate = |p: &Path| {
+        let s = p.to_string_lossy();
+        let escaped = s
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        raw.contains(&format!("{}/Contents/MacOS/bypax-service", escaped))
+            || raw.contains(&format!("{}/Contents/MacOS/bypax-service", s))
+    };
+    if check_candidate(target_app) {
+        return true;
+    }
+    if let Ok(canon) = std::fs::canonicalize(target_app) {
+        return check_candidate(&canon);
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn send_macos_service_command_sync(
+    command: bypax_ipc::ServiceCommand,
+    runtime_dir: Option<&Path>,
+    timeout: Duration,
+) -> Result<bypax_ipc::ServiceResponse> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(bypax_ipc::UNIX_SVC_SOCKET_PATH)
+        .context("Unable to connect to macOS bypax-service socket")?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    let token = bypax_ipc::load_ipc_token(runtime_dir).unwrap_or_default();
+    let env = bypax_ipc::ServiceEnvelope {
+        id: format!("updater-{}", now_epoch_ms()),
+        session_token: token,
+        command,
+    };
+    let mut payload = serde_json::to_string(&env)?;
+    payload.push('\n');
+    stream.write_all(payload.as_bytes())?;
+    stream.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let n = reader.read_line(&mut line)?;
+    if n == 0 {
+        bail!("macOS bypax-service closed socket before responding");
+    }
+    let resp: bypax_ipc::ServiceResponse = serde_json::from_str(line.trim())?;
+    Ok(resp)
+}
+
+#[cfg(target_os = "macos")]
+impl ServiceLifecycleController for OsServiceLifecycleController {
+    fn is_service_running(&self) -> bool {
+        let plist = Path::new(MACOS_LAUNCHD_PLIST_PATH);
+        if !plist.is_file() || !Path::new(bypax_ipc::UNIX_SVC_SOCKET_PATH).exists() {
+            return false;
+        }
+        if let Some(ref target_app) = self.target_app_bundle {
+            if !plist_references_app_bundle(plist, target_app) {
+                return false;
+            }
+        }
+        match send_macos_service_command_sync(
+            bypax_ipc::ServiceCommand::Ping,
+            self.runtime_dir.as_deref(),
+            Duration::from_millis(800),
+        ) {
+            Ok(resp) if resp.ok => {
+                if let Ok(mut guard) = self.last_pid.lock() {
+                    *guard = resp.service_pid;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn stop_service_gracefully(&self) -> Result<()> {
+        let old_pid = self.last_pid.lock().ok().and_then(|g| *g);
+        let _ = send_macos_service_command_sync(
+            bypax_ipc::ServiceCommand::Shutdown,
+            self.runtime_dir.as_deref(),
+            Duration::from_secs(2),
+        );
+        if let Some(pid) = old_pid {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline && is_pid_alive_macos(pid) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        Ok(())
+    }
+
+    fn start_service(&self) -> Result<()> {
+        // LaunchDaemon `com.bypax.service` runs with `KeepAlive=true` and `ThrottleInterval=2`,
+        // so launchd automatically respawns the newly swapped binary after Shutdown.
+        let old_pid = self.last_pid.lock().ok().and_then(|g| *g);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(resp) = send_macos_service_command_sync(
+                bypax_ipc::ServiceCommand::Ping,
+                self.runtime_dir.as_deref(),
+                Duration::from_millis(600),
+            ) {
+                if resp.ok && (old_pid.is_none() || resp.service_pid != old_pid) {
+                    return Ok(());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 impl ServiceLifecycleController for OsServiceLifecycleController {
     fn is_service_running(&self) -> bool {
         false
@@ -1817,7 +2686,64 @@ fn wait_for_pid_exit(pid: u32, timeout_ms: u32) {
     std::thread::sleep(Duration::from_millis(300));
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn is_pid_alive_macos(pid: u32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let exists = rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    if !exists {
+        return false;
+    }
+
+    // Treat zombie processes (SZOMB / ps stat 'Z*') as already exited: all file descriptors,
+    // sockets, and single-instance locks are already released even before reaping.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast::<libc::c_void>(),
+            size,
+        )
+    };
+    if filled >= size {
+        const SZOMB: u32 = 5;
+        return info.pbi_status != SZOMB;
+    }
+
+    // `proc_pidinfo` returns 0 both for zombies and for cross-UID (root) processes;
+    // disambiguate cleanly with `/bin/ps -o stat= -p <pid>`.
+    if let Ok(out) = std::process::Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .output()
+    {
+        if !out.status.success() {
+            return false;
+        }
+        let stat = String::from_utf8_lossy(&out.stdout);
+        let trimmed = stat.trim();
+        if trimmed.is_empty() || trimmed.starts_with('Z') {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_pid_exit(pid: u32, timeout_ms: u32) {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    while Instant::now() < deadline && is_pid_alive_macos(pid) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(250));
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn wait_for_pid_exit(_pid: u32, _timeout_ms: u32) {
     std::thread::sleep(Duration::from_millis(800));
 }
@@ -1857,9 +2783,34 @@ pub fn build_relaunch_args(plan: &UpdatePlan, helper_exe: Option<&Path>) -> Vec<
 }
 
 fn relaunch_target(plan: &UpdatePlan, helper_exe: Option<&Path>) {
+    let args = build_relaunch_args(plan, helper_exe);
+
+    #[cfg(target_os = "macos")]
+    if let Some(ref app_bundle) = plan.target_app_bundle {
+        if app_bundle.is_dir() {
+            let mut open_cmd = std::process::Command::new("/usr/bin/open");
+            open_cmd
+                .arg("-n")
+                .arg(app_bundle)
+                .arg("--args")
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if let Ok(status) = open_cmd.status() {
+                if status.success() {
+                    return;
+                }
+            }
+        }
+    }
+
     let mut cmd = std::process::Command::new(&plan.target_exe);
-    cmd.args(build_relaunch_args(plan, helper_exe))
-        .current_dir(&plan.target_dir);
+    cmd.args(&args)
+        .current_dir(&plan.target_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
 
     #[cfg(windows)]
     {
@@ -1949,19 +2900,39 @@ pub fn build_swap_manifest(plan: &UpdatePlan) -> (Vec<(PathBuf, PathBuf)>, bool)
     (pairs, needs_service_stop)
 }
 
-/// Core multi-binary update transaction with service coordination and atomic rollback.
+/// Core multi-binary / app-bundle update transaction with service coordination and atomic rollback.
 /// Separated from process waiting/relaunch so integration tests can verify every edge case.
 pub fn apply_update_transaction<S, F>(
     plan: &UpdatePlan,
     service_ctl: &S,
     max_attempts: usize,
     retry_delay: Duration,
-    before_swap_hook: F,
+    mut before_swap_hook: F,
 ) -> Result<()>
 where
     S: ServiceLifecycleController,
     F: FnMut(usize, &Path) -> Result<()>,
 {
+    if let (Some(ref staged_app), Some(ref target_app)) =
+        (&plan.staged_app_bundle, &plan.target_app_bundle)
+    {
+        // On macOS, swap the .app bundle atomically first (Unix rename does not fail on running
+        // binaries), then bounce the LaunchDaemon so launchd respawns the newly installed binary.
+        let daemon_running = service_ctl.is_service_running();
+        replace_macos_app_bundle_atomically_internal(
+            staged_app,
+            target_app,
+            max_attempts,
+            retry_delay,
+            |target| before_swap_hook(0, target),
+        )?;
+        if daemon_running {
+            let _ = service_ctl.stop_service_gracefully();
+            let _ = service_ctl.start_service();
+        }
+        return Ok(());
+    }
+
     let (pairs, needs_service_stop) = build_swap_manifest(plan);
     let mut service_was_running = false;
 
@@ -1995,7 +2966,7 @@ pub fn apply_update_plan(plan_path: &Path) -> Result<()> {
         .service_name
         .clone()
         .unwrap_or_else(|| BYPAX_SERVICE_NAME.to_string());
-    let service_ctl = OsServiceLifecycleController::new(svc_name);
+    let service_ctl = OsServiceLifecycleController::for_plan(svc_name, &plan);
 
     match apply_update_transaction(
         &plan,
@@ -2071,6 +3042,16 @@ pub fn cleanup_post_update_artifacts(args: &[String], updates_root: &Path) {
     }
 
     if let Ok(exe) = std::env::current_exe() {
+        if let Some(app_bundle) = find_macos_app_bundle_root(&exe) {
+            let backup_bundle = backup_app_bundle_path_for(&app_bundle);
+            if backup_bundle.is_dir() {
+                let _ = std::fs::remove_dir_all(&backup_bundle);
+            }
+            let tmp_bundle = sibling_tmp_path_for(&app_bundle);
+            if tmp_bundle.is_dir() {
+                let _ = std::fs::remove_dir_all(&tmp_bundle);
+            }
+        }
         if let Some(parent) = exe.parent() {
             cleanup_prev_backups_in_dir(parent);
             cleanup_prev_backups_in_dir(&parent.join("core"));
@@ -2236,8 +3217,16 @@ mod tests {
         }"#;
 
         // Portable mode always prefers the full portable bundle so CLI/service/drivers upgrade together.
-        let report_portable =
-            parse_app_release_json("0.1.0", json, "proxy:bypax", true, true).unwrap();
+        let report_portable = parse_app_release_json_for_platform(
+            "0.1.0",
+            json,
+            "proxy:bypax",
+            true,
+            false,
+            UpdatePlatform::WindowsX64,
+            false,
+        )
+        .unwrap();
         assert!(report_portable.update_available);
         assert_eq!(
             report_portable.selected_asset_name.as_deref(),
@@ -2248,18 +3237,35 @@ mod tests {
             Some("portable_zip")
         );
         assert!(report_portable.checksums_url.is_some());
+        assert!(report_portable.in_app_update_supported);
 
         // Non-portable with companion binaries also prefers portable bundle.
-        let report_companions =
-            parse_app_release_json_with_layout("0.1.0", json, "direct", false, true).unwrap();
+        let report_companions = parse_app_release_json_for_platform(
+            "0.1.0",
+            json,
+            "direct",
+            false,
+            true,
+            UpdatePlatform::WindowsX64,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             report_companions.selected_asset_kind.as_deref(),
             Some("portable_zip")
         );
 
         // Pure single-file standalone install selects lightweight standalone EXE.
-        let report_standalone =
-            parse_app_release_json("0.1.0", json, "direct", false, true).unwrap();
+        let report_standalone = parse_app_release_json_for_platform(
+            "0.1.0",
+            json,
+            "direct",
+            false,
+            false,
+            UpdatePlatform::WindowsX64,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             report_standalone.selected_asset_name.as_deref(),
             Some("bypax-v0.2.0-x86_64-windows.exe")
@@ -2283,6 +3289,118 @@ mod tests {
         assert_eq!(evil_rep.release_url, RELEASES_PAGE_URL);
         assert!(evil_rep.selected_asset_url.is_none());
         assert!(!evil_rep.in_app_update_supported);
+    }
+
+    #[test]
+    fn parses_macos_release_assets_by_arch_and_bundle_writability() {
+        let json = r#"{
+            "tag_name": "v0.3.0",
+            "name": "Bypax v0.3.0",
+            "html_url": "https://github.com/Nexusyyan/bypax/releases/tag/v0.3.0",
+            "assets": [
+                {
+                    "name": "bypax-v0.3.0-x86_64-windows-portable.zip",
+                    "browser_download_url": "https://github.com/Nexusyyan/bypax/releases/download/v0.3.0/bypax-v0.3.0-x86_64-windows-portable.zip",
+                    "size": 22000000
+                },
+                {
+                    "name": "bypax-v0.3.0-aarch64-macos.dmg",
+                    "browser_download_url": "https://github.com/Nexusyyan/bypax/releases/download/v0.3.0/bypax-v0.3.0-aarch64-macos.dmg",
+                    "size": 19000000
+                },
+                {
+                    "name": "bypax-v0.3.0-x86_64-macos.dmg",
+                    "browser_download_url": "https://github.com/Nexusyyan/bypax/releases/download/v0.3.0/bypax-v0.3.0-x86_64-macos.dmg",
+                    "size": 19500000
+                },
+                {
+                    "name": "SHA256SUMS.txt",
+                    "browser_download_url": "https://github.com/Nexusyyan/bypax/releases/download/v0.3.0/SHA256SUMS.txt",
+                    "size": 320
+                }
+            ]
+        }"#;
+
+        let arm64 = parse_app_release_json_for_platform(
+            "0.2.0",
+            json,
+            "direct",
+            false,
+            false,
+            UpdatePlatform::MacosArm64,
+            true,
+        )
+        .unwrap();
+        assert!(arm64.update_available);
+        assert_eq!(
+            arm64.selected_asset_name.as_deref(),
+            Some("bypax-v0.3.0-aarch64-macos.dmg")
+        );
+        assert_eq!(arm64.selected_asset_kind.as_deref(), Some("macos_dmg"));
+        assert_eq!(arm64.install_mode, "app_bundle");
+        assert!(arm64.in_app_update_supported);
+
+        // Non-writable or translocated bundle disables in-app auto-replace cleanly.
+        let arm64_ro = parse_app_release_json_for_platform(
+            "0.2.0",
+            json,
+            "direct",
+            false,
+            false,
+            UpdatePlatform::MacosArm64,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            arm64_ro.selected_asset_name.as_deref(),
+            Some("bypax-v0.3.0-aarch64-macos.dmg")
+        );
+        assert!(!arm64_ro.in_app_update_supported);
+
+        let x64 = parse_app_release_json_for_platform(
+            "0.2.0",
+            json,
+            "proxy:bypax",
+            false,
+            false,
+            UpdatePlatform::MacosX64,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            x64.selected_asset_name.as_deref(),
+            Some("bypax-v0.3.0-x86_64-macos.dmg")
+        );
+        assert!(x64.in_app_update_supported);
+
+        // Windows-only release must never select a Windows binary on macOS.
+        let win_only = r#"{
+            "tag_name": "v0.3.0",
+            "assets": [
+                {
+                    "name": "bypax-v0.3.0-x86_64-windows.exe",
+                    "browser_download_url": "https://github.com/Nexusyyan/bypax/releases/download/v0.3.0/bypax-v0.3.0-x86_64-windows.exe",
+                    "size": 7000000
+                },
+                {
+                    "name": "SHA256SUMS.txt",
+                    "browser_download_url": "https://github.com/Nexusyyan/bypax/releases/download/v0.3.0/SHA256SUMS.txt",
+                    "size": 128
+                }
+            ]
+        }"#;
+        let mac_missing = parse_app_release_json_for_platform(
+            "0.2.0",
+            win_only,
+            "direct",
+            false,
+            false,
+            UpdatePlatform::MacosArm64,
+            true,
+        )
+        .unwrap();
+        assert!(mac_missing.selected_asset_url.is_none());
+        assert!(!mac_missing.in_app_update_supported);
     }
 
     #[test]
@@ -2435,9 +3553,11 @@ mod tests {
             parent_pid: 0,
             target_exe: install_dir.join("bypax.exe"),
             target_dir: install_dir.clone(),
+            target_app_bundle: None,
             portable_mode: true,
             staged_dir: staged_dir.clone(),
             staged_exe: payload_dir.join("bypax.exe"),
+            staged_app_bundle: None,
             staged_core_exe: bundle.core_exe,
             staged_cli_exe: bundle.cli_exe,
             staged_service_exe: bundle.service_exe,
@@ -2448,6 +3568,7 @@ mod tests {
             resume_app_proxy: true,
             resume_tun: false,
             service_name: Some(BYPAX_SERVICE_NAME.to_string()),
+            runtime_dir: None,
             from_version: "0.1.0".to_string(),
             to_version: "0.2.0".to_string(),
             to_tag: "v0.2.0".to_string(),
@@ -2539,9 +3660,11 @@ mod tests {
             parent_pid: 0,
             target_exe: install_dir.join("bypax.exe"),
             target_dir: install_dir.clone(),
+            target_app_bundle: None,
             portable_mode: true,
             staged_dir: dir.path().join("stage"),
             staged_exe: payload_dir.join("bypax.exe"),
+            staged_app_bundle: None,
             staged_core_exe: bundle.core_exe,
             staged_cli_exe: bundle.cli_exe,
             staged_service_exe: bundle.service_exe,
@@ -2552,6 +3675,7 @@ mod tests {
             resume_app_proxy: false,
             resume_tun: true,
             service_name: Some(BYPAX_SERVICE_NAME.to_string()),
+            runtime_dir: None,
             from_version: "0.1.0".to_string(),
             to_version: "0.2.0".to_string(),
             to_tag: "v0.2.0".to_string(),
@@ -2597,5 +3721,271 @@ mod tests {
         // Relaunch args include TUN resume flag.
         let relaunch = build_relaunch_args(&plan, None);
         assert!(relaunch.contains(&RESUME_TUN_ARG.to_string()));
+    }
+
+    fn write_fake_macho(path: &Path, size: usize, cputype: u32, marker: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut bytes = vec![0u8; size];
+        bytes[0..4].copy_from_slice(&MH_MAGIC_64.to_le_bytes());
+        bytes[4..8].copy_from_slice(&cputype.to_le_bytes());
+        let end = (64 + marker.len()).min(size);
+        bytes[64..end].copy_from_slice(&marker[..(end - 64)]);
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    fn write_fake_universal_macho(path: &Path, size: usize, cpus: &[u32]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut bytes = vec![0u8; size];
+        bytes[0..4].copy_from_slice(&FAT_MAGIC.to_be_bytes());
+        bytes[4..8].copy_from_slice(&(cpus.len() as u32).to_be_bytes());
+        for (idx, cpu) in cpus.iter().enumerate() {
+            let off = 8 + idx * 20;
+            bytes[off..off + 4].copy_from_slice(&cpu.to_be_bytes());
+        }
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    fn build_fake_macos_bundle(root: &Path, cputype: u32, marker: &[u8]) {
+        std::fs::create_dir_all(root.join("Contents/MacOS/core")).unwrap();
+        std::fs::create_dir_all(root.join("Contents/Resources/skills/bypax-agent")).unwrap();
+        std::fs::write(
+            root.join("Contents/Info.plist"),
+            b"<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>CFBundleExecutable</key><string>bypax</string></dict></plist>",
+        )
+        .unwrap();
+        write_fake_macho(&root.join("Contents/MacOS/bypax"), 70_000, cputype, marker);
+        write_fake_macho(
+            &root.join("Contents/MacOS/bypax-cli"),
+            70_000,
+            cputype,
+            marker,
+        );
+        write_fake_macho(
+            &root.join("Contents/MacOS/bypax-service"),
+            70_000,
+            cputype,
+            marker,
+        );
+        write_fake_macho(
+            &root.join("Contents/MacOS/core/sing-box"),
+            70_000,
+            cputype,
+            marker,
+        );
+        std::fs::write(
+            root.join("Contents/Resources/skills/bypax-agent/SKILL.md"),
+            marker,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn finds_macos_app_bundle_root_and_detects_translocation() {
+        let app_exe = PathBuf::from("/Applications/Bypax.app/Contents/MacOS/bypax");
+        assert_eq!(
+            find_macos_app_bundle_root(&app_exe),
+            Some(PathBuf::from("/Applications/Bypax.app"))
+        );
+        assert!(!is_macos_translocated_path(&app_exe));
+
+        let dev_exe = PathBuf::from("/tmp/bypax/target/debug/bypax");
+        assert_eq!(find_macos_app_bundle_root(&dev_exe), None);
+
+        let translocated = PathBuf::from(
+            "/private/var/folders/ab/cd/T/AppTranslocation/1234-5678/d/Bypax.app/Contents/MacOS/bypax",
+        );
+        assert!(is_macos_translocated_path(&translocated));
+        assert!(!is_macos_app_bundle_updatable(&translocated));
+
+        let dir = tempdir().unwrap();
+        let writable_app = dir.path().join("Bypax.app");
+        build_fake_macos_bundle(&writable_app, MACHO_CPU_TYPE_ARM64, b"v1");
+        assert!(is_macos_app_bundle_updatable(
+            &writable_app.join("Contents/MacOS/bypax")
+        ));
+    }
+
+    #[test]
+    fn validates_macho_single_and_universal_headers() {
+        let dir = tempdir().unwrap();
+        let bad = dir.path().join("not-macho");
+        std::fs::write(&bad, vec![0u8; 70_000]).unwrap();
+        assert!(validate_macho_binary(&bad, MIN_MACHO_BYTES, Some(MACHO_CPU_TYPE_ARM64)).is_err());
+
+        let arm_bin = dir.path().join("bypax-arm64");
+        write_fake_macho(&arm_bin, 70_000, MACHO_CPU_TYPE_ARM64, b"arm64");
+        assert!(validate_macho_binary(&arm_bin, MIN_MACHO_BYTES, Some(MACHO_CPU_TYPE_ARM64)).is_ok());
+        assert!(
+            validate_macho_binary(&arm_bin, MIN_MACHO_BYTES, Some(MACHO_CPU_TYPE_X86_64)).is_err()
+        );
+
+        let fat_bin = dir.path().join("bypax-universal");
+        write_fake_universal_macho(
+            &fat_bin,
+            70_000,
+            &[MACHO_CPU_TYPE_X86_64, MACHO_CPU_TYPE_ARM64],
+        );
+        assert!(validate_macho_binary(&fat_bin, MIN_MACHO_BYTES, Some(MACHO_CPU_TYPE_ARM64)).is_ok());
+        assert!(
+            validate_macho_binary(&fat_bin, MIN_MACHO_BYTES, Some(MACHO_CPU_TYPE_X86_64)).is_ok()
+        );
+        assert!(validate_macho_binary(&fat_bin, MIN_MACHO_BYTES, Some(0x0100_0099)).is_err());
+    }
+
+    #[test]
+    fn macos_app_bundle_atomic_swap_coordinates_daemon_and_rolls_back_on_failure() {
+        let dir = tempdir().unwrap();
+        let apps_dir = dir.path().join("Applications");
+        let stage_dir = dir.path().join("stage");
+        let target_app = apps_dir.join("Bypax.app");
+        let staged_app = stage_dir.join("payload").join("Bypax.app");
+
+        build_fake_macos_bundle(&target_app, MACHO_CPU_TYPE_ARM64, b"OLD_MAC_V1");
+        build_fake_macos_bundle(&staged_app, MACHO_CPU_TYPE_ARM64, b"NEW_MAC_V2");
+
+        validate_macos_app_bundle(&staged_app, Some(MACHO_CPU_TYPE_ARM64), false).unwrap();
+
+        let staged_state = AppUpdateState {
+            stage: AppUpdateStage::ReadyToRestart,
+            target_version: Some("0.3.0".to_string()),
+            target_tag: Some("v0.3.0".to_string()),
+            asset_kind: Some("macos_dmg".to_string()),
+            staged_dir: Some(stage_dir.to_string_lossy().to_string()),
+            staged_exe_path: Some(
+                staged_app
+                    .join("Contents/MacOS/bypax")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            staged_app_bundle_path: Some(staged_app.to_string_lossy().to_string()),
+            ..AppUpdateState::default()
+        };
+        let plan = UpdatePlan::from_staged(
+            &staged_state,
+            0,
+            target_app.join("Contents/MacOS/bypax"),
+            apps_dir.clone(),
+            false,
+            stage_dir.clone(),
+            staged_app.join("Contents/MacOS/bypax"),
+            true,
+            false,
+            true,
+            false,
+            dir.path().join("runtime/last-update-result.json"),
+        );
+        assert_eq!(plan.target_app_bundle.as_deref(), Some(target_app.as_path()));
+        assert_eq!(plan.staged_app_bundle.as_deref(), Some(staged_app.as_path()));
+
+        // Injected failure before swap must keep OLD_MAC_V1 intact and leave daemon untouched.
+        let mock_svc_fail = MockServiceController::new(true);
+        let err = apply_update_transaction(
+            &plan,
+            &mock_svc_fail,
+            2,
+            Duration::from_millis(5),
+            |_, _| bail!("simulated macOS bundle swap failure"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("simulated macOS bundle swap failure"));
+        assert!(mock_svc_fail.recorded_events().is_empty());
+        assert_eq!(
+            &std::fs::read(target_app.join("Contents/MacOS/bypax")).unwrap()[64..74],
+            b"OLD_MAC_V1"
+        );
+        assert!(!sibling_tmp_path_for(&target_app).exists());
+
+        // Successful swap replaces entire bundle atomically and bounces running LaunchDaemon.
+        let mock_svc_ok = MockServiceController::new(true);
+        apply_update_transaction(&plan, &mock_svc_ok, 3, Duration::from_millis(5), |_, _| {
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(mock_svc_ok.recorded_events(), vec!["stop", "start"]);
+        assert_eq!(
+            &std::fs::read(target_app.join("Contents/MacOS/bypax")).unwrap()[64..74],
+            b"NEW_MAC_V2"
+        );
+        assert_eq!(
+            &std::fs::read(target_app.join("Contents/MacOS/bypax-service")).unwrap()[64..74],
+            b"NEW_MAC_V2"
+        );
+        assert_eq!(
+            std::fs::read(target_app.join("Contents/Resources/skills/bypax-agent/SKILL.md"))
+                .unwrap(),
+            b"NEW_MAC_V2"
+        );
+        let backup = backup_app_bundle_path_for(&target_app);
+        assert!(backup.is_dir());
+        assert_eq!(
+            &std::fs::read(backup.join("Contents/MacOS/bypax")).unwrap()[64..74],
+            b"OLD_MAC_V1"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn extracts_and_verifies_real_signed_macos_dmg_end_to_end() {
+        let dir = tempdir().unwrap();
+        let src_stage = dir.path().join("dmg-src");
+        let src_app = src_stage.join("Bypax.app");
+        std::fs::create_dir_all(src_app.join("Contents/MacOS")).unwrap();
+        std::fs::write(
+            src_app.join("Contents/Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>bypax</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.bypax.desktop.test</string>
+  <key>CFBundleName</key>
+  <string>Bypax</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleVersion</key>
+  <string>0.3.0</string>
+</dict>
+</plist>
+"#,
+        )
+        .unwrap();
+
+        // Reuse the live test runner executable as a real host-architecture Mach-O binary.
+        let host_exe = std::env::current_exe().unwrap();
+        let bundled_exe = src_app.join("Contents/MacOS/bypax");
+        std::fs::copy(&host_exe, &bundled_exe).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bundled_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let sign_status = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--deep", "--sign", "-"])
+            .arg(&src_app)
+            .status()
+            .unwrap();
+        assert!(sign_status.success(), "ad-hoc codesign failed");
+
+        let dmg_path = dir.path().join("bypax-v0.3.0-test-macos.dmg");
+        let create_status = std::process::Command::new("/usr/bin/hdiutil")
+            .args(["create", "-volname", "Bypax Test", "-srcfolder"])
+            .arg(&src_stage)
+            .args(["-ov", "-format", "UDZO"])
+            .arg(&dmg_path)
+            .status()
+            .unwrap();
+        assert!(create_status.success(), "hdiutil create failed");
+
+        let payload_dir = dir.path().join("payload");
+        let extracted = extract_macos_dmg_app(&dmg_path, &payload_dir).unwrap();
+        assert_eq!(extracted, payload_dir.join("Bypax.app"));
+        assert!(extracted.join("Contents/MacOS/bypax").is_file());
+        assert!(extracted.join("Contents/Info.plist").is_file());
     }
 }

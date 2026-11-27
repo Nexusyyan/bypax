@@ -600,6 +600,7 @@ export interface AppUpdateState {
   via?: string | null;
   stagedDir?: string | null;
   stagedExePath?: string | null;
+  stagedAppBundlePath?: string | null;
   stagedCoreExePath?: string | null;
   sha256?: string | null;
   error?: string | null;
