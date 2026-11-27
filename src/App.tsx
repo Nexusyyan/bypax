@@ -1291,6 +1291,7 @@ export default function App() {
               onImportCoreBinary={handleImportCoreBinary}
               onSelectMainNode={(id) => void handleSelectMainNode(id)}
               onDeleteNode={(id) => void handleDeleteNode(id)}
+              onCopyText={handleCopyText}
               onRunBatchTest={(k, ids) => void handleRunBatchTest(k, ids)}
               onImportPayload={handleImportPayload}
               onImportSubscription={handleImportSubscription}
@@ -1444,6 +1445,7 @@ export default function App() {
               onChangeTheme={handleChangeTheme}
               onUpdateSettings={(s) => void handleUpdateSettings(s)}
               onRestoreNetguard={() => void handleRestoreNetguard()}
+              onCleanupLegacy={() => handleServiceAction("cleanup_legacy")}
               onGoToDns={() => setActiveTab("dns")}
               onCopyText={handleCopyText}
               onCheckAppUpdate={() => handleCheckAppUpdate(false)}

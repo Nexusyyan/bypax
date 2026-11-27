@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   ArrowUpDown,
+  Check,
+  Copy,
   Download,
   FolderOpen,
   Gauge,
@@ -51,6 +53,7 @@ interface NodesViewProps {
   onImportCoreBinary: () => Promise<void>;
   onSelectMainNode: (id: string) => void;
   onDeleteNode: (id: string) => void;
+  onCopyText: (text: string) => void;
   onRunBatchTest: (kind: "tcping" | "real", nodeIds: string[]) => void;
   onImportPayload: (payload: string, groupName: string) => Promise<void>;
   onImportSubscription: (name: string, url: string) => Promise<void>;
@@ -78,6 +81,7 @@ export function NodesView({
   onImportCoreBinary,
   onSelectMainNode,
   onDeleteNode,
+  onCopyText,
   onRunBatchTest,
   onImportPayload,
   onImportSubscription,
@@ -103,17 +107,54 @@ export function NodesView({
     y: number;
     placeBelow: boolean;
   } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    node: NodeIR;
+    x: number;
+    y: number;
+  } | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         setShowImport(false);
         setShowSubs(false);
+        setContextMenu(null);
       }
     };
+    const onPointer = (e: MouseEvent) => {
+      if (
+        contextMenu &&
+        contextMenuRef.current &&
+        !contextMenuRef.current.contains(e.target as Node)
+      ) {
+        setContextMenu(null);
+      }
+    };
+    const onWindowBlurOrResize = () => setContextMenu(null);
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
+    window.addEventListener("mousedown", onPointer);
+    window.addEventListener("resize", onWindowBlurOrResize);
+    window.addEventListener("blur", onWindowBlurOrResize);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("mousedown", onPointer);
+      window.removeEventListener("resize", onWindowBlurOrResize);
+      window.removeEventListener("blur", onWindowBlurOrResize);
+    };
+  }, [contextMenu]);
+
+  const openNodeContextMenu = (e: React.MouseEvent, node: NodeIR) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const menuWidth = 224;
+    const menuHeight = node.rawUri ? 268 : 236;
+    const pad = 10;
+    const x = Math.max(pad, Math.min(e.clientX, window.innerWidth - menuWidth - pad));
+    const y = Math.max(pad, Math.min(e.clientY, window.innerHeight - menuHeight - pad));
+    setHoveredTags(null);
+    setContextMenu({ node, x, y });
+  };
 
   const groups = useMemo(() => {
     const names = Array.from(new Set(nodes.map((n) => n.group)));
@@ -518,6 +559,7 @@ export function NodesView({
             ref={scrollRef}
             onScroll={() => {
               if (hoveredTags) setHoveredTags(null);
+              if (contextMenu) setContextMenu(null);
             }}
             className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
           >
@@ -531,6 +573,7 @@ export function NodesView({
               {virtualizer.getVirtualItems().map((vRow) => {
                 const n = visibleNodes[vRow.index];
                 const isMain = n.id === mainNodeId;
+                const isContextTarget = contextMenu?.node.id === n.id;
                 const tags = ruleUsageMap.get(n.id) ?? [];
                 const displayMs = n.realDelayMs ?? n.tcpingMs ?? null;
                 const delayKind = n.realDelayMs != null ? "real" : "tcping";
@@ -541,6 +584,7 @@ export function NodesView({
                     key={n.id}
                     tabIndex={0}
                     onDoubleClick={() => onSelectMainNode(n.id)}
+                    onContextMenu={(e) => openNodeContextMenu(e, n)}
                     onKeyDown={(e) => {
                       if (e.key === "Enter") onSelectMainNode(n.id);
                     }}
@@ -551,10 +595,14 @@ export function NodesView({
                       width: "100%",
                       height: `${vRow.size}px`,
                       transform: `translateY(${vRow.start}px)`,
-                      backgroundColor: isMain ? "var(--accent-soft)" : undefined,
+                      backgroundColor: isMain
+                        ? "var(--accent-soft)"
+                        : isContextTarget
+                          ? "var(--bg-hover)"
+                          : undefined,
                     }}
                     className={`group nodes-grid relative border-b border-[var(--border-hairline)] px-4 text-[12.5px] transition-colors cursor-pointer lg:px-5 ${
-                      isMain ? "" : "hover:bg-[var(--bg-hover)]"
+                      isMain || isContextTarget ? "" : "hover:bg-[var(--bg-hover)]"
                     }`}
                   >
                     {/* P1: Name (Flag + Remark + Group pill + responsive subline) */}
@@ -761,6 +809,127 @@ export function NodesView({
               </span>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Desktop Node Row Context Menu */}
+      {contextMenu && (
+        <div
+          ref={contextMenuRef}
+          role="menu"
+          className="ui-popover fixed z-50 min-w-[216px] max-w-[260px] space-y-0.5 p-1.5 text-[12px]"
+          style={{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <div className="mb-1 flex items-center justify-between gap-2 border-b border-[var(--border-hairline)] px-2 pb-1.5">
+            <span
+              className="truncate font-medium text-[var(--text-primary)]"
+              title={contextMenu.node.remark}
+            >
+              {contextMenu.node.remark}
+            </span>
+            <span className="shrink-0 rounded-[5px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-1.5 py-0.5 font-mono text-[10.5px] text-[var(--text-secondary)]">
+              {PROTO_BADGES[contextMenu.node.protocol]}
+            </span>
+          </div>
+
+          <button
+            type="button"
+            role="menuitem"
+            disabled={contextMenu.node.id === mainNodeId}
+            onClick={() => {
+              onSelectMainNode(contextMenu.node.id);
+              setContextMenu(null);
+            }}
+            className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-55 cursor-pointer disabled:cursor-default"
+          >
+            <Check
+              className="h-3.5 w-3.5 shrink-0"
+              style={{
+                color:
+                  contextMenu.node.id === mainNodeId
+                    ? "var(--accent-focus)"
+                    : "var(--text-secondary)",
+              }}
+              strokeWidth={1.6}
+            />
+            <span>
+              {contextMenu.node.id === mainNodeId ? dict.nodes.ctxIsMain : dict.nodes.ctxUseMain}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            role="menuitem"
+            disabled={testingKind !== null}
+            onClick={() => {
+              onRunBatchTest("tcping", [contextMenu.node.id]);
+              setContextMenu(null);
+            }}
+            className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed"
+          >
+            <Wifi className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]" strokeWidth={1.5} />
+            <span>{dict.nodes.ctxTcping}</span>
+          </button>
+
+          <button
+            type="button"
+            role="menuitem"
+            disabled={testingKind !== null}
+            onClick={() => {
+              onRunBatchTest("real", [contextMenu.node.id]);
+              setContextMenu(null);
+            }}
+            className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed"
+          >
+            <Gauge className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]" strokeWidth={1.5} />
+            <span>{dict.nodes.ctxRealDelay}</span>
+          </button>
+
+          <div className="my-1 border-t border-[var(--border-hairline)]" />
+
+          {contextMenu.node.rawUri && (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                if (contextMenu.node.rawUri) onCopyText(contextMenu.node.rawUri);
+                setContextMenu(null);
+              }}
+              className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] cursor-pointer"
+            >
+              <Link2 className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]" strokeWidth={1.5} />
+              <span>{dict.nodes.ctxCopyUri}</span>
+            </button>
+          )}
+
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              onCopyText(`${contextMenu.node.server}:${contextMenu.node.port}`);
+              setContextMenu(null);
+            }}
+            className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] cursor-pointer"
+          >
+            <Copy className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]" strokeWidth={1.5} />
+            <span>{dict.nodes.ctxCopyAddr}</span>
+          </button>
+
+          <div className="my-1 border-t border-[var(--border-hairline)]" />
+
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              onDeleteNode(contextMenu.node.id);
+              setContextMenu(null);
+            }}
+            className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--danger-bg-hover)] hover:text-[var(--danger-text-on-bg)] cursor-pointer"
+          >
+            <Trash2 className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
+            <span>{dict.nodes.ctxDelete}</span>
+          </button>
         </div>
       )}
 
