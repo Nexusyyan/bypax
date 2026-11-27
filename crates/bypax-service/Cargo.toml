@@ -25,6 +25,9 @@ tracing-subscriber.workspace = true
 windows.workspace = true
 windows-service.workspace = true
 
+[target.'cfg(windows)'.build-dependencies]
+tauri-winres = "0.3"
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 

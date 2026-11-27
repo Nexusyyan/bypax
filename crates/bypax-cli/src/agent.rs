@@ -870,7 +870,7 @@ pub fn capability_schema() -> Value {
             "mcp",
             "doctor [--json]",
             "ps [--filter <text>] [--json]",
-            "service install|uninstall|start|stop|status [--json]"
+            "service install|uninstall|cleanup|start|stop|status [--json]"
         ],
         "mcpTools": [
             "bypax_status",

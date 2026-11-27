@@ -3,7 +3,7 @@ mod mcp;
 mod service_cmd;
 
 use crate::agent::{capability_schema, AgentClient};
-use crate::service_cmd::{query_os_service_status, run_service_subcommand};
+use crate::service_cmd::{query_os_service_status, run_service_subcommand, ServiceStatusReport};
 use anyhow::{bail, Result};
 use bypax_ipc::{AppProxyRuleWire, CtlRequest, DomainOverrideWire};
 use clap::{Parser, Subcommand};
@@ -71,7 +71,7 @@ enum Commands {
         json: bool,
     },
 
-    /// Manage the Bypax privileged service (Windows BypaxService / macOS launchd)
+    /// Manage the Bypax privileged service (Windows legacy cleanup / macOS launchd)
     Service {
         /// Emit structured machine-readable JSON output
         #[arg(long, global = true)]
@@ -523,14 +523,7 @@ fn handle_service_command(
             if as_json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!(
-                    "Service '{}' ({}): installed={} running={} state={}",
-                    report.service_name,
-                    report.platform,
-                    report.installed,
-                    report.running,
-                    report.state
-                );
+                println!("{}", format_service_status_human(&report));
             }
             Ok(())
         }
@@ -574,22 +567,60 @@ fn emit_service_result(action: &str, message: &str, as_json: bool) -> Result<()>
     Ok(())
 }
 
-fn print_doctor_human(data: &Value) {
-    println!("=== Bypax Doctor ===");
-    println!(
+fn format_service_status_human(report: &ServiceStatusReport) -> String {
+    if report.platform.eq_ignore_ascii_case("windows") {
+        if !report.legacy_services.is_empty() {
+            return format!(
+                "Service (windows): mode=gui_bound_worker legacy=[{}] (run 'bypax-cli service cleanup')",
+                report.legacy_services.join(", ")
+            );
+        }
+        return "Service (windows): mode=gui_bound_worker running=false (starts on demand when GUI enables App Proxy/TUN)".to_string();
+    }
+    format!(
+        "Service '{}' ({}): installed={} running={} state={}",
+        report.service_name,
+        report.platform,
+        report.installed,
+        report.running,
+        report.state
+    )
+}
+
+fn contains_os_error_code(lower: &str, code: &str) -> bool {
+    let needle = format!("os error {code}");
+    for (idx, _) in lower.match_indices(&needle) {
+        let after = idx + needle.len();
+        let next_is_digit = lower[after..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit());
+        if !next_is_digit {
+            return true;
+        }
+    }
+    false
+}
+
+fn format_doctor_human(data: &Value) -> String {
+    let mut lines = Vec::new();
+    let platform = data
+        .get("platform")
+        .and_then(Value::as_str)
+        .unwrap_or(std::env::consts::OS);
+    let is_windows = platform.eq_ignore_ascii_case("windows");
+
+    lines.push("=== Bypax Doctor ===".to_string());
+    lines.push(format!(
         "Control Mode : {}",
         data.get("controlMode")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
-    );
-    println!(
-        "Platform     : {}",
-        data.get("platform")
-            .and_then(Value::as_str)
-            .unwrap_or(std::env::consts::OS)
-    );
+    ));
+    lines.push(format!("Platform     : {}", platform));
+
     if let Some(core) = data.get("core") {
-        println!(
+        lines.push(format!(
             "Core Binary  : installed={} version={} path={}",
             core.get("installed")
                 .and_then(Value::as_bool)
@@ -600,60 +631,125 @@ fn print_doctor_human(data: &Value) {
             core.get("binaryPath")
                 .and_then(Value::as_str)
                 .unwrap_or("-")
-        );
+        ));
     }
+
     if let Some(svc) = data.get("service") {
-        let default_name = if cfg!(windows) {
-            "BypaxService"
-        } else if cfg!(target_os = "macos") {
-            "com.bypax.service"
-        } else {
-            "bypax-service"
-        };
         let plane1 = svc
             .get("plane1Connected")
             .or_else(|| svc.get("connected"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        println!(
-            "Service      : name={} installed={} running={} plane1={}",
-            svc.get("name").and_then(Value::as_str).unwrap_or(default_name),
-            svc.get("installed")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            svc.get("running")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            plane1
-        );
-        if let Some(legacy) = svc.get("legacyServices").and_then(Value::as_array) {
-            if !legacy.is_empty() {
-                let names: Vec<&str> = legacy.iter().filter_map(Value::as_str).collect();
-                println!("Legacy Svcs  : {} (run 'bypax-cli service cleanup')", names.join(", "));
+        let running = svc
+            .get("running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let legacy_names: Vec<&str> = svc
+            .get("legacyServices")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+
+        if is_windows {
+            let worker_active = plane1 || (running && legacy_names.is_empty());
+            if worker_active {
+                let mode = svc
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .filter(|m| !m.is_empty() && *m != "off")
+                    .unwrap_or("elevated_worker");
+                lines.push(format!(
+                    "Service      : mode={} running=true plane1={}",
+                    mode, plane1
+                ));
+            } else {
+                lines.push(
+                    "Service      : mode=gui_bound_worker running=false (starts on demand when GUI enables App Proxy/TUN)"
+                        .to_string(),
+                );
             }
+        } else {
+            let default_name = if platform.eq_ignore_ascii_case("macos") {
+                "com.bypax.service"
+            } else {
+                "bypax-service"
+            };
+            lines.push(format!(
+                "Service      : name={} installed={} running={} plane1={}",
+                svc.get("name").and_then(Value::as_str).unwrap_or(default_name),
+                svc.get("installed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                running,
+                plane1
+            ));
+        }
+
+        if !legacy_names.is_empty() {
+            lines.push(format!(
+                "Legacy Svcs  : {} (run 'bypax-cli service cleanup')",
+                legacy_names.join(", ")
+            ));
         }
     }
+
     if let Some(drv) = data.get("driver") {
-        println!(
-            "Driver       : loaded={} opened={} version={} error={}",
-            drv.get("dllLoaded")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            drv.get("driverOpened")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            drv.get("driverVersion")
-                .and_then(Value::as_str)
-                .unwrap_or("-"),
-            drv.get("error").and_then(Value::as_str).unwrap_or("none")
-        );
+        let dll_loaded = drv
+            .get("dllLoaded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let driver_opened = drv
+            .get("driverOpened")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let elevated = drv
+            .get("elevated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let error_kind = drv.get("errorKind").and_then(Value::as_str);
+        let error_msg = drv.get("error").and_then(Value::as_str);
+
+        let is_access_denied = match error_kind {
+            Some("access_denied") => true,
+            Some(other) if other != "other" => false,
+            _ => error_msg.is_some_and(|e| {
+                let lower = e.to_ascii_lowercase();
+                lower.contains("access denied")
+                    || lower.contains("access is denied")
+                    || contains_os_error_code(&lower, "5")
+            }),
+        };
+
+        if dll_loaded && !driver_opened && !elevated && is_access_denied {
+            lines.push(
+                "Driver       : loaded=true opened=standby (non-elevated terminal; opens via elevated worker when GUI enables App Proxy)"
+                    .to_string(),
+            );
+        } else {
+            lines.push(format!(
+                "Driver       : loaded={} opened={} version={} error={}",
+                dll_loaded,
+                driver_opened,
+                drv.get("driverVersion")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-"),
+                error_msg.unwrap_or("none")
+            ));
+        }
     }
+
     if let Some(ng) = data.get("netguard") {
-        println!(
+        lines.push(format!(
             "NetGuard     : armed={}",
             ng.get("armed").and_then(Value::as_bool).unwrap_or(false)
-        );
+        ));
     }
+
+    lines.join("\n")
+}
+
+fn print_doctor_human(data: &Value) {
+    println!("{}", format_doctor_human(data));
 }
 
 fn print_processes_human(data: &Value) {
@@ -676,4 +772,237 @@ fn print_processes_human(data: &Value) {
         println!("{:<8} {:<8} {:<28} {:<20} {}", pid, ppid, name, rule, path);
     }
     println!("\nTotal matched processes: {}", procs.len());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn doctor_human_windows_standby_non_elevated_is_calm_and_accurate() {
+        let payload = json!({
+            "controlMode": "offline",
+            "platform": "windows",
+            "core": {
+                "installed": true,
+                "version": "1.14.0",
+                "binaryPath": r"C:\Bypax\core\sing-box.exe"
+            },
+            "service": {
+                "name": "BypaxService",
+                "mode": "off",
+                "installed": false,
+                "running": false,
+                "plane1Connected": false,
+                "legacyServices": []
+            },
+            "driver": {
+                "platform": "windows",
+                "elevated": false,
+                "dllLoaded": true,
+                "driverOpened": false,
+                "driverVersion": null,
+                "error": "WinDivertOpen failed (Access Denied: Administrator privileges or BypaxService required): os error 5",
+                "errorKind": "access_denied"
+            },
+            "netguard": {
+                "armed": false
+            }
+        });
+
+        let rendered = format_doctor_human(&payload);
+        assert!(rendered.contains(
+            "Service      : mode=gui_bound_worker running=false (starts on demand when GUI enables App Proxy/TUN)"
+        ));
+        assert!(rendered.contains(
+            "Driver       : loaded=true opened=standby (non-elevated terminal; opens via elevated worker when GUI enables App Proxy)"
+        ));
+        assert!(!rendered.contains("BypaxService"));
+        assert!(!rendered.contains("Legacy Svcs"));
+        assert!(!rendered.contains("Access Denied"));
+    }
+
+    #[test]
+    fn doctor_human_windows_driver_fallback_distinguishes_access_denied_from_signature_error() {
+        let denied_no_kind = json!({
+            "controlMode": "offline",
+            "platform": "windows",
+            "driver": {
+                "elevated": false,
+                "dllLoaded": true,
+                "driverOpened": false,
+                "error": "Access Denied (os error 5)"
+            }
+        });
+        let rendered_denied = format_doctor_human(&denied_no_kind);
+        assert!(rendered_denied.contains("loaded=true opened=standby"));
+
+        let sig_err = json!({
+            "controlMode": "offline",
+            "platform": "windows",
+            "driver": {
+                "elevated": false,
+                "dllLoaded": true,
+                "driverOpened": false,
+                "error": "Driver signature verification failed: os error 577",
+                "errorKind": "signature_failed"
+            }
+        });
+        let rendered_sig = format_doctor_human(&sig_err);
+        assert!(rendered_sig.contains("loaded=true opened=false version=- error=Driver signature verification failed: os error 577"));
+        assert!(!rendered_sig.contains("opened=standby"));
+    }
+
+    #[test]
+    fn doctor_human_windows_live_elevated_shows_active_worker_and_driver() {
+        let payload = json!({
+            "controlMode": "live",
+            "platform": "windows",
+            "core": {
+                "installed": true,
+                "version": "1.14.0",
+                "binaryPath": r"C:\Bypax\core\sing-box.exe"
+            },
+            "service": {
+                "mode": "elevated_worker",
+                "installed": false,
+                "running": true,
+                "connected": true,
+                "elevated": true,
+                "legacyServices": []
+            },
+            "driver": {
+                "platform": "windows",
+                "elevated": true,
+                "dllLoaded": true,
+                "driverOpened": true,
+                "driverVersion": "2.2",
+                "error": null,
+                "errorKind": null
+            },
+            "netguard": {
+                "armed": true
+            }
+        });
+
+        let rendered = format_doctor_human(&payload);
+        assert!(rendered.contains("Service      : mode=elevated_worker running=true plane1=true"));
+        assert!(rendered.contains("Driver       : loaded=true opened=true version=2.2 error=none"));
+        assert!(rendered.contains("NetGuard     : armed=true"));
+        assert!(!rendered.contains("BypaxService"));
+        assert!(!rendered.contains("Legacy Svcs"));
+    }
+
+    #[test]
+    fn doctor_human_windows_highlights_legacy_services_only_when_non_empty() {
+        let payload = json!({
+            "controlMode": "offline",
+            "platform": "windows",
+            "service": {
+                "name": "BypaxService",
+                "installed": true,
+                "running": true,
+                "plane1Connected": false,
+                "legacyServices": ["BypaxService", "BypathService"]
+            }
+        });
+
+        let rendered = format_doctor_human(&payload);
+        assert!(rendered.contains(
+            "Service      : mode=gui_bound_worker running=false (starts on demand when GUI enables App Proxy/TUN)"
+        ));
+        assert!(rendered.contains(
+            "Legacy Svcs  : BypaxService, BypathService (run 'bypax-cli service cleanup')"
+        ));
+    }
+
+    #[test]
+    fn doctor_human_macos_uses_launchd_service_format() {
+        let payload = json!({
+            "controlMode": "live",
+            "platform": "macos",
+            "core": {
+                "installed": true,
+                "version": "1.14.0",
+                "binaryPath": "/Users/test/Library/Application Support/Bypax/core/sing-box"
+            },
+            "service": {
+                "installed": true,
+                "running": true,
+                "connected": true
+            },
+            "driver": {
+                "platform": "macos",
+                "elevated": false,
+                "dllLoaded": false,
+                "driverOpened": false,
+                "driverVersion": null,
+                "error": "WinDivert is only used on Windows; macOS uses zero-cert launchd + utun path routing"
+            },
+            "netguard": {
+                "armed": false
+            }
+        });
+
+        let rendered = format_doctor_human(&payload);
+        assert!(rendered.contains("Service      : name=com.bypax.service installed=true running=true plane1=true"));
+        assert!(rendered.contains("Driver       : loaded=false opened=false version=- error=WinDivert is only used on Windows; macOS uses zero-cert launchd + utun path routing"));
+        assert!(!rendered.contains("gui_bound_worker"));
+    }
+
+    #[test]
+    fn service_subcommand_help_reflects_windows_legacy_cleanup_and_macos_launchd() {
+        let cmd = Cli::command();
+        let svc = cmd
+            .find_subcommand("service")
+            .expect("service subcommand exists");
+        let about = svc
+            .get_about()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            about.contains("(Windows legacy cleanup / macOS launchd)"),
+            "unexpected service about text: {about}"
+        );
+        assert!(!about.contains("Windows BypaxService"));
+    }
+
+    #[test]
+    fn service_status_human_formats_windows_and_macos_accurately() {
+        let win_clean = ServiceStatusReport {
+            platform: "windows".to_string(),
+            service_name: "BypaxService".to_string(),
+            installed: false,
+            running: false,
+            state: "not_installed".to_string(),
+            legacy_services: Vec::new(),
+            binary_path: None,
+        };
+        let win_out = format_service_status_human(&win_clean);
+        assert!(win_out.contains("mode=gui_bound_worker"));
+        assert!(!win_out.contains("BypaxService"));
+
+        let win_legacy = ServiceStatusReport {
+            legacy_services: vec!["BypaxService".to_string()],
+            ..win_clean
+        };
+        let win_legacy_out = format_service_status_human(&win_legacy);
+        assert!(win_legacy_out.contains("legacy=[BypaxService]"));
+        assert!(win_legacy_out.contains("bypax-cli service cleanup"));
+
+        let mac = ServiceStatusReport {
+            platform: "macos".to_string(),
+            service_name: "com.bypax.service".to_string(),
+            installed: true,
+            running: true,
+            state: "running".to_string(),
+            legacy_services: Vec::new(),
+            binary_path: None,
+        };
+        assert_eq!(
+            format_service_status_human(&mac),
+            "Service 'com.bypax.service' (macos): installed=true running=true state=running"
+        );
+    }
 }
