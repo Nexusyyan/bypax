@@ -1372,3 +1372,195 @@ fn test_updater_staging_swap_preserves_portable_data_and_results() -> Result<()>
 
     Ok(())
 }
+
+#[test]
+fn test_hysteria2_parsers_obfs_mport_and_singbox_compile() {
+    use bypax_core::compiler::compile_proxy_outbound;
+
+    // 1. sing-box JSON with salamander obfs + single port AND port-hopping-only entry
+    let sb_json = r#"{
+        "outbounds": [
+            {
+                "type": "hysteria2",
+                "tag": "JP-HY2-Obfs",
+                "server": "jp-hy2.example.com",
+                "server_port": 22371,
+                "password": "secret-hy2-password",
+                "up_mbps": 50,
+                "down_mbps": 200,
+                "obfs": {
+                    "type": "salamander",
+                    "password": "salamander-obfs-key"
+                },
+                "tls": {
+                    "enabled": true,
+                    "server_name": "jp-hy2.example.com",
+                    "alpn": ["h3"]
+                }
+            },
+            {
+                "type": "hysteria2",
+                "tag": "US-HY2-Hop",
+                "server": "us-hy2.example.com",
+                "server_ports": ["20000:30000", "40000"],
+                "hop_interval": "30s",
+                "password": "hop-password",
+                "tls": {
+                    "enabled": true,
+                    "server_name": "us-hy2.example.com",
+                    "insecure": true
+                }
+            }
+        ]
+    }"#;
+    let parsed_json = parse_payload(sb_json, "JsonSub").expect("parse sing-box json");
+    assert_eq!(parsed_json.nodes.len(), 2);
+
+    let j0 = &parsed_json.nodes[0];
+    assert_eq!(j0.protocol, Protocol::Hysteria2);
+    assert_eq!(j0.port, 22371);
+    assert_eq!(j0.password.as_deref(), Some("secret-hy2-password"));
+    assert_eq!(j0.obfs_type.as_deref(), Some("salamander"));
+    assert_eq!(j0.obfs_password.as_deref(), Some("salamander-obfs-key"));
+    assert_eq!(j0.up_mbps, Some(50));
+    assert_eq!(j0.down_mbps, Some(200));
+    assert_eq!(
+        j0.tls.as_ref().map(|t| t.alpn.as_slice()),
+        Some(&["h3".to_string()][..])
+    );
+
+    let j1 = &parsed_json.nodes[1];
+    assert_eq!(j1.port, 20000);
+    assert_eq!(
+        j1.server_ports,
+        vec!["20000:30000".to_string(), "40000:40000".to_string()]
+    );
+    assert_eq!(j1.hop_interval.as_deref(), Some("30s"));
+
+    // 2. Clash YAML with obfs, obfs-password, ports, hop-interval, bandwidth units, alpn, and auth fallback
+    let clash_yaml = r#"
+proxies:
+  - name: "SG-Clash-HY2"
+    type: hysteria2
+    server: sg-hy2.example.com
+    port: 443
+    ports: "20000-30000,40000"
+    hop-interval: 30
+    auth: "clash-auth-pw"
+    up: "80 Mbps"
+    down: "1 Gbps"
+    obfs: salamander
+    obfs-password: "clash-obfs-password"
+    sni: sg-hy2.example.com
+    skip-cert-verify: true
+    client-fingerprint: chrome
+    alpn:
+      - h3
+"#;
+    let parsed_yaml = parse_payload(clash_yaml, "ClashSub").expect("parse clash yaml");
+    assert_eq!(parsed_yaml.nodes.len(), 1);
+    let y0 = &parsed_yaml.nodes[0];
+    assert_eq!(y0.protocol, Protocol::Hysteria2);
+    assert_eq!(y0.password.as_deref(), Some("clash-auth-pw"));
+    assert_eq!(y0.obfs_type.as_deref(), Some("salamander"));
+    assert_eq!(y0.obfs_password.as_deref(), Some("clash-obfs-password"));
+    assert_eq!(y0.up_mbps, Some(80));
+    assert_eq!(y0.down_mbps, Some(1000));
+    assert_eq!(
+        y0.server_ports,
+        vec!["20000:30000".to_string(), "40000:40000".to_string()]
+    );
+    assert_eq!(y0.hop_interval.as_deref(), Some("30s"));
+    assert_eq!(y0.tls.as_ref().map(|t| t.insecure), Some(true));
+    assert_eq!(
+        y0.tls.as_ref().map(|t| t.alpn.as_slice()),
+        Some(&["h3".to_string()][..])
+    );
+
+    // 3. hy2:// and hysteria2:// URIs with user:pass auth, obfs, mport, and inline port range
+    let uri_batch = [
+        "hy2://user1:pass%3A2@hk-hy2.example.com:8443/?obfs=salamander&obfs-password=uri-obfs-pw&mport=25000-26000,27000&hop-interval=45&upmbps=100&downmbps=500&sni=hk.example.com&alpn=h3&insecure=1#HK-HY2-URI",
+        "hysteria2://plainpw@uk-hy2.example.com:30000-31000/?sni=uk.example.com&obfs=salamander&obfs_password=inline-obfs#UK-HY2-Range",
+    ]
+    .join("\n");
+    let parsed_uri = parse_payload(&uri_batch, "UriSub").expect("parse hy2 uris");
+    assert_eq!(parsed_uri.nodes.len(), 2);
+
+    let u0 = &parsed_uri.nodes[0];
+    assert_eq!(u0.password.as_deref(), Some("user1:pass:2"));
+    assert_eq!(u0.obfs_type.as_deref(), Some("salamander"));
+    assert_eq!(u0.obfs_password.as_deref(), Some("uri-obfs-pw"));
+    assert_eq!(
+        u0.server_ports,
+        vec!["25000:26000".to_string(), "27000:27000".to_string()]
+    );
+    assert_eq!(u0.hop_interval.as_deref(), Some("45s"));
+    assert_eq!(u0.up_mbps, Some(100));
+    assert_eq!(u0.down_mbps, Some(500));
+    assert_eq!(u0.tls.as_ref().map(|t| t.insecure), Some(true));
+
+    let u1 = &parsed_uri.nodes[1];
+    assert_eq!(u1.port, 30000);
+    assert_eq!(u1.server_ports, vec!["30000:31000".to_string()]);
+    assert_eq!(u1.obfs_type.as_deref(), Some("salamander"));
+    assert_eq!(u1.obfs_password.as_deref(), Some("inline-obfs"));
+
+    // 4. Verify compiled sing-box v1.14 outbounds preserve obfs/server_ports and omit utls on QUIC
+    let c_obfs = compile_proxy_outbound(j0);
+    assert_eq!(c_obfs["obfs"]["type"], "salamander");
+    assert_eq!(c_obfs["obfs"]["password"], "salamander-obfs-key");
+    assert_eq!(c_obfs["server_port"], 22371);
+    assert!(c_obfs.get("server_ports").is_none());
+
+    let c_yaml = compile_proxy_outbound(y0);
+    assert!(c_yaml.get("server_port").is_none());
+    assert_eq!(
+        c_yaml["server_ports"],
+        serde_json::json!(["20000:30000", "40000:40000"])
+    );
+    assert_eq!(c_yaml["hop_interval"], "30s");
+    assert_eq!(c_yaml["obfs"]["type"], "salamander");
+    assert_eq!(c_yaml["obfs"]["password"], "clash-obfs-password");
+    assert!(
+        c_yaml["tls"].get("utls").is_none(),
+        "QUIC hysteria2 outbound must not emit tls.utls"
+    );
+
+    // 5. Real sing-box v1.14 check -c validation across all parsed HY2 variants
+    if let Some(sb) = find_test_singbox() {
+        let mut all_hy2 = Vec::new();
+        all_hy2.extend(parsed_json.nodes);
+        all_hy2.extend(parsed_yaml.nodes);
+        all_hy2.extend(parsed_uri.nodes);
+        let settings = AppSettings {
+            main_node_id: Some(all_hy2[0].id.clone()),
+            ..Default::default()
+        };
+        let mut rules = default_simple_rules();
+        rules[0].target = "auto:ALL".to_string();
+        let compiled = SingBox114Compiler::compile(&CompileInput {
+            nodes: &all_hy2,
+            rules: &rules,
+            app_rules: &[],
+            extra_ports: &[],
+            settings: &settings,
+            control_secret: "hy2-check",
+            cache_db_path: None,
+            rule_cache: None,
+            platform: CompilePlatform::Windows,
+        })
+        .expect("compile hy2 variants");
+
+        let report = SingBox114Compiler::preflight_check(&sb, &compiled.config).expect("preflight");
+        assert!(
+            report.ok,
+            "sing-box check failed on compiled HY2 outbounds: stderr={} stdout={}",
+            report.stderr, report.stdout
+        );
+        assert!(
+            report.deprecated_warnings.is_empty(),
+            "Unexpected HY2 deprecation warnings: {:?}",
+            report.deprecated_warnings
+        );
+    }
+}

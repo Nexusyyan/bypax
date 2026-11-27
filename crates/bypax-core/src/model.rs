@@ -116,6 +116,10 @@ pub struct NodeIR {
     pub obfs_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub obfs_password: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_ports: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hop_interval: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wg_private_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,6 +180,8 @@ impl NodeIR {
             down_mbps: None,
             obfs_type: None,
             obfs_password: None,
+            server_ports: Vec::new(),
+            hop_interval: None,
             wg_private_key: None,
             wg_peer_public_key: None,
             wg_preshared_key: None,

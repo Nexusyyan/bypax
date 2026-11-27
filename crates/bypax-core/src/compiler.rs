@@ -1196,9 +1196,11 @@ fn compile_tls(node: &NodeIR) -> Option<Value> {
     if !tls.alpn.is_empty() {
         obj.insert("alpn".to_string(), json!(tls.alpn));
     }
-    if let Some(ref fp) = tls.fingerprint {
-        if !fp.is_empty() {
-            obj.insert("utls".to_string(), json!({ "enabled": true, "fingerprint": fp }));
+    if !matches!(node.protocol, Protocol::Hysteria2 | Protocol::Tuic) {
+        if let Some(ref fp) = tls.fingerprint {
+            if !fp.is_empty() {
+                obj.insert("utls".to_string(), json!({ "enabled": true, "fingerprint": fp }));
+            }
         }
     }
     if let Some(ref pbk) = tls.reality_public_key {
@@ -1302,6 +1304,15 @@ pub fn compile_proxy_outbound(node: &NodeIR) -> Value {
                 "password".to_string(),
                 json!(node.password.as_deref().unwrap_or("")),
             );
+            if !node.server_ports.is_empty() {
+                obj.remove("server_port");
+                obj.insert("server_ports".to_string(), json!(node.server_ports));
+                if let Some(ref hop) = node.hop_interval {
+                    if !hop.is_empty() {
+                        obj.insert("hop_interval".to_string(), json!(hop));
+                    }
+                }
+            }
             if let Some(up) = node.up_mbps {
                 obj.insert("up_mbps".to_string(), json!(up));
             }
@@ -1309,12 +1320,17 @@ pub fn compile_proxy_outbound(node: &NodeIR) -> Value {
                 obj.insert("down_mbps".to_string(), json!(down));
             }
             if let Some(ref obfs) = node.obfs_type {
-                let mut obfs_obj = Map::new();
-                obfs_obj.insert("type".to_string(), json!(obfs));
-                if let Some(ref pass) = node.obfs_password {
-                    obfs_obj.insert("password".to_string(), json!(pass));
+                let clean = obfs.trim();
+                if !clean.is_empty() && !clean.eq_ignore_ascii_case("none") {
+                    let mut obfs_obj = Map::new();
+                    obfs_obj.insert("type".to_string(), json!(clean));
+                    if let Some(ref pass) = node.obfs_password {
+                        if !pass.is_empty() {
+                            obfs_obj.insert("password".to_string(), json!(pass));
+                        }
+                    }
+                    obj.insert("obfs".to_string(), Value::Object(obfs_obj));
                 }
-                obj.insert("obfs".to_string(), Value::Object(obfs_obj));
             }
         }
         Protocol::Tuic => {

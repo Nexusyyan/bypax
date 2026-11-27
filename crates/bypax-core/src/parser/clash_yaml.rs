@@ -1,5 +1,8 @@
 use crate::model::{NodeIR, Protocol, TlsConfig, TransportConfig};
-use crate::parser::ImportSummary;
+use crate::parser::{
+    first_port_from_ranges, normalize_hop_interval, normalize_port_ranges, parse_bandwidth_mbps,
+    ImportSummary,
+};
 use anyhow::{anyhow, Result};
 use saphyr::{LoadableYamlNode, Yaml};
 use std::collections::BTreeMap;
@@ -59,14 +62,45 @@ fn yaml_u16(node: &Yaml<'_>, key: &str) -> Option<u16> {
 }
 
 fn yaml_bool(node: &Yaml<'_>, key: &str) -> bool {
-    matches!(yaml_get(node, key), Some(Yaml::Value(saphyr::Scalar::Boolean(true))))
+    match yaml_get(node, key) {
+        Some(Yaml::Value(saphyr::Scalar::Boolean(b))) => *b,
+        Some(Yaml::Value(saphyr::Scalar::Integer(i))) => *i != 0,
+        Some(Yaml::Value(saphyr::Scalar::String(s))) => {
+            s.eq_ignore_ascii_case("true") || s.trim() == "1"
+        }
+        _ => false,
+    }
+}
+
+fn yaml_str_list(node: &Yaml<'_>, key: &str) -> Vec<String> {
+    match yaml_get(node, key) {
+        Some(Yaml::Sequence(seq)) => seq
+            .iter()
+            .filter_map(|item| match item {
+                Yaml::Value(saphyr::Scalar::String(s)) => {
+                    let t = s.trim();
+                    if t.is_empty() {
+                        None
+                    } else {
+                        Some(t.to_string())
+                    }
+                }
+                Yaml::Value(saphyr::Scalar::Integer(i)) => Some(i.to_string()),
+                _ => None,
+            })
+            .collect(),
+        Some(Yaml::Value(saphyr::Scalar::String(s))) => s
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn parse_clash_proxy(p: &Yaml<'_>, group: &str) -> Option<NodeIR> {
     let ptype = yaml_str(p, "type")?.to_ascii_lowercase();
     let server = yaml_str(p, "server")?;
-    let port = yaml_u16(p, "port")?;
-    let name = yaml_str(p, "name").unwrap_or_else(|| format!("{}:{}", server, port));
 
     let protocol = match ptype.as_str() {
         "vless" => Protocol::Vless,
@@ -82,10 +116,29 @@ fn parse_clash_proxy(p: &Yaml<'_>, group: &str) -> Option<NodeIR> {
         _ => return None,
     };
 
+    let mut server_ports: Vec<String> = Vec::new();
+    for entry in yaml_str_list(p, "ports") {
+        for norm in normalize_port_ranges(&entry) {
+            if !server_ports.contains(&norm) {
+                server_ports.push(norm);
+            }
+        }
+    }
+    let port = yaml_u16(p, "port")
+        .filter(|&pt| pt > 0)
+        .or_else(|| first_port_from_ranges(&server_ports))?;
+    let name = yaml_str(p, "name").unwrap_or_else(|| format!("{}:{}", server, port));
+
     let mut node = NodeIR::new(next_id(&ptype), protocol, name, &server, port, group);
     node.uuid = yaml_str(p, "uuid");
     node.username = yaml_str(p, "username");
-    node.password = yaml_str(p, "password");
+    node.password = yaml_str(p, "password").or_else(|| {
+        if protocol == Protocol::Hysteria2 {
+            yaml_str(p, "auth")
+        } else {
+            None
+        }
+    });
     if protocol == Protocol::Socks {
         node.socks_version = Some("5".to_string());
     }
@@ -93,6 +146,22 @@ fn parse_clash_proxy(p: &Yaml<'_>, group: &str) -> Option<NodeIR> {
     node.flow = yaml_str(p, "flow");
     node.alter_id = yaml_u16(p, "alterId");
     node.congestion_control = yaml_str(p, "congestion-controller");
+    if protocol == Protocol::Hysteria2 {
+        node.obfs_type = yaml_str(p, "obfs")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"));
+        node.obfs_password = yaml_str(p, "obfs-password").filter(|s| !s.is_empty());
+        node.up_mbps = yaml_str(p, "up")
+            .or_else(|| yaml_str(p, "up-mbps"))
+            .and_then(|s| parse_bandwidth_mbps(&s));
+        node.down_mbps = yaml_str(p, "down")
+            .or_else(|| yaml_str(p, "down-mbps"))
+            .and_then(|s| parse_bandwidth_mbps(&s));
+        node.server_ports = server_ports;
+        node.hop_interval = yaml_str(p, "hop-interval")
+            .or_else(|| yaml_str(p, "hop_interval"))
+            .and_then(|s| normalize_hop_interval(&s));
+    }
 
     let tls_flag = yaml_bool(p, "tls")
         || matches!(
@@ -109,7 +178,7 @@ fn parse_clash_proxy(p: &Yaml<'_>, group: &str) -> Option<NodeIR> {
             enabled: true,
             server_name: Some(sni),
             insecure: yaml_bool(p, "skip-cert-verify"),
-            alpn: Vec::new(),
+            alpn: yaml_str_list(p, "alpn"),
             fingerprint: yaml_str(p, "client-fingerprint"),
             reality_public_key: reality_pub,
             reality_short_id: reality_sid,

@@ -1,5 +1,8 @@
 use crate::model::{NodeIR, Protocol, TlsConfig, TransportConfig};
-use crate::parser::ImportSummary;
+use crate::parser::{
+    first_port_from_ranges, normalize_hop_interval, normalize_port_ranges, parse_bandwidth_mbps,
+    ImportSummary,
+};
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -380,29 +383,100 @@ fn split_host_port(hp: &str) -> Result<(String, u16)> {
     Ok((host.to_string(), port))
 }
 
+fn extract_inline_hy2_port_range(normalized: &str) -> (String, Vec<String>) {
+    let Some(rest) = normalized.strip_prefix("hysteria2://") else {
+        return (normalized.to_string(), Vec::new());
+    };
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    let suffix = &rest[auth_end..];
+    let (userinfo_prefix, hostport) = match authority.rsplit_once('@') {
+        Some((u, hp)) => (format!("{}@", u), hp),
+        None => (String::new(), authority),
+    };
+    let (host_part, port_part) = if let Some(after_bracket) = hostport.strip_prefix('[') {
+        let Some((ipv6, port_str)) = after_bracket.split_once("]:") else {
+            return (normalized.to_string(), Vec::new());
+        };
+        (format!("[{}]", ipv6), port_str)
+    } else {
+        let Some((h, port_str)) = hostport.rsplit_once(':') else {
+            return (normalized.to_string(), Vec::new());
+        };
+        (h.to_string(), port_str)
+    };
+    if !port_part.contains('-') && !port_part.contains(',') {
+        return (normalized.to_string(), Vec::new());
+    }
+    let ranges = normalize_port_ranges(port_part);
+    let Some(first_port) = first_port_from_ranges(&ranges) else {
+        return (normalized.to_string(), Vec::new());
+    };
+    let rewritten = format!(
+        "hysteria2://{}{}:{}{}",
+        userinfo_prefix, host_part, first_port, suffix
+    );
+    (rewritten, ranges)
+}
+
 fn parse_hysteria2(uri: &str, group: &str) -> Result<NodeIR> {
     let normalized = if uri.to_ascii_lowercase().starts_with("hy2://") {
         format!("hysteria2://{}", &uri[6..])
     } else {
         uri.to_string()
     };
-    let url = Url::parse(&normalized).context("Invalid Hysteria2 URI")?;
+    let (parseable, inline_ports) = extract_inline_hy2_port_range(&normalized);
+    let url = Url::parse(&parseable).context("Invalid Hysteria2 URI")?;
     let server = url.host_str().ok_or_else(|| anyhow!("Hysteria2 missing host"))?.to_string();
-    let port = url.port().unwrap_or(443);
-    let password = percent_decode(url.username());
+    let user = percent_decode(url.username());
+    let password = match url.password() {
+        Some(pass) => format!("{}:{}", user, percent_decode(pass)),
+        None => user,
+    };
+    let params = query_map(&url);
+
+    let mut server_ports = inline_ports;
+    if let Some(mport) = params.get("mport").or_else(|| params.get("ports")) {
+        for norm in normalize_port_ranges(mport) {
+            if !server_ports.contains(&norm) {
+                server_ports.push(norm);
+            }
+        }
+    }
+    let port = url
+        .port()
+        .or_else(|| first_port_from_ranges(&server_ports))
+        .unwrap_or(443);
     let remark = url
         .fragment()
         .map(percent_decode)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("{}:{}", server, port));
-    let params = query_map(&url);
 
     let mut node = NodeIR::new(next_node_id("hy2"), Protocol::Hysteria2, remark, &server, port, group);
     node.password = Some(password);
-    node.obfs_type = params.get("obfs").filter(|s| !s.is_empty() && *s != "none").cloned();
-    node.obfs_password = params.get("obfs-password").filter(|s| !s.is_empty()).cloned();
-    node.up_mbps = params.get("upmbps").and_then(|s| s.parse::<u32>().ok());
-    node.down_mbps = params.get("downmbps").and_then(|s| s.parse::<u32>().ok());
+    node.obfs_type = params
+        .get("obfs")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"));
+    node.obfs_password = params
+        .get("obfs-password")
+        .or_else(|| params.get("obfs_password"))
+        .filter(|s| !s.is_empty())
+        .cloned();
+    node.up_mbps = params
+        .get("upmbps")
+        .or_else(|| params.get("up"))
+        .and_then(|s| parse_bandwidth_mbps(s));
+    node.down_mbps = params
+        .get("downmbps")
+        .or_else(|| params.get("down"))
+        .and_then(|s| parse_bandwidth_mbps(s));
+    node.server_ports = server_ports;
+    node.hop_interval = params
+        .get("hop-interval")
+        .or_else(|| params.get("hop_interval"))
+        .and_then(|s| normalize_hop_interval(s));
     node.tls = build_tls(&params, &server, true);
     node.raw_uri = Some(uri.to_string());
     Ok(node)

@@ -1,5 +1,8 @@
 use crate::model::{NodeIR, Protocol, TlsConfig, TransportConfig};
-use crate::parser::ImportSummary;
+use crate::parser::{
+    first_port_from_ranges, normalize_hop_interval, normalize_port_ranges, parse_bandwidth_mbps,
+    ImportSummary,
+};
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -136,7 +139,42 @@ fn parse_outbound_obj(item: &Value, group: &str) -> Option<NodeIR> {
     };
 
     let server = item.get("server")?.as_str()?.to_string();
-    let port = item.get("server_port")?.as_u64()? as u16;
+    let mut server_ports: Vec<String> = Vec::new();
+    if let Some(raw_ports) = item.get("server_ports") {
+        match raw_ports {
+            Value::Array(arr) => {
+                for entry in arr {
+                    if let Some(s) = entry.as_str() {
+                        for norm in normalize_port_ranges(s) {
+                            if !server_ports.contains(&norm) {
+                                server_ports.push(norm);
+                            }
+                        }
+                    } else if let Some(n) = entry.as_u64().and_then(|v| u16::try_from(v).ok()) {
+                        if n > 0 {
+                            let norm = format!("{}:{}", n, n);
+                            if !server_ports.contains(&norm) {
+                                server_ports.push(norm);
+                            }
+                        }
+                    }
+                }
+            }
+            Value::String(s) => {
+                server_ports = normalize_port_ranges(s);
+            }
+            _ => {}
+        }
+    }
+    let port = item
+        .get("server_port")
+        .and_then(|v| {
+            v.as_u64()
+                .and_then(|n| u16::try_from(n).ok())
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u16>().ok()))
+        })
+        .filter(|&p| p > 0)
+        .or_else(|| first_port_from_ranges(&server_ports))?;
     let remark = item
         .get("tag")
         .and_then(|s| s.as_str())
@@ -169,11 +207,38 @@ fn parse_outbound_obj(item: &Value, group: &str) -> Option<NodeIR> {
         .get("congestion_control")
         .and_then(|s| s.as_str())
         .map(|s| s.to_string());
-    node.up_mbps = item.get("up_mbps").and_then(|n| n.as_u64()).map(|n| n as u32);
-    node.down_mbps = item.get("down_mbps").and_then(|n| n.as_u64()).map(|n| n as u32);
+    node.up_mbps = item.get("up_mbps").and_then(parse_json_mbps);
+    node.down_mbps = item.get("down_mbps").and_then(parse_json_mbps);
+    if let Some(obfs) = item.get("obfs").and_then(|v| v.as_object()) {
+        node.obfs_type = obfs
+            .get("type")
+            .and_then(|s| s.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
+            .map(|s| s.to_string());
+        node.obfs_password = obfs
+            .get("password")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+    }
+    node.server_ports = server_ports;
+    node.hop_interval = item.get("hop_interval").and_then(|v| match v {
+        Value::String(s) => normalize_hop_interval(s),
+        Value::Number(n) => n.as_u64().and_then(|s| normalize_hop_interval(&s.to_string())),
+        _ => None,
+    });
     node.tls = parse_tls_obj(item);
     node.transport = parse_transport_obj(item);
     Some(node)
+}
+
+fn parse_json_mbps(v: &Value) -> Option<u32> {
+    match v {
+        Value::Number(n) => n.as_u64().and_then(|x| u32::try_from(x).ok()).filter(|&x| x > 0),
+        Value::String(s) => parse_bandwidth_mbps(s),
+        _ => None,
+    }
 }
 
 fn parse_endpoint_obj(item: &Value, group: &str) -> Option<NodeIR> {

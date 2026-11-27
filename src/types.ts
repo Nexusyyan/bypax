@@ -65,6 +65,8 @@ export interface NodeIR {
   downMbps?: number;
   obfsType?: string;
   obfsPassword?: string;
+  serverPorts?: string[];
+  hopInterval?: string;
   wgPrivateKey?: string;
   wgPeerPublicKey?: string;
   wgPresharedKey?: string;
