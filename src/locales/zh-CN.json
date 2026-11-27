@@ -1,5 +1,13 @@
 {
   "appTitle": "Bypax",
+  "bootstrap": {
+    "loadingTitle": "正在准备代理工作区...",
+    "loadingHint": "正在读取本地配置、节点列表与运行状态",
+    "trayLoading": "正在读取状态...",
+    "errorTitle": "本地配置加载失败",
+    "retry": "重新加载",
+    "retrying": "正在重试..."
+  },
   "titlebar": {
     "modeRule": "规则",
     "modeGlobal": "全局",

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api/client";
+import { BootstrapScreen } from "./components/BootstrapScreen";
 import { Sidebar } from "./components/Sidebar";
 import { TitleBar } from "./components/TitleBar";
 import { AppsView } from "./features/apps/AppsView";
@@ -202,6 +203,22 @@ function readInitialTab(): NavTab {
   return "nodes";
 }
 
+function detectInitialPlatform(): PlatformKind {
+  if (typeof navigator !== "undefined") {
+    const ua = `${navigator.platform ?? ""} ${navigator.userAgent ?? ""}`.toLowerCase();
+    if (ua.includes("mac")) return "macos";
+    if (ua.includes("linux") && !ua.includes("android")) return "linux";
+  }
+  return "windows";
+}
+
+function readPreviewBootMode(): "loading" | "error" | null {
+  if (typeof window === "undefined" || api.isDesktop()) return null;
+  const raw = new URLSearchParams(window.location.search).get("boot");
+  if (raw === "loading" || raw === "error") return raw;
+  return null;
+}
+
 export default function App() {
   const [locale, setLocale] = useState<Locale>(detectInitialLocale);
   const [theme, setTheme] = useState<ThemeMode>(readInitialTheme);
@@ -209,7 +226,7 @@ export default function App() {
   const [routingTestHost, setRoutingTestHost] = useState<string | null>(null);
 
   const [appVersion, setAppVersion] = useState<string>("0.1.0");
-  const [platform, setPlatform] = useState<PlatformKind | string>("windows");
+  const [platform, setPlatform] = useState<PlatformKind | string>(detectInitialPlatform);
   const [captureMode, setCaptureMode] = useState<CaptureMode>("off");
   const [captureSwitching, setCaptureSwitching] = useState(false);
   const [capturePendingTarget, setCapturePendingTarget] = useState<CaptureMode | null>(null);
@@ -265,8 +282,13 @@ export default function App() {
   const [checkingAppUpdate, setCheckingAppUpdate] = useState(false);
   const [appUpdateError, setAppUpdateError] = useState<string | null>(null);
   const [bootstrapped, setBootstrapped] = useState(false);
+  const [bootstrapError, setBootstrapError] = useState<string | null>(() =>
+    readPreviewBootMode() === "error" ? "Local workspace store unavailable (preview)" : null,
+  );
+  const [retryingBootstrap, setRetryingBootstrap] = useState(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
+  const bootstrappedRef = useRef(false);
   const autoCheckTriggeredRef = useRef(false);
   const updateResultHandledRef = useRef(false);
 
@@ -349,6 +371,8 @@ export default function App() {
               : "off"),
       );
       if (data.appUpdateState) setAppUpdateState(data.appUpdateState);
+      bootstrappedRef.current = true;
+      setBootstrapError(null);
       setBootstrapped(true);
 
       if (data.lastUpdateResult && !updateResultHandledRef.current) {
@@ -367,11 +391,27 @@ export default function App() {
         }
       }
     } catch (err) {
-      pushToast(String(err), "err");
+      const msg = String(err);
+      if (!bootstrappedRef.current) {
+        setBootstrapError(msg);
+      } else {
+        pushToast(msg, "err");
+      }
     }
   }, [dict.toast.updateApplied, dict.toast.updateRolledBack, pushToast]);
 
+  const handleRetryBootstrap = useCallback(async () => {
+    setRetryingBootstrap(true);
+    setBootstrapError(null);
+    try {
+      await reloadBootstrap();
+    } finally {
+      setRetryingBootstrap(false);
+    }
+  }, [reloadBootstrap]);
+
   useEffect(() => {
+    if (readPreviewBootMode() !== null) return;
     void reloadBootstrap();
     void api.listRulePresets().then(setRulePresets).catch(() => {});
   }, [reloadBootstrap]);
@@ -437,8 +477,9 @@ export default function App() {
     };
   }, []);
 
-  // Periodic live monitor polling (works in both Tauri desktop & browser preview)
+  // Periodic live monitor polling (starts only after initial bootstrap completes)
   useEffect(() => {
+    if (!bootstrapped) return;
     const poll = async () => {
       try {
         const snap = await api.getLiveMonitor();
@@ -1205,6 +1246,18 @@ export default function App() {
     ]);
     return { processes, installed };
   };
+
+  if (!bootstrapped) {
+    return (
+      <BootstrapScreen
+        dict={dict}
+        platform={platform}
+        error={bootstrapError}
+        retrying={retryingBootstrap}
+        onRetry={() => void handleRetryBootstrap()}
+      />
+    );
+  }
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-[var(--bg-chrome)]">

@@ -78,6 +78,7 @@ export function TrayPopup() {
   });
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [loaded, setLoaded] = useState(false);
 
   const dict = useMemo(() => getDict(locale), [locale]);
 
@@ -104,12 +105,16 @@ export function TrayPopup() {
         setLocale(nextLoc);
         applyTrayTheme((data.settings.theme as ThemeMode) || "system");
       }
+      setLoaded(true);
     } catch {
       // ignore transient startup read
     }
   }, []);
 
   useEffect(() => {
+    const previewLoading =
+      !api.isDesktop() &&
+      new URLSearchParams(window.location.search).get("boot") === "loading";
     const syncThemeFromEnv = () => {
       const urlTheme = new URLSearchParams(window.location.search).get("theme");
       if (urlTheme === "light" || urlTheme === "dark") {
@@ -124,7 +129,9 @@ export function TrayPopup() {
       }
     };
     syncThemeFromEnv();
-    void refreshAll();
+    if (!previewLoading) {
+      void refreshAll();
+    }
 
     const onStorage = (e: StorageEvent) => {
       if (e.key === THEME_STORAGE_KEY && e.newValue) {
@@ -285,7 +292,29 @@ export function TrayPopup() {
   const isDesktop = api.isDesktop();
 
   // Gate A A3: Root Tray Popover uses --bg-surface and inner cards use --bg-subtle.
-  const card = (
+  const card = !loaded ? (
+    <div
+      role="status"
+      aria-live="polite"
+      aria-busy="true"
+      className={`flex flex-col items-center justify-center overflow-hidden bg-[var(--bg-surface)] p-6 text-center select-none ${
+        isDesktop
+          ? "h-screen w-screen border border-[var(--border-strong)]"
+          : "h-[456px] w-[304px] rounded-[16px] border border-[var(--border-strong)] shadow-[var(--shadow-card-lg)]"
+      }`}
+    >
+      <BrandLogo variant="color" className="h-[52px] w-[52px]" />
+      <div className="mt-3 text-[14px] font-semibold tracking-[-0.015em] text-[var(--text-primary)]">
+        {dict.appTitle}
+      </div>
+      <p className="mt-1 text-[12px] text-[var(--text-secondary)]">
+        {dict.bootstrap.trayLoading}
+      </p>
+      <div className="boot-track mt-4 w-[136px]" aria-hidden="true">
+        <div className="boot-indeterminate" />
+      </div>
+    </div>
+  ) : (
     <div
       className={`flex flex-col justify-between overflow-hidden bg-[var(--bg-surface)] p-3 select-none ${
         isDesktop

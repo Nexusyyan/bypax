@@ -1,5 +1,13 @@
 {
   "appTitle": "Bypax",
+  "bootstrap": {
+    "loadingTitle": "Preparing workspace...",
+    "loadingHint": "Reading local configuration, nodes, and runtime state",
+    "trayLoading": "Loading status...",
+    "errorTitle": "Unable to load local configuration",
+    "retry": "Retry",
+    "retrying": "Retrying..."
+  },
   "titlebar": {
     "modeRule": "Rule",
     "modeGlobal": "Global",

@@ -475,6 +475,25 @@
     opacity: 0.9;
   }
 
+  /* Bootstrap loading indeterminate bar (Studio Slate neutral accent, G9 reduced-motion safe) */
+  .boot-track {
+    position: relative;
+    height: 4px;
+    border-radius: 9999px;
+    overflow: hidden;
+    background: var(--bg-track);
+  }
+
+  .boot-indeterminate {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 38%;
+    border-radius: 9999px;
+    background: var(--accent-primary);
+    animation: boot-slide 1.25s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  }
+
   /* =========================================================================
    * Zero-Overflow @container Table Layouts (DESIGN.md Section 6, G1 & G2)
    * ========================================================================= */
@@ -694,6 +713,15 @@
   }
 }
 
+@keyframes boot-slide {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(280%);
+  }
+}
+
 /* G9: Reduced-motion compliance (disable springs, pulse dots, radar sweeps, shimmers) */
 @media (prefers-reduced-motion: reduce) {
   *,
@@ -705,7 +733,13 @@
     scroll-behavior: auto !important;
   }
   .telemetry-fill::after,
-  .telemetry-radar {
+  .telemetry-radar,
+  .boot-indeterminate {
     animation: none !important;
+  }
+  .boot-indeterminate {
+    left: 25%;
+    width: 50%;
+    transform: none !important;
   }
 }
