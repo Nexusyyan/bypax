@@ -506,10 +506,7 @@ export function RoutingView({
       {/* Unified Single-Row 40px Page Header */}
       <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-[var(--border-hairline)] px-4 py-2.5 lg:px-5">
         <div className="min-w-0">
-          <h1
-            className="truncate text-[18px] font-semibold tracking-[-0.015em] text-[var(--text-primary)]"
-            title={dict.routing.subtitle}
-          >
+          <h1 className="truncate text-[18px] font-semibold tracking-[-0.015em] text-[var(--text-primary)]">
             {dict.routing.title}
           </h1>
         </div>
@@ -878,9 +875,6 @@ export function RoutingView({
               <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
                 {dict.routing.fallbackTitle}
               </div>
-              <div className="mt-0.5 text-[11.5px] text-[var(--text-secondary)]">
-                {dict.routing.fallbackDesc}
-              </div>
             </div>
 
             <div className="col-span-5">
@@ -927,7 +921,6 @@ export function RoutingView({
               </span>
             </div>
             <div className="flex items-center gap-2 text-[11.5px] text-[var(--text-secondary)]">
-              <span>{dict.routing.advPortsHint}</span>
               {portsOpen ? (
                 <ChevronDown className="h-4 w-4 text-[var(--text-tertiary)]" strokeWidth={1.5} />
               ) : (
@@ -943,13 +936,8 @@ export function RoutingView({
                   <span className="rounded-[6px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-2 py-1 font-mono text-[12px] font-semibold text-[var(--text-primary)] num-tabular">
                     :{mixedPort}
                   </span>
-                  <div>
-                    <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
-                      {dict.routing.mainPortName}
-                    </div>
-                    <div className="text-[11.5px] text-[var(--text-secondary)]">
-                      {dict.routing.mainPortDesc}
-                    </div>
+                  <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
+                    {dict.routing.mainPortName}
                   </div>
                 </div>
                 <button
@@ -971,13 +959,8 @@ export function RoutingView({
                     <span className="rounded-[6px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-2 py-1 font-mono text-[12px] font-semibold text-[var(--text-primary)] num-tabular">
                       :{p.port}
                     </span>
-                    <div>
-                      <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
-                        {locale === "en" ? p.noteEn : p.note}
-                      </div>
-                      <div className="text-[11.5px] text-[var(--text-secondary)]">
-                        {dict.routing.extraPortDesc}
-                      </div>
+                    <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
+                      {locale === "en" ? p.noteEn : p.note}
                     </div>
                   </div>
                   <div className="flex items-center gap-1.5">
@@ -1059,14 +1042,9 @@ export function RoutingView({
         >
           <div className="ui-modal flex max-h-[82vh] w-full max-w-2xl flex-col overflow-hidden">
             <div className="flex items-center justify-between border-b border-[var(--border-hairline)] px-5 py-3.5">
-              <div>
-                <h3 className="text-[14px] font-semibold text-[var(--text-primary)]">
-                  {dict.routing.presetLibTitle}
-                </h3>
-                <p className="mt-0.5 text-[11.5px] text-[var(--text-secondary)]">
-                  {dict.routing.presetLibDesc}
-                </p>
-              </div>
+              <h3 className="text-[14px] font-semibold text-[var(--text-primary)]">
+                {dict.routing.presetLibTitle}
+              </h3>
               <button
                 type="button"
                 onClick={() => setShowPresetModal(false)}

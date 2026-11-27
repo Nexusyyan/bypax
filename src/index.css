@@ -494,6 +494,44 @@
     animation: boot-slide 1.25s cubic-bezier(0.4, 0, 0.2, 1) infinite;
   }
 
+  /* Main Exit Signal Breathing Light (Studio Slate, G9 reduced-motion safe) */
+  .signal-beacon {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 10px;
+    height: 10px;
+    flex-shrink: 0;
+  }
+
+  .signal-beacon-core {
+    position: relative;
+    z-index: 1;
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background-color: var(--beacon-color, var(--text-tertiary));
+    transition: background-color var(--duration-base) var(--ease-out);
+  }
+
+  .signal-beacon-ring {
+    position: absolute;
+    inset: 0;
+    border-radius: 9999px;
+    background-color: var(--beacon-color, var(--text-tertiary));
+    opacity: 0.35;
+    animation: signal-breathe 2.4s ease-in-out infinite;
+  }
+
+  .signal-beacon-probing .signal-beacon-ring {
+    animation: signal-probe 0.9s ease-out infinite;
+  }
+
+  .signal-beacon-probing .signal-beacon-core {
+    animation: signal-core-pulse 0.9s ease-in-out infinite;
+  }
+
   /* =========================================================================
    * Zero-Overflow @container Table Layouts (DESIGN.md Section 6, G1 & G2)
    * ========================================================================= */
@@ -722,6 +760,39 @@
   }
 }
 
+@keyframes signal-breathe {
+  0%,
+  100% {
+    transform: scale(0.75);
+    opacity: 0.16;
+  }
+  50% {
+    transform: scale(1.38);
+    opacity: 0.42;
+  }
+}
+
+@keyframes signal-probe {
+  0% {
+    transform: scale(0.7);
+    opacity: 0.55;
+  }
+  100% {
+    transform: scale(1.85);
+    opacity: 0;
+  }
+}
+
+@keyframes signal-core-pulse {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 /* G9: Reduced-motion compliance (disable springs, pulse dots, radar sweeps, shimmers) */
 @media (prefers-reduced-motion: reduce) {
   *,
@@ -734,8 +805,14 @@
   }
   .telemetry-fill::after,
   .telemetry-radar,
-  .boot-indeterminate {
+  .boot-indeterminate,
+  .signal-beacon-ring,
+  .signal-beacon-core {
     animation: none !important;
+  }
+  .signal-beacon-ring {
+    opacity: 0.22;
+    transform: scale(1.1);
   }
   .boot-indeterminate {
     left: 25%;

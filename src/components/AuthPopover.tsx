@@ -57,6 +57,7 @@ export function AuthPopover({
     <div
       ref={ref}
       role="dialog"
+      onMouseDown={(e) => e.stopPropagation()}
       aria-label={targetMode === "tun" ? dict.authPopover.titleTun : dict.authPopover.title}
       className={`ui-popover absolute top-full ${alignClass} z-50 mt-2 w-[320px] max-w-[calc(100vw-24px)] p-3.5 text-left`}
     >

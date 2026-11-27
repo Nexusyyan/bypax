@@ -252,13 +252,13 @@ Users answer exactly two orthogonal questions:
 
 ### 5.3 Frameless TitleBar (`44px`) Responsive Ladder
 
-- **Platform Chrome Alignment:** Windows places native window controls (`46x44`, close hover `#C42B1C` white glyph) on the far right. macOS uses native traffic lights on the far left and shifts the brand tile and core pill rightward to clear the traffic-light inset (`padding-left: 76px`).
+- **Platform Chrome Alignment:** Windows places native window controls (`46x44`, close hover `#C42B1C` white glyph) on the far right and renders the monochrome brand tile + wordmark on the left. macOS uses native `Overlay` traffic lights (`x: 16, y: 22`) on the far left and omits the duplicate top-left brand tile/wordmark (since macOS displays the app title in the global menu bar), leaving the traffic-light inset clean (`padding-left: 82px`). The TitleBar never displays the underlying core version number (`v1.14.x`) to avoid confusion with Bypax's own app version (only showing a missing-core indicator when no core binary is installed, or an app update pill when relevant).
 
 | Window Width | TitleBar Composition |
 | :--- | :--- |
-| `>= 1280px` | Monochrome tile + `Bypax` + Core pill + Mode segmented + hairline divider + System Proxy switch + `Off\|App Proxy\|TUN` segmented + Up/Down throughput + Locale + Theme + Window controls |
-| `1100px - 1279px` | Hide wordmark text; throughput shows Down only; Locale + Theme merge into a single Appearance menu button |
-| `940px - 1099px` | System Proxy + `Off\|App Proxy\|TUN` collapse into a single `Takeover` summary button (opens anchored panel identical to Tray controls); Core pill collapses to status dot |
+| `>= 1280px` | Mode segmented + hairline divider + System Proxy switch + `Off\|App Proxy\|TUN` segmented + Down/Up throughput + Locale + Theme (+ Windows brand mark & window controls on Windows) |
+| `1100px - 1279px` | Hide Windows wordmark text; keep both Down/Up throughput visible; Locale + Theme merge into a single Appearance menu button |
+| `940px - 1099px` | System Proxy + `Off\|App Proxy\|TUN` collapse into a single `Takeover` summary button (opens anchored panel identical to Tray controls); keep both Down/Up throughput visible |
 
 ### 5.4 Custom Tray Popover (`304 x 456`)
 - **Surface Hierarchy (Contrast Guard):** Root container MUST use `--bg-surface` (`#FFFFFF` Light / `#161B22` Dark) and inner cards (Main Exit card, Takeover group) MUST use `--bg-subtle` (`#F8FAFC` Light / `#1C2128` Dark) -- NEVER `--bg-chrome` -- so metadata labels meet WCAG AA contrast.

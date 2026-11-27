@@ -7,7 +7,6 @@ import {
   Download,
   FolderOpen,
   Gauge,
-  HelpCircle,
   Link2,
   Plus,
   RefreshCw,
@@ -363,18 +362,28 @@ export function NodesView({
             })}
           </div>
 
-          <div className="relative">
-            <Search
-              className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-[var(--text-tertiary)]"
-              strokeWidth={1.5}
-            />
-            <input
-              type="text"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder={dict.nodes.searchPlaceholder}
-              className="ui-input h-8 w-44 pr-3 pl-8 text-[12px] xl:w-56"
-            />
+          <div className="flex items-center gap-2">
+            <div className="relative">
+              <Search
+                className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-[var(--text-tertiary)]"
+                strokeWidth={1.5}
+              />
+              <input
+                type="text"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder={dict.nodes.searchPlaceholder}
+                className="ui-input h-8 w-44 pr-3 pl-8 text-[12px] xl:w-56"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={cycleSort}
+              className="ui-btn-secondary h-8 shrink-0 px-2.5 font-mono text-[11.5px] text-[var(--text-secondary)]"
+            >
+              <ArrowUpDown className="h-3 w-3 text-[var(--text-secondary)]" strokeWidth={1.5} />
+              {sortLabel}
+            </button>
           </div>
         </div>
       )}
@@ -482,7 +491,7 @@ export function NodesView({
                 </>
               ) : (
                 <span className="text-[var(--text-secondary)]">
-                  {isStartingPhase ? "ISOLATED PROBE ENGINE" : `${progressDone} / ${progressTotal}`}
+                  {isStartingPhase ? dict.nodes.testingStarting : `${progressDone} / ${progressTotal}`}
                 </span>
               )}
             </div>
@@ -490,23 +499,6 @@ export function NodesView({
               {progressDone} / {progressTotal}
             </span>
           </div>
-        </div>
-      )}
-
-      {/* Subtle Tip + Sort Strip (hidden when 0 nodes) */}
-      {nodes.length > 0 && (
-        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-4 py-1.5 text-[11.5px] text-[var(--text-secondary)] lg:px-5">
-          <span className="truncate" title={dict.nodes.hint}>
-            {dict.nodes.hint}
-          </span>
-          <button
-            type="button"
-            onClick={cycleSort}
-            className="inline-flex shrink-0 items-center gap-1 font-mono text-[11.5px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
-          >
-            <ArrowUpDown className="h-3 w-3 text-[var(--text-secondary)]" strokeWidth={1.5} />
-            {sortLabel}
-          </button>
         </div>
       )}
 
@@ -544,13 +536,7 @@ export function NodesView({
             <div className="nodes-col-proto">{dict.nodes.colProto}</div>
             <div className="nodes-col-server">{dict.nodes.colServer}</div>
             <div className="nodes-col-rules">{dict.nodes.colRules}</div>
-            <div
-              className="flex items-center justify-end gap-1"
-              title={dict.nodes.realDelayTooltip}
-            >
-              <span>{dict.nodes.colReal}</span>
-              <HelpCircle className="h-3 w-3 text-[var(--text-tertiary)]" strokeWidth={1.5} />
-            </div>
+            <div className="text-right">{dict.nodes.colReal}</div>
             <div className="nodes-col-actions text-right">{dict.nodes.colAction}</div>
           </div>
 

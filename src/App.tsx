@@ -150,7 +150,6 @@ const DEFAULT_SETTINGS: AppSettings = {
     "172.16.0.0/12",
     "192.168.0.0/16",
     "100.64.0.0/10",
-    "198.19.0.0/16",
   ],
 };
 
@@ -267,6 +266,7 @@ export default function App() {
   const [upHistory, setUpHistory] = useState<number[]>(() => Array(40).fill(0));
 
   const [testingKind, setTestingKind] = useState<"tcping" | "real" | null>(null);
+  const [mainNodeTesting, setMainNodeTesting] = useState(false);
   const [testProgress, setTestProgress] = useState<LatencyProgressEvent | null>(null);
   const [testDelayStats, setTestDelayStats] = useState<{ sum: number; count: number }>({
     sum: 0,
@@ -295,6 +295,8 @@ export default function App() {
   const bootstrappedRef = useRef(false);
   const autoCheckTriggeredRef = useRef(false);
   const updateResultHandledRef = useRef(false);
+  const batchTestingRef = useRef(false);
+  const mainProbeSeqRef = useRef(0);
 
   const dict = useMemo(() => getDict(locale), [locale]);
 
@@ -455,10 +457,12 @@ export default function App() {
     let unlistenProg: (() => void) | undefined;
     void api
       .onLatencyProgress((ev) => {
-        setTestProgress(ev);
+        if (batchTestingRef.current) {
+          setTestProgress(ev);
+        }
         const latest = ev.latest;
         if (latest) {
-          if (latest.delayMs != null) {
+          if (batchTestingRef.current && latest.delayMs != null) {
             const ms = latest.delayMs;
             setTestDelayStats((prev) => ({ sum: prev.sum + ms, count: prev.count + 1 }));
           }
@@ -466,9 +470,9 @@ export default function App() {
             prev.map((n) => {
               if (n.id !== latest.nodeId) return n;
               if (latest.kind === "tcping") {
-                return { ...n, tcpingMs: latest.delayMs ?? n.tcpingMs };
+                return { ...n, tcpingMs: latest.delayMs ?? null };
               }
-              return { ...n, realDelayMs: latest.delayMs ?? n.realDelayMs };
+              return { ...n, realDelayMs: latest.delayMs ?? null };
             }),
           );
         }
@@ -633,6 +637,7 @@ export default function App() {
       const reason = String(err);
       setCaptureError(reason);
       pushToast(dict.capture.switchFailed.replace("{reason}", reason), "err");
+      void reloadBootstrap();
     } finally {
       setCaptureSwitching(false);
       setCapturePendingTarget(null);
@@ -734,12 +739,48 @@ export default function App() {
     }
   };
 
+  const handleProbeMainNode = useCallback(
+    async (explicitNodeId?: string) => {
+      const targetId = explicitNodeId ?? settings.mainNodeId ?? nodes[0]?.id ?? null;
+      if (!targetId) return;
+      const seq = ++mainProbeSeqRef.current;
+      setMainNodeTesting(true);
+      try {
+        const useReal = coreInfo.installed;
+        const results = useReal
+          ? await api.runBatchRealDelay([targetId])
+          : await api.runBatchTcping([targetId]);
+        const hit = results.find((r) => r.nodeId === targetId) ?? results[0];
+        if (hit) {
+          setNodes((prev) =>
+            prev.map((n) => {
+              if (n.id !== targetId) return n;
+              if (hit.kind === "tcping") {
+                return { ...n, tcpingMs: hit.delayMs ?? null };
+              }
+              return { ...n, realDelayMs: hit.delayMs ?? null };
+            }),
+          );
+        }
+      } catch (err) {
+        const msg = String(err);
+        pushToast(msg.includes("CORE_NOT_INSTALLED") ? dict.toast.coreMissingAction : msg, "err");
+      } finally {
+        if (mainProbeSeqRef.current === seq) {
+          setMainNodeTesting(false);
+        }
+      }
+    },
+    [coreInfo.installed, dict.toast.coreMissingAction, nodes, pushToast, settings.mainNodeId],
+  );
+
   const handleSelectMainNode = async (id: string) => {
     setSettings((prev) => ({ ...prev, mainNodeId: id }));
     try {
       const res = await api.selectMainNode(id);
       setCompiled(res.compiled);
       pushToast(res.hotSwitched ? dict.toast.hotSwitched : dict.toast.nodeSelected);
+      void handleProbeMainNode(id);
     } catch (err) {
       pushToast(String(err), "err");
     }
@@ -790,6 +831,7 @@ export default function App() {
   };
 
   const handleRunBatchTest = async (kind: "tcping" | "real", nodeIds: string[]) => {
+    batchTestingRef.current = true;
     setTestingKind(kind);
     setTestDelayStats({ sum: 0, count: 0 });
     setTestProgress({
@@ -812,6 +854,7 @@ export default function App() {
       const msg = String(err);
       pushToast(msg.includes("CORE_NOT_INSTALLED") ? dict.toast.coreMissingAction : msg, "err");
     } finally {
+      batchTestingRef.current = false;
       setTestingKind(null);
       setTestProgress(null);
       setTestDelayStats({ sum: 0, count: 0 });
@@ -1284,6 +1327,15 @@ export default function App() {
         }}
         onOpenCore={() => setActiveTab("core")}
         onOpenApps={() => setActiveTab("apps")}
+        onSeeCaptureError={() => {
+          setCaptureError(null);
+          if (activeTab === "apps") {
+            handleOpenLiveLogs();
+          } else {
+            setActiveTab("apps");
+          }
+        }}
+        onDismissCaptureError={() => setCaptureError(null)}
         onOpenUpdates={() => setActiveTab("settings")}
         onRestartToUpdate={() => void handleRestartToUpdate()}
         onToggleLocale={handleToggleLocale}
@@ -1307,6 +1359,8 @@ export default function App() {
           }
           takeoverSummary={takeoverSummary}
           mainNode={mainNode}
+          mainNodeTesting={mainNodeTesting}
+          onRetestMainNode={() => void handleProbeMainNode()}
           mixedPort={settings.mixedPort}
           coreInfo={coreInfo}
           coreBusy={coreBusy}

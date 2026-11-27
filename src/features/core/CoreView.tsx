@@ -129,10 +129,7 @@ export function CoreView({
     <section className="flex min-h-0 flex-1 flex-col overflow-hidden">
       {/* Unified Single-Row 40px Page Header */}
       <div className="flex shrink-0 items-center justify-between gap-2 border-b border-[var(--border-hairline)] px-4 py-2.5 lg:px-5">
-        <h1
-          className="text-[18px] font-semibold tracking-[-0.015em] text-[var(--text-primary)]"
-          title={dict.core.subtitle}
-        >
+        <h1 className="text-[18px] font-semibold tracking-[-0.015em] text-[var(--text-primary)]">
           {dict.core.title}
         </h1>
         <span className="font-mono text-[11.5px] text-[var(--text-secondary)]">
@@ -405,13 +402,8 @@ export function CoreView({
               </div>
 
               <div className="flex items-center justify-between gap-4 px-4 py-3">
-                <div>
-                  <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
-                    {dict.core.logLevelLabel}
-                  </div>
-                  <div className="text-[11.5px] text-[var(--text-secondary)]">
-                    {dict.core.logLevelDesc}
-                  </div>
+                <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
+                  {dict.core.logLevelLabel}
                 </div>
                 <CustomSelect
                   value={settings.logLevel}

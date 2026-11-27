@@ -1095,6 +1095,14 @@ export function AppsView({
                                 : dict.recovery.pipeDescWin
                               : null}
                   </div>
+                  {activeFaultKind === "pipe_timeout" && serviceStatus.error && (
+                    <div
+                      className="mt-1 truncate font-mono text-[11px] text-[var(--text-secondary)] select-text"
+                      title={serviceStatus.error}
+                    >
+                      {serviceStatus.error}
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -1157,13 +1165,23 @@ export function AppsView({
                     >
                       {isMac ? dict.recovery.restartService : dict.recovery.restartHelper}
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => void onProbeDriver()}
-                      className="ui-btn-secondary h-7 text-[11.5px]"
-                    >
-                      {dict.recovery.retry}
-                    </button>
+                    {isMac ? (
+                      <button
+                        type="button"
+                        onClick={onOpenLogs}
+                        className="ui-btn-secondary h-7 text-[11.5px]"
+                      >
+                        {dict.service.menuLogs}
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => void onProbeDriver()}
+                        className="ui-btn-secondary h-7 text-[11.5px]"
+                      >
+                        {dict.recovery.retry}
+                      </button>
+                    )}
                   </>
                 )}
                 <button
@@ -1333,14 +1351,9 @@ export function AppsView({
 
           {/* 4. Custom Rules Table (@container P1-P4, Zero Fixed min-width) */}
           <div className="space-y-2">
-            <div className="flex flex-wrap items-baseline justify-between gap-2">
-              <h2 className="text-[14px] font-semibold text-[var(--text-primary)]">
-                {dict.apps.rulesTitle}
-              </h2>
-              <span className="text-[11.5px] text-[var(--text-secondary)]">
-                {dict.apps.rulesOrderHint}
-              </span>
-            </div>
+            <h2 className="text-[14px] font-semibold text-[var(--text-primary)]">
+              {dict.apps.rulesTitle}
+            </h2>
 
             <div className="apps-rules-container ui-card overflow-hidden">
               {editingId === "__new__" && renderInlineEditor()}
@@ -1350,9 +1363,6 @@ export function AppsView({
                   <div className="text-[13.5px] font-medium text-[var(--text-primary)]">
                     {dict.apps.emptyRulesTitle}
                   </div>
-                  <p className="max-w-md text-[12px] text-[var(--text-secondary)]">
-                    {dict.apps.emptyRulesDesc}
-                  </p>
                   <button
                     type="button"
                     onClick={() => void openPicker()}

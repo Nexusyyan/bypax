@@ -5,7 +5,6 @@ import {
   ChevronLeft,
   ChevronRight,
   FolderOpen,
-  Info,
   Play,
   Search,
   Trash2,
@@ -476,25 +475,18 @@ export function MonitorView({
           </div>
 
           <div className="monitor-kpi-grid">
-            {/* KPI 1: Active Connections + Zero-Double-Counting Tooltip & Outside-Core Sub-Counter */}
-            <div
-              className="min-w-0 rounded-[12px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] p-2.5"
-              title={dict.monitor.dedupHint}
-            >
+            {/* KPI 1: Active Connections */}
+            <div className="min-w-0 rounded-[12px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] p-2.5">
               <div className="flex items-center justify-between gap-1 text-[11.5px] text-[var(--text-secondary)]">
                 <span className="truncate" title={dict.monitor.kpiConns}>
                   {dict.monitor.kpiConns}
                 </span>
-                <Info className="h-3 w-3 shrink-0 text-[var(--text-tertiary)]" strokeWidth={1.5} />
               </div>
               <div className="mt-0.5 font-mono text-[15px] font-semibold num-tabular text-[var(--text-primary)]">
                 {connections.length}
               </div>
               {(localDirectBytes > 0 || localRejectCount > 0) && (
-                <div
-                  className="mt-0.5 truncate font-mono text-[11.5px] num-tabular text-[var(--text-tertiary)]"
-                  title={dict.monitor.dedupHint}
-                >
+                <div className="mt-0.5 truncate font-mono text-[11.5px] num-tabular text-[var(--text-tertiary)]">
                   {dict.monitor.localSubStat.replace("{bytes}", formatBytes(localDirectBytes))}
                 </div>
               )}

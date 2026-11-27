@@ -203,13 +203,8 @@ export function SettingsView({
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
-            <div>
-              <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
-                {dict.settings.langLabel}
-              </div>
-              <div className="text-[11.5px] text-[var(--text-secondary)]">
-                {dict.settings.langDesc}
-              </div>
+            <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
+              {dict.settings.langLabel}
             </div>
             <SegmentedControl
               value={locale}
@@ -223,13 +218,8 @@ export function SettingsView({
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
-            <div>
-              <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
-                {dict.settings.themeLabel}
-              </div>
-              <div className="text-[11.5px] text-[var(--text-secondary)]">
-                {dict.settings.themeDesc}
-              </div>
+            <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
+              {dict.settings.themeLabel}
             </div>
             <SegmentedControl
               value={theme}
@@ -245,15 +235,14 @@ export function SettingsView({
 
           {(
             [
-              ["launchAtLogin", dict.settings.autostartLabel, dict.settings.autostartDesc],
-              ["minimizeToTray", dict.settings.trayLabel, dict.settings.trayDesc],
-              ["autoCheckUpdates", dict.settings.autoUpdateLabel, dict.settings.autoUpdateDesc],
+              ["launchAtLogin", dict.settings.autostartLabel],
+              ["minimizeToTray", dict.settings.trayLabel],
+              ["autoCheckUpdates", dict.settings.autoUpdateLabel],
             ] as const
-          ).map(([field, label, desc]) => (
+          ).map(([field, label]) => (
             <div key={field} className="flex items-center justify-between gap-4 px-4 py-3">
-              <div className="min-w-0">
-                <div className="text-[12.5px] font-medium text-[var(--text-primary)]">{label}</div>
-                <div className="text-[11.5px] text-[var(--text-secondary)]">{desc}</div>
+              <div className="min-w-0 text-[12.5px] font-medium text-[var(--text-primary)]">
+                {label}
               </div>
               <button
                 type="button"
@@ -353,14 +342,9 @@ export function SettingsView({
           </div>
 
           <div className="space-y-2 px-4 py-3">
-            <div>
-              <label className="block text-[12px] font-medium text-[var(--text-primary)]">
-                {dict.settings.testUrlLabel}
-              </label>
-              <div className="text-[11px] text-[var(--text-secondary)]">
-                {dict.settings.testUrlHint}
-              </div>
-            </div>
+            <label className="block text-[12px] font-medium text-[var(--text-primary)]">
+              {dict.settings.testUrlLabel}
+            </label>
             <input
               type="text"
               value={testUrlDraft}
@@ -508,10 +492,6 @@ export function SettingsView({
                 {activeAgentCode}
               </pre>
             </div>
-
-            <div className="text-[11.5px] text-[var(--text-secondary)]">
-              {dict.agent.offlineNote}
-            </div>
           </div>
         </div>
 
@@ -583,10 +563,7 @@ export function SettingsView({
           <div className="bg-[var(--bg-subtle)] px-4 py-2 text-[11.5px] font-medium text-[var(--text-secondary)]">
             {dict.settings.secOverride}
           </div>
-          <div className="space-y-2 p-4">
-            <p className="text-[11.5px] text-[var(--text-secondary)]">
-              {dict.settings.overrideDesc}
-            </p>
+          <div className="p-4">
             <textarea
               rows={3}
               value={overrideDraft}
@@ -633,7 +610,7 @@ export function SettingsView({
                         : dict.settings.updateUpToDate
                             .replace("{version}", appUpdateReport.currentVersion)
                             .replace("{via}", appUpdateReport.checkedVia)
-                    : dict.settings.updateIdle;
+                    : null;
 
           return (
             <div className="ui-card divide-y divide-[var(--border-hairline)] overflow-hidden">
@@ -671,9 +648,6 @@ export function SettingsView({
                         <span className="rounded-full border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-2 py-0.5 font-mono text-[11.5px] font-normal text-[var(--text-secondary)]">
                           MIT
                         </span>
-                      </div>
-                      <div className="text-[12px] text-[var(--text-secondary)]">
-                        {dict.settings.aboutDesc}
                       </div>
                     </div>
                   </div>
@@ -753,40 +727,42 @@ export function SettingsView({
                   </div>
                 </div>
 
-                {/* Status line */}
-                <div
-                  className="flex flex-wrap items-center justify-between gap-2 rounded-[10px] border px-3 py-2 text-[12px]"
-                  style={
-                    isReady
-                      ? {
-                          borderColor: "var(--success-border)",
-                          backgroundColor: "var(--success-bg)",
-                          color: "var(--success-text)",
-                        }
-                      : {
-                          borderColor: "var(--border-hairline)",
-                          backgroundColor: "var(--bg-subtle)",
-                          color: "var(--text-secondary)",
-                        }
-                  }
-                >
-                  <span className="min-w-0 flex-1">{statusText}</span>
-                  {appUpdateReport?.releaseNotes && (
-                    <button
-                      type="button"
-                      onClick={() => setShowNotes((v) => !v)}
-                      className="inline-flex shrink-0 items-center gap-1 text-[11.5px] font-medium text-[var(--text-primary)] cursor-pointer"
-                    >
-                      <span>{dict.settings.releaseNotesToggle}</span>
-                      <ChevronDown
-                        className={`h-3.5 w-3.5 transition-transform ${
-                          showNotes ? "rotate-180" : ""
-                        }`}
-                        strokeWidth={1.5}
-                      />
-                    </button>
-                  )}
-                </div>
+                {/* Status line (only shown once checked or updating) */}
+                {statusText && (
+                  <div
+                    className="flex flex-wrap items-center justify-between gap-2 rounded-[10px] border px-3 py-2 text-[12px]"
+                    style={
+                      isReady
+                        ? {
+                            borderColor: "var(--success-border)",
+                            backgroundColor: "var(--success-bg)",
+                            color: "var(--success-text)",
+                          }
+                        : {
+                            borderColor: "var(--border-hairline)",
+                            backgroundColor: "var(--bg-subtle)",
+                            color: "var(--text-secondary)",
+                          }
+                    }
+                  >
+                    <span className="min-w-0 flex-1">{statusText}</span>
+                    {appUpdateReport?.releaseNotes && (
+                      <button
+                        type="button"
+                        onClick={() => setShowNotes((v) => !v)}
+                        className="inline-flex shrink-0 items-center gap-1 text-[11.5px] font-medium text-[var(--text-primary)] cursor-pointer"
+                      >
+                        <span>{dict.settings.releaseNotesToggle}</span>
+                        <ChevronDown
+                          className={`h-3.5 w-3.5 transition-transform ${
+                            showNotes ? "rotate-180" : ""
+                          }`}
+                          strokeWidth={1.5}
+                        />
+                      </button>
+                    )}
+                  </div>
+                )}
 
                 {appUpdateReport?.updateAvailable && !appUpdateReport.inAppUpdateSupported && (
                   <div className="flex items-center justify-between gap-2 text-[11.5px] text-[var(--text-secondary)]">

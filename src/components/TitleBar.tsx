@@ -64,6 +64,8 @@ interface TitleBarProps {
   onAuthCancel: () => void;
   onOpenCore: () => void;
   onOpenApps: () => void;
+  onSeeCaptureError: () => void;
+  onDismissCaptureError: () => void;
   onOpenUpdates: () => void;
   onRestartToUpdate: () => void;
   onToggleLocale: () => void;
@@ -107,6 +109,8 @@ export function TitleBar({
   onAuthCancel,
   onOpenCore,
   onOpenApps,
+  onSeeCaptureError,
+  onDismissCaptureError,
   onOpenUpdates,
   onRestartToUpdate,
   onToggleLocale,
@@ -164,10 +168,6 @@ export function TitleBar({
     };
   }, [takeoverOpen, appearanceOpen]);
 
-  const coreLabel = !coreInfo.installed
-    ? dict.titlebar.coreMissing
-    : coreInfo.version ?? dict.titlebar.coreStopped;
-
   const modeOptions = [
     { value: "rule" as RouteMode, label: dict.titlebar.modeRule },
     { value: "global" as RouteMode, label: dict.titlebar.modeGlobal },
@@ -203,44 +203,42 @@ export function TitleBar({
     <header
       data-tauri-drag-region
       className={`relative z-30 flex h-11 shrink-0 items-center justify-between gap-2 bg-[var(--bg-chrome)] select-none ${
-        isMac ? "pr-3 pl-[76px]" : "pr-0 pl-3"
+        isMac ? "pr-3 pl-[82px]" : "pr-0 pl-3"
       }`}
     >
-      {/* Left: Brand Mark (< 48px monochrome tile) + Core Status Pill + Update Pill */}
+      {/* Left: Brand Mark (non-macOS) + Core Status Pill + Update Pill */}
       <div data-tauri-drag-region className="flex min-w-0 items-center gap-2">
-        <span className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[8px] border border-[var(--border-hairline)] bg-[var(--bg-surface)] text-[var(--text-primary)] shadow-[var(--shadow-sm)]">
-          <BrandLogo variant="monochrome" className="h-[18px] w-[18px]" />
-        </span>
+        {!isMac && (
+          <>
+            <span className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[8px] border border-[var(--border-hairline)] bg-[var(--bg-surface)] text-[var(--text-primary)] shadow-[var(--shadow-sm)]">
+              <BrandLogo variant="monochrome" className="h-[18px] w-[18px]" />
+            </span>
 
-        {tier === "wide" && (
-          <span
-            data-tauri-drag-region
-            className="text-[13px] font-semibold tracking-[-0.015em] text-[var(--text-primary)]"
-          >
-            {dict.appTitle}
-          </span>
+            {tier === "wide" && (
+              <span
+                data-tauri-drag-region
+                className="text-[13px] font-semibold tracking-[-0.015em] text-[var(--text-primary)]"
+              >
+                {dict.appTitle}
+              </span>
+            )}
+          </>
         )}
 
-        <button
-          type="button"
-          onClick={onOpenCore}
-          title={`${dict.core.binaryTitle}: ${coreLabel}`}
-          className="inline-flex h-7 items-center gap-1.5 rounded-full border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2 text-[11.5px] font-medium text-[var(--text-secondary)] shadow-[var(--shadow-sm)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-primary)] cursor-pointer"
-        >
-          <span
-            className="h-2 w-2 shrink-0 rounded-full"
-            style={{
-              backgroundColor: coreInfo.running
-                ? "var(--success-dot)"
-                : coreInfo.installed
-                  ? "var(--warning-dot)"
-                  : "var(--text-secondary)",
-            }}
-          />
-          {tier !== "compact" && (
-            <span className="font-mono num-tabular">{coreLabel}</span>
-          )}
-        </button>
+        {!coreInfo.installed && (
+          <button
+            type="button"
+            onClick={onOpenCore}
+            title={`${dict.core.binaryTitle}: ${dict.titlebar.coreMissing}`}
+            className="inline-flex h-7 items-center gap-1.5 rounded-full border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2 text-[11.5px] font-medium text-[var(--text-secondary)] shadow-[var(--shadow-sm)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-primary)] cursor-pointer"
+          >
+            <span
+              className="h-2 w-2 shrink-0 rounded-full"
+              style={{ backgroundColor: "var(--warning-dot)" }}
+            />
+            {tier !== "compact" && <span>{dict.titlebar.coreMissing}</span>}
+          </button>
+        )}
 
         {appUpdateState.stage === "ready_to_restart" ? (
           <button
@@ -354,7 +352,9 @@ export function TitleBar({
 
               {captureError && !authPromptTarget && (
                 <div
-                  className="ui-popover absolute top-full right-0 z-40 mt-1.5 flex items-center gap-2 px-2.5 py-1.5 text-[11.5px]"
+                  role="alert"
+                  onMouseDown={(e) => e.stopPropagation()}
+                  className="ui-popover absolute top-full right-0 z-50 mt-2 flex max-w-[360px] items-center gap-2 px-3 py-2 text-[11.5px]"
                   style={{
                     borderColor: "var(--danger-border)",
                     backgroundColor: "var(--danger-bg)",
@@ -362,15 +362,23 @@ export function TitleBar({
                   }}
                 >
                   <AlertCircle className="h-3.5 w-3.5 shrink-0" strokeWidth={1.6} />
-                  <span className="max-w-[200px] truncate" title={captureError}>
+                  <span className="min-w-0 flex-1 truncate" title={captureError}>
                     {captureError}
                   </span>
                   <button
                     type="button"
-                    onClick={onOpenApps}
-                    className="shrink-0 font-semibold underline cursor-pointer"
+                    onClick={onSeeCaptureError}
+                    className="shrink-0 font-semibold underline hover:opacity-80 cursor-pointer"
                   >
                     {dict.capture.seeWhy}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onDismissCaptureError}
+                    aria-label={dict.recovery.dismiss}
+                    className="shrink-0 rounded p-0.5 hover:opacity-75 cursor-pointer"
+                  >
+                    <X className="h-3 w-3" strokeWidth={1.7} />
                   </button>
                 </div>
               )}
@@ -484,37 +492,31 @@ export function TitleBar({
         )}
       </div>
 
-      {/* Right: Throughput + Locale/Theme (or merged Appearance) + Native Window Controls */}
+      {/* Right: Throughput (Down + Up) + Locale/Theme (or merged Appearance) + Native Window Controls */}
       <div className="flex shrink-0 items-center gap-0.5">
-        {tier === "wide" && (
-          <div className="mr-2 flex items-center gap-2.5 font-mono text-[11.5px] num-tabular text-[var(--text-secondary)]">
-            <span className="inline-flex items-center gap-0.5">
-              <ArrowDown
-                className="h-3 w-3"
-                style={{ color: "var(--success-text)" }}
-                strokeWidth={1.6}
-              />
-              {formatSpeed(traffic.downBytesPerSec)}
-            </span>
-            <span className="inline-flex items-center gap-0.5">
-              <ArrowUp className="h-3 w-3 text-[var(--text-secondary)]" strokeWidth={1.6} />
-              {formatSpeed(traffic.upBytesPerSec)}
-            </span>
-          </div>
-        )}
-
-        {tier === "medium" && (
-          <div className="mr-1.5 flex items-center font-mono text-[11.5px] num-tabular text-[var(--text-secondary)]">
-            <span className="inline-flex items-center gap-0.5">
-              <ArrowDown
-                className="h-3 w-3"
-                style={{ color: "var(--success-text)" }}
-                strokeWidth={1.6}
-              />
-              {formatSpeed(traffic.downBytesPerSec)}
-            </span>
-          </div>
-        )}
+        <div className="mr-2 flex items-center gap-2.5 whitespace-nowrap font-mono text-[11.5px] num-tabular text-[var(--text-secondary)]">
+          <span
+            className="inline-flex items-center gap-0.5"
+            title={dict.monitor.downloadShort}
+          >
+            <ArrowDown
+              className="h-3 w-3 shrink-0"
+              style={{ color: "var(--success-text)" }}
+              strokeWidth={1.6}
+            />
+            {formatSpeed(traffic.downBytesPerSec)}
+          </span>
+          <span
+            className="inline-flex items-center gap-0.5"
+            title={dict.monitor.uploadShort}
+          >
+            <ArrowUp
+              className="h-3 w-3 shrink-0 text-[var(--text-secondary)]"
+              strokeWidth={1.6}
+            />
+            {formatSpeed(traffic.upBytesPerSec)}
+          </span>
+        </div>
 
         {tier === "wide" ? (
           <>

@@ -196,14 +196,9 @@ export function DryRunDrawer({
         className="flex h-full w-full max-w-[400px] flex-col border-l border-[var(--border-strong)] bg-[var(--bg-surface)] shadow-[var(--shadow-card-lg)]"
       >
         <div className="flex shrink-0 items-center justify-between border-b border-[var(--border-hairline)] px-5 py-3.5">
-          <div>
-            <h2 className="text-[16px] font-semibold tracking-[-0.015em] text-[var(--text-primary)]">
-              {dict.tester.title}
-            </h2>
-            <p className="mt-0.5 text-[11.5px] text-[var(--text-secondary)]">
-              {dict.tester.subtitle}
-            </p>
-          </div>
+          <h2 className="text-[16px] font-semibold tracking-[-0.015em] text-[var(--text-primary)]">
+            {dict.tester.title}
+          </h2>
           <button
             type="button"
             onClick={onClose}

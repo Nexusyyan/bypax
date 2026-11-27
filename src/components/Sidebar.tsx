@@ -30,6 +30,8 @@ interface SidebarProps {
   hasAppUpdate: boolean;
   takeoverSummary: string;
   mainNode: NodeIR | null;
+  mainNodeTesting: boolean;
+  onRetestMainNode: () => void;
   mixedPort: number;
   coreInfo: CoreInfo;
   coreBusy: boolean;
@@ -66,6 +68,8 @@ export function Sidebar({
   hasAppUpdate,
   takeoverSummary,
   mainNode,
+  mainNodeTesting,
+  onRetestMainNode,
   mixedPort,
   coreInfo,
   coreBusy,
@@ -132,6 +136,16 @@ export function Sidebar({
 
   const delay = mainNode ? (mainNode.realDelayMs ?? mainNode.tcpingMs ?? null) : null;
   const delayKind = mainNode?.realDelayMs != null ? "real" : "tcping";
+  const beaconColorVar = mainNodeTesting
+    ? "var(--accent-focus)"
+    : delay != null
+      ? delayColorVar(delay, delayKind)
+      : coreInfo.running
+        ? "var(--danger-dot)"
+        : "var(--text-tertiary)";
+  const retestTitle = mainNodeTesting
+    ? dict.nav.retestingMainDelay
+    : dict.nav.retestMainDelay;
   const isRail = mode === "rail";
   const widthClass =
     mode === "full" ? "w-[212px]" : mode === "compact" ? "w-[188px]" : "w-[64px]";
@@ -214,17 +228,41 @@ export function Sidebar({
       {/* Bottom Active Exit & One-Line Takeover Summary Card */}
       {isRail ? (
         <div className="flex flex-col items-center gap-2 border-t border-[var(--border-hairline)] pt-2.5">
-          <span
-            title={takeoverSummary}
-            className="h-2.5 w-2.5 rounded-full"
-            style={{
-              backgroundColor: hasRecoveryFault
-                ? "var(--warning-dot)"
-                : coreInfo.running
-                  ? "var(--success-dot)"
-                  : "var(--text-secondary)",
-            }}
-          />
+          {mainNode ? (
+            <button
+              type="button"
+              disabled={mainNodeTesting}
+              onClick={onRetestMainNode}
+              title={
+                delay != null
+                  ? `${mainNode.remark} (${delay} ms) - ${retestTitle}`
+                  : `${mainNode.remark} - ${retestTitle}`
+              }
+              aria-label={retestTitle}
+              className="flex h-7 w-7 items-center justify-center rounded-full transition-colors hover:bg-[var(--bg-hover)] cursor-pointer disabled:cursor-wait"
+            >
+              <span
+                aria-hidden="true"
+                className={`signal-beacon ${mainNodeTesting ? "signal-beacon-probing" : ""}`}
+                style={{ ["--beacon-color" as string]: beaconColorVar }}
+              >
+                <span className="signal-beacon-ring" />
+                <span className="signal-beacon-core" />
+              </span>
+            </button>
+          ) : (
+            <span
+              title={takeoverSummary}
+              className="h-2.5 w-2.5 rounded-full"
+              style={{
+                backgroundColor: hasRecoveryFault
+                  ? "var(--warning-dot)"
+                  : coreInfo.running
+                    ? "var(--success-dot)"
+                    : "var(--text-secondary)",
+              }}
+            />
+          )}
           <button
             type="button"
             disabled={coreBusy}
@@ -278,15 +316,34 @@ export function Sidebar({
               <span className="rounded-[6px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-1.5 py-0.5 font-mono text-[var(--text-secondary)]">
                 {PROTO_BADGES[mainNode.protocol]}
               </span>
-              <span className="inline-flex items-center gap-1.5">
+              <button
+                type="button"
+                disabled={mainNodeTesting}
+                onClick={onRetestMainNode}
+                title={retestTitle}
+                aria-label={retestTitle}
+                className="-mr-1.5 inline-flex items-center gap-1.5 rounded-[7px] px-1.5 py-0.5 transition-colors hover:bg-[var(--bg-hover)] active:scale-[0.97] cursor-pointer disabled:cursor-wait"
+              >
+                <span
+                  aria-hidden="true"
+                  className={`signal-beacon ${mainNodeTesting ? "signal-beacon-probing" : ""}`}
+                  style={{ ["--beacon-color" as string]: beaconColorVar }}
+                >
+                  <span className="signal-beacon-ring" />
+                  <span className="signal-beacon-core" />
+                </span>
                 <SignalBars ms={delay} kind={delayKind} />
                 <span
                   className="font-mono font-medium num-tabular"
-                  style={{ color: delayColorVar(delay, delayKind) }}
+                  style={{
+                    color: mainNodeTesting
+                      ? "var(--text-secondary)"
+                      : delayColorVar(delay, delayKind),
+                  }}
                 >
-                  {delay != null ? `${delay} ms` : "--"}
+                  {mainNodeTesting ? "..." : delay != null ? `${delay} ms` : "--"}
                 </span>
-              </span>
+              </button>
             </div>
           )}
 

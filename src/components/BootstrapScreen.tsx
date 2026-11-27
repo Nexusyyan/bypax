@@ -43,20 +43,22 @@ export function BootstrapScreen({
       <header
         data-tauri-drag-region
         className={`relative z-30 flex h-11 shrink-0 items-center justify-between gap-2 bg-[var(--bg-chrome)] ${
-          isMac ? "pr-3 pl-[76px]" : "pr-0 pl-3"
+          isMac ? "pr-3 pl-[82px]" : "pr-0 pl-3"
         }`}
       >
-        <div data-tauri-drag-region className="flex min-w-0 items-center gap-2">
-          <span className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[8px] border border-[var(--border-hairline)] bg-[var(--bg-surface)] text-[var(--text-primary)] shadow-[var(--shadow-sm)]">
-            <BrandLogo variant="monochrome" className="h-[18px] w-[18px]" />
-          </span>
-          <span
-            data-tauri-drag-region
-            className="text-[13px] font-semibold tracking-[-0.015em] text-[var(--text-primary)]"
-          >
-            {dict.appTitle}
-          </span>
-        </div>
+        {!isMac && (
+          <div data-tauri-drag-region className="flex min-w-0 items-center gap-2">
+            <span className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[8px] border border-[var(--border-hairline)] bg-[var(--bg-surface)] text-[var(--text-primary)] shadow-[var(--shadow-sm)]">
+              <BrandLogo variant="monochrome" className="h-[18px] w-[18px]" />
+            </span>
+            <span
+              data-tauri-drag-region
+              className="text-[13px] font-semibold tracking-[-0.015em] text-[var(--text-primary)]"
+            >
+              {dict.appTitle}
+            </span>
+          </div>
+        )}
 
         <div data-tauri-drag-region className="flex-1 self-stretch" />
 
@@ -155,10 +157,6 @@ export function BootstrapScreen({
               <div className="boot-track mt-5 w-48" aria-hidden="true">
                 <div className="boot-indeterminate" />
               </div>
-
-              <p className="mt-3 text-[11.5px] text-[var(--text-tertiary)]">
-                {dict.bootstrap.loadingHint}
-              </p>
             </>
           )}
         </div>
