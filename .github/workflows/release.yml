@@ -480,7 +480,7 @@ jobs:
 
           ### Quick Start
 
-          - **Windows**: Extract `__WIN_PORTABLE__` and launch `bypax.exe` (non-elevated). All portable data stays in `./bypax-data/`. Enable per-app Zero-TUN routing via WinDivert in **Apps** (Background Service or On-Demand UAC).
+          - **Windows**: Extract `__WIN_PORTABLE__` and launch `bypax.exe` (non-elevated). All portable data stays in `./bypax-data/` (with rotating logs in `./bypax-data/logs/`). Enable per-app Zero-TUN routing via WinDivert in **Apps** (GUI-bound On-Demand UAC helper).
           - **macOS (Zero-Cert Community Build)**: Drag `Bypax.app` into `/Applications`. Because Bypax is ad-hoc signed without a paid Apple Developer certificate, clear Gatekeeper quarantine once before first launch:
             ```bash
             xattr -dr com.apple.quarantine /Applications/Bypax.app

@@ -432,7 +432,7 @@ checksum = "87a0cf66fd1eb2fb7b822cb78370d82303750809bc6ba855f3f58e517d3238db"
 
 [[package]]
 name = "bypax"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bypax-appproxy",
@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "bypax-appproxy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bypax-core",
@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "bypax-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bypax-appproxy",
@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "bypax-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "bypax-ipc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "hex",
@@ -539,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "bypax-service"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bypax-appproxy",
@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "bypax-windivert"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bypax-appproxy",
