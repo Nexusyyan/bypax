@@ -79,6 +79,10 @@ pub struct AppProxyStartConfig {
     pub block_quic_when_needed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windivert_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sing_box_pid: Option<u32>,
     #[serde(default)]
     pub exempt_pids: Vec<u32>,
     #[serde(default)]
@@ -234,6 +238,8 @@ pub enum ServiceCommand {
         config_json: String,
         #[serde(default)]
         tun_mode: bool,
+        #[serde(default)]
+        gui_pid: Option<u32>,
     },
     StopCore,
     CoreStatus,

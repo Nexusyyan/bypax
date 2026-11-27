@@ -35,17 +35,20 @@ mod platform {
     use tracing::{error, info};
     use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
     use windows::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetExitCodeProcess, OpenProcess, WaitForSingleObject, INFINITE,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
     use windows_service::service::{
-        ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl,
-        ServiceExitCode, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+        ServiceAccess, ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState,
+        ServiceStatus, ServiceType,
     };
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
     use windows_service::{define_windows_service, service_dispatcher};
 
     define_windows_service!(ffi_service_main, service_main);
+
+    pub const LEGACY_WINDOWS_SERVICES: &[&str] = &[WINDOWS_SERVICE_NAME, "BypathService"];
 
     pub fn is_parent_alive(pid: u32) -> bool {
         if pid <= 4 {
@@ -59,6 +62,30 @@ mod platform {
             let ok = GetExitCodeProcess(handle, &mut exit_code).is_ok();
             let _ = CloseHandle(handle);
             ok && exit_code == STILL_ACTIVE.0 as u32
+        }
+    }
+
+    /// Blocks in the OS kernel until `pid` terminates (0ms detection, immune to PID reuse
+    /// because holding the process handle pins the kernel process object until CloseHandle).
+    pub fn wait_for_process_exit(pid: u32) {
+        if pid <= 4 {
+            return;
+        }
+        unsafe {
+            let Ok(handle) = OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                false,
+                pid,
+            ) else {
+                return;
+            };
+            let mut exit_code = 0u32;
+            let still_active = GetExitCodeProcess(handle, &mut exit_code).is_ok()
+                && exit_code == STILL_ACTIVE.0 as u32;
+            if still_active {
+                let _ = WaitForSingleObject(handle, INFINITE);
+            }
+            let _ = CloseHandle(handle);
         }
     }
 
@@ -108,66 +135,41 @@ mod platform {
         }
     }
 
-    pub fn install(service_exe: &Path, autostart: bool) -> Result<()> {
-        let manager = ServiceManager::local_computer(
-            None::<&str>,
-            ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+    pub fn install(_service_exe: &Path, _autostart: bool) -> Result<()> {
+        anyhow::bail!(
+            "Windows Bypax uses the GUI-bound on-demand elevated helper (worker-run) instead of \
+             registering a persistent Windows Service. Launch Bypax GUI to enable App Proxy or TUN, \
+             or run 'bypax-service cleanup-legacy' to remove legacy services."
         )
-        .context("failed to open Windows SCM (Administrator privileges required)")?;
-
-        let start_type = if autostart {
-            ServiceStartType::AutoStart
-        } else {
-            ServiceStartType::OnDemand
-        };
-
-        let info = ServiceInfo {
-            name: OsString::from(WINDOWS_SERVICE_NAME),
-            display_name: OsString::from(WINDOWS_SERVICE_DISPLAY_NAME),
-            service_type: ServiceType::OWN_PROCESS,
-            start_type,
-            error_control: ServiceErrorControl::Normal,
-            executable_path: service_exe.to_path_buf(),
-            launch_arguments: vec![OsString::from("service-run")],
-            dependencies: vec![],
-            account_name: None,
-            account_password: None,
-        };
-
-        // If already installed, update config cleanly; otherwise create fresh service.
-        if let Ok(existing) = manager.open_service(
-            WINDOWS_SERVICE_NAME,
-            ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
-        ) {
-            existing
-                .change_config(&info)
-                .context("failed to update existing BypaxService configuration")?;
-            let _ = existing.set_description(WINDOWS_SERVICE_DESCRIPTION);
-            return Ok(());
-        }
-
-        let service = manager
-            .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
-            .context("failed to create BypaxService")?;
-        let _ = service.set_description(WINDOWS_SERVICE_DESCRIPTION);
-        Ok(())
     }
 
-    pub fn uninstall() -> Result<()> {
-        let manager =
-            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-                .context("failed to open Windows SCM (Administrator privileges required)")?;
-        let service = manager
-            .open_service(
-                WINDOWS_SERVICE_NAME,
-                ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE,
-            )
-            .context("BypaxService is not installed or access was denied")?;
+    fn is_service_not_found_err(err: &windows_service::Error) -> bool {
+        matches!(
+            err,
+            windows_service::Error::Winapi(io_err) if io_err.raw_os_error() == Some(1060)
+        )
+    }
 
+    fn stop_and_delete_service(manager: &ServiceManager, name: &str) -> Result<bool> {
+        let service = match manager.open_service(
+            name,
+            ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE,
+        ) {
+            Ok(svc) => svc,
+            Err(err) if is_service_not_found_err(&err) => return Ok(false),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to open Windows service '{name}' for removal \
+                         (Administrator privileges required)"
+                    )
+                });
+            }
+        };
         if let Ok(st) = service.query_status() {
             if st.current_state != ServiceState::Stopped {
                 let _ = service.stop();
-                for _ in 0..20 {
+                for _ in 0..24 {
                     std::thread::sleep(Duration::from_millis(250));
                     if let Ok(s) = service.query_status() {
                         if s.current_state == ServiceState::Stopped {
@@ -177,7 +179,85 @@ mod platform {
                 }
             }
         }
-        service.delete().context("failed to delete BypaxService")?;
+        service
+            .delete()
+            .with_context(|| format!("failed to delete legacy Windows service '{name}'"))?;
+        Ok(true)
+    }
+
+    fn stop_service_if_running(manager: &ServiceManager, name: &str) -> Result<bool> {
+        let service = match manager
+            .open_service(name, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)
+        {
+            Ok(svc) => svc,
+            Err(err) if is_service_not_found_err(&err) => return Ok(false),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to open Windows service '{name}' to stop \
+                         (Administrator privileges required)"
+                    )
+                });
+            }
+        };
+        if let Ok(st) = service.query_status() {
+            if st.current_state == ServiceState::Stopped {
+                return Ok(false);
+            }
+            if service.stop().is_ok() {
+                for _ in 0..16 {
+                    std::thread::sleep(Duration::from_millis(250));
+                    if let Ok(s) = service.query_status() {
+                        if s.current_state == ServiceState::Stopped {
+                            break;
+                        }
+                    }
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Stops and deletes legacy persistent proxy services (`BypaxService`, `BypathService`),
+    /// unloads any idle/locked `WinDivert` kernel driver service, and cleans stale ProgramData
+    /// IPC tokens so GUI-bound capture starts cleanly with zero conflicts.
+    pub fn cleanup_legacy_services_and_driver() -> Result<Vec<String>> {
+        let manager =
+            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+                .context("failed to open Windows SCM (Administrator privileges required)")?;
+        let mut actions = Vec::new();
+
+        for svc_name in LEGACY_WINDOWS_SERVICES {
+            if stop_and_delete_service(&manager, svc_name)? {
+                actions.push(format!("deleted:{svc_name}"));
+            }
+        }
+
+        if stop_service_if_running(&manager, "WinDivert")? {
+            actions.push("stopped:WinDivert".to_string());
+        }
+
+        if let Ok(program_data) = std::env::var("ProgramData") {
+            let trimmed = program_data.trim();
+            if !trimmed.is_empty() {
+                let token_path = Path::new(trimmed).join("Bypax").join("ipc.token");
+                if token_path.exists() && std::fs::remove_file(&token_path).is_ok() {
+                    actions.push("removed:programdata-ipc-token".to_string());
+                }
+            }
+        }
+
+        Ok(actions)
+    }
+
+    pub fn uninstall() -> Result<()> {
+        let manager =
+            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+                .context("failed to open Windows SCM (Administrator privileges required)")?;
+        if !stop_and_delete_service(&manager, WINDOWS_SERVICE_NAME)? {
+            anyhow::bail!("BypaxService is not installed or access was denied");
+        }
         Ok(())
     }
 
@@ -268,7 +348,9 @@ mod platform {
 
         rt.block_on(async {
             let paths = DataPaths::resolve()?;
-            let token = resolve_or_create_ipc_token(Some(&paths.runtime_dir));
+            // Always resolve/persist the Plane 1 token in the machine-wide ProgramData path
+            // rather than LocalSystem's private systemprofile AppData directory.
+            let token = resolve_or_create_ipc_token(None);
             let controller = ServiceController::new(&paths, token);
             let _watchdog = controller.spawn_watchdog();
 
@@ -278,7 +360,7 @@ mod platform {
                 PipeAclMode::PrivilegedService,
                 controller.clone(),
             );
-            let ipc_task = tokio::spawn(async move {
+            let mut ipc_task = tokio::spawn(async move {
                 if let Err(err) = server.run(ipc_rx).await {
                     error!(error = %err, "BypaxService IPC server exited with error");
                 }
@@ -295,7 +377,10 @@ mod platform {
             })?;
             info!("BypaxService is running");
 
-            let _ = stop_rx.await;
+            let ipc_already_exited = tokio::select! {
+                _ = stop_rx => false,
+                _ = &mut ipc_task => true,
+            };
 
             let _ = status_handle.set_service_status(ServiceStatus {
                 service_type: ServiceType::OWN_PROCESS,
@@ -308,8 +393,10 @@ mod platform {
             });
 
             controller.stop_all_and_restore().await;
-            let _ = ipc_tx.send(());
-            let _ = ipc_task.await;
+            if !ipc_already_exited {
+                let _ = ipc_tx.send(());
+                let _ = ipc_task.await;
+            }
             Ok::<(), anyhow::Error>(())
         })?;
 
@@ -349,6 +436,16 @@ mod platform {
             return true;
         }
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    pub fn wait_for_process_exit(pid: u32) {
+        while is_parent_alive(pid) {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+
+    pub fn cleanup_legacy_services_and_driver() -> Result<Vec<String>> {
+        Ok(Vec::new())
     }
 
     pub fn query_status() -> PlatformServiceStatus {
@@ -479,6 +576,16 @@ mod platform {
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
+    pub fn wait_for_process_exit(pid: u32) {
+        while is_parent_alive(pid) {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+
+    pub fn cleanup_legacy_services_and_driver() -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     pub fn query_status() -> PlatformServiceStatus {
         PlatformServiceStatus {
             platform: std::env::consts::OS.into(),
@@ -512,6 +619,6 @@ mod platform {
 }
 
 pub use platform::{
-    install, install_launchd, is_parent_alive, query_status, run_windows_service, start, stop,
-    uninstall, uninstall_launchd,
+    cleanup_legacy_services_and_driver, install, install_launchd, is_parent_alive, query_status,
+    run_windows_service, start, stop, uninstall, uninstall_launchd, wait_for_process_exit,
 };

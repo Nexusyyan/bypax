@@ -190,13 +190,15 @@ export function TrayPopup() {
   );
 
   const trayFaultText =
-    activeFaultKind === "hvci_blocked"
-      ? dict.tray.warnHvci
-      : activeFaultKind === "driver_missing" || activeFaultKind === "signature_failed"
-        ? dict.tray.warnDriver
-        : activeFaultKind === "pipe_timeout"
-          ? dict.tray.warnService
-          : null;
+    activeFaultKind === "legacy_conflict"
+      ? dict.tray.warnConflict
+      : activeFaultKind === "hvci_blocked"
+        ? dict.tray.warnHvci
+        : activeFaultKind === "driver_missing" || activeFaultKind === "signature_failed"
+          ? dict.tray.warnDriver
+          : activeFaultKind === "pipe_timeout"
+            ? dict.tray.warnService
+            : null;
 
   const takeoverSummary = useMemo(
     () =>
@@ -252,7 +254,7 @@ export function TrayPopup() {
 
   const handleCapture = async (next: CaptureMode) => {
     setCaptureErr(null);
-    if (next !== "off" && serviceStatus?.mode === "off") {
+    if (next !== "off" && (!serviceStatus?.connected || serviceStatus.mode === "off")) {
       await api.showMainWindow();
       return;
     }

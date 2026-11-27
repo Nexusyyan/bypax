@@ -88,13 +88,15 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum ServiceAction {
-    /// Install the privileged Bypax service
+    /// Install the privileged Bypax helper (macOS launchd only; Windows uses GUI-bound helper)
     Install,
-    /// Uninstall the privileged Bypax service
+    /// Uninstall any legacy Windows Service or macOS LaunchDaemon
     Uninstall,
-    /// Start the privileged Bypax service
+    /// Clean up legacy Windows services (BypaxService/BypathService) and stale driver locks
+    Cleanup,
+    /// Start the installed service (macOS)
     Start,
-    /// Stop the privileged Bypax service
+    /// Stop the installed service
     Stop,
     /// Query privileged service installation and runtime status
     Status,
@@ -540,6 +542,10 @@ fn handle_service_command(
             let msg = run_service_subcommand("uninstall", service_exe)?;
             emit_service_result("uninstall", &msg, as_json)
         }
+        ServiceAction::Cleanup => {
+            let msg = run_service_subcommand("cleanup", service_exe)?;
+            emit_service_result("cleanup", &msg, as_json)
+        }
         ServiceAction::Start => {
             let msg = run_service_subcommand("start", service_exe)?;
             emit_service_result("start", &msg, as_json)
@@ -597,19 +603,35 @@ fn print_doctor_human(data: &Value) {
         );
     }
     if let Some(svc) = data.get("service") {
+        let default_name = if cfg!(windows) {
+            "BypaxService"
+        } else if cfg!(target_os = "macos") {
+            "com.bypax.service"
+        } else {
+            "bypax-service"
+        };
+        let plane1 = svc
+            .get("plane1Connected")
+            .or_else(|| svc.get("connected"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         println!(
             "Service      : name={} installed={} running={} plane1={}",
-            svc.get("name").and_then(Value::as_str).unwrap_or("-"),
+            svc.get("name").and_then(Value::as_str).unwrap_or(default_name),
             svc.get("installed")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             svc.get("running")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            svc.get("plane1Connected")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
+            plane1
         );
+        if let Some(legacy) = svc.get("legacyServices").and_then(Value::as_array) {
+            if !legacy.is_empty() {
+                let names: Vec<&str> = legacy.iter().filter_map(Value::as_str).collect();
+                println!("Legacy Svcs  : {} (run 'bypax-cli service cleanup')", names.join(", "));
+            }
+        }
     }
     if let Some(drv) = data.get("driver") {
         println!(

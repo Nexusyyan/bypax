@@ -66,7 +66,7 @@ bypax-cli service status
 ## 2. Live Mode vs. Automatic Offline Fallback
 
 - **Live Mode (GUI open)**: `bypax-cli` connects to the non-elevated Bypax GUI over Plane 2 Control IPC (`\\.\pipe\bypax-ctl-v1` on Windows, `<runtime_dir>/bypax-ctl.sock` with mode `0600` on macOS/Linux). Node switches are 0ms hot-switches, and every mutation emits `bypax-state-sync` so the desktop UI refreshes immediately.
-- **Offline Fallback (GUI closed)**: If Plane 2 is unavailable, `bypax-cli` automatically falls back to SQLite WAL (`bypax.db` with `busy_timeout = 5000`) for persistent settings, nodes, and rules, and talks directly to Plane 1 privileged service IPC (`\\.\pipe\bypax-svc-v1` / `/var/run/bypax-svc.sock`) for driver/service probes and privileged capture state.
+- **Offline Fallback (GUI closed)**: If Plane 2 is unavailable, `bypax-cli` automatically falls back to SQLite WAL (`bypax.db` with `busy_timeout = 5000`) for persistent settings, nodes, and rules. **No-GUI, No-Active-Proxy boundary**: offline mode can inspect state, edit nodes/rules, and run stop/disable/cleanup operations, but enabling active core, OS system proxy, App Proxy, or TUN returns `GUI_NOT_RUNNING` until Bypax GUI is open.
 
 ## 3. Complete 20-Tool MCP Catalog
 
@@ -164,5 +164,6 @@ bypax-cli service status
    - Inspect live attribution via `bypax_list_connections` (filter by `process`) and recent warnings via `bypax_get_logs(min_level: "WARN")`.
    - Run `bypax_app_test_rule` and `bypax_test_route` to detect higher-priority rule shadowing.
    - On macOS, child processes spawned outside `.app` bundles (such as `/opt/homebrew/bin/node`) can be included by adding their path prefix to `path_prefixes` or `process_names`.
-5. **Service management from terminal**:
-   - Use `bypax-cli service status`, `bypax-cli service install`, `bypax-cli service start`, `bypax-cli service stop`, or `bypax-cli service uninstall`.
+5. **Service & legacy driver cleanup from terminal**:
+   - On Windows, Bypax uses a GUI-bound on-demand UAC helper (`worker-run`, stops immediately on GUI exit/crash) with zero background Windows SCM service. Run `bypax-cli service cleanup` (or `bypax-cli doctor`) to detect and remove any legacy background services or stale WinDivert locks.
+   - On macOS, use `bypax-cli service status`, `bypax-cli service install`, `bypax-cli service start`, `bypax-cli service stop`, or `bypax-cli service uninstall`.

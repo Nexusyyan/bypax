@@ -83,14 +83,16 @@ pub fn run() {
                 });
             }
 
-            // 5-second heartbeat task feeding bypax-service's 15-second GUI watchdog.
+            // 5-second heartbeat task feeding the elevated helper's GUI lease watchdog.
             let hb_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(5));
                 loop {
                     interval.tick().await;
                     if let Some(st) = hb_handle.try_state::<AppState>() {
-                        st.send_service_heartbeat().await;
+                        if st.send_service_heartbeat().await {
+                            let _ = hb_handle.emit("bypax-state-sync", ());
+                        }
                     }
                 }
             });
@@ -134,17 +136,42 @@ pub fn run() {
                     let mut restored_ok = false;
                     if resume_tun_flag {
                         restored_ok = st.apply_capture_mode(CaptureMode::Tun).await.is_ok();
+                        if !restored_ok {
+                            clear_persisted_capture_flags(&st);
+                            if resume_sys_proxy_flag || resume_core_flag {
+                                restored_ok = st
+                                    .start_local_core_only()
+                                    .await
+                                    .map(|(_, rep)| rep.ok)
+                                    .unwrap_or(false);
+                            }
+                        }
                     } else if resume_app_proxy_flag {
-                        restored_ok = st.apply_capture_mode(CaptureMode::Apps).await.is_ok();
+                        let local_ok = st
+                            .start_local_core_only()
+                            .await
+                            .map(|(_, rep)| rep.ok)
+                            .unwrap_or(false);
+                        if local_ok && resume_sys_proxy_flag {
+                            if let Ok(guard) = st.netguard.lock() {
+                                let _ = guard.enable_system_proxy("127.0.0.1", settings.mixed_port);
+                            }
+                        }
+                        if st.apply_capture_mode(CaptureMode::Apps).await.is_ok() {
+                            restored_ok = true;
+                        } else {
+                            clear_persisted_capture_flags(&st);
+                            restored_ok = local_ok;
+                        }
                     } else if resume_core_flag {
                         restored_ok = st
-                            .start_core_flow()
+                            .start_local_core_only()
                             .await
                             .map(|(_, rep)| rep.ok)
                             .unwrap_or(false);
                     }
 
-                    if resume_sys_proxy_flag {
+                    if resume_sys_proxy_flag && restored_ok {
                         if let Ok(guard) = st.netguard.lock() {
                             let _ = guard.enable_system_proxy("127.0.0.1", settings.mixed_port);
                         }
@@ -157,19 +184,20 @@ pub fn run() {
                                 "updater: resumed state cleanly after update (core={}, sys_proxy={}, app_proxy={}, tun={})",
                                 resume_core_flag,
                                 resume_sys_proxy_flag,
-                                resume_app_proxy_flag,
-                                resume_tun_flag
+                                st.app_proxy_active.load(std::sync::atomic::Ordering::Relaxed),
+                                st.tun_active.load(std::sync::atomic::Ordering::Relaxed)
                             ),
                         );
-                        tray::update_tray_icon_state(
-                            &resume_handle,
-                            resume_sys_proxy_flag || resume_app_proxy_flag || resume_tun_flag,
-                            false,
-                        );
+                        let active = st.netguard.lock().map(|g| g.is_armed()).unwrap_or(false)
+                            || st.current_capture_mode() != CaptureMode::Off;
+                        tray::update_tray_icon_state(&resume_handle, active, false);
                         let _ = resume_handle.emit("bypax-state-sync", ());
                     }
                 });
-            } else if launched_via_autostart {
+            } else {
+                // Both `--autostart` and normal manual GUI launch obey the GUI-bound boundary:
+                // proxy and capture activate ONLY after GUI opens, restoring saved preferences
+                // cleanly (falling back capture to Off if UAC elevation is cancelled).
                 if let Some(state) = app.try_state::<AppState>() {
                     let startup_cfg = state.store.lock().ok().and_then(|s| {
                         let settings = s.load_settings().ok()?;
@@ -177,32 +205,49 @@ pub fn run() {
                         Some((settings, has_nodes))
                     });
                     if let Some((settings, has_nodes)) = startup_cfg {
-                        if settings.minimize_to_tray {
+                        if launched_via_autostart && settings.minimize_to_tray {
                             if let Some(win) = app.get_webview_window("main") {
                                 let _ = win.hide();
                             }
                         }
-                        if settings.auto_start_core
-                            && has_nodes
-                            && state.core_manager.is_installed()
-                        {
+                        let should_restore = settings.auto_start_core
+                            || settings.system_proxy_enabled
+                            || settings.app_proxy_enabled
+                            || settings.tun_enabled;
+                        if should_restore && has_nodes && state.core_manager.is_installed() {
                             let start_handle = app.handle().clone();
                             tauri::async_runtime::spawn(async move {
                                 let Some(st) = start_handle.try_state::<AppState>() else {
                                     return;
                                 };
-                                let started_ok = if settings.tun_enabled {
-                                    st.apply_capture_mode(CaptureMode::Tun).await.is_ok()
-                                } else if settings.app_proxy_enabled {
-                                    st.apply_capture_mode(CaptureMode::Apps).await.is_ok()
+                                let mut core_ready = false;
+
+                                if settings.tun_enabled {
+                                    match st.apply_capture_mode(CaptureMode::Tun).await {
+                                        Ok(_) => {
+                                            core_ready = true;
+                                        }
+                                        Err(err) => {
+                                            clear_persisted_capture_flags(&st);
+                                            log_startup_capture_fallback(&st, "TUN", &err);
+                                            if settings.system_proxy_enabled
+                                                || settings.auto_start_core
+                                            {
+                                                core_ready = st
+                                                    .start_local_core_only()
+                                                    .await
+                                                    .map(|(_, rep)| rep.ok)
+                                                    .unwrap_or(false);
+                                            }
+                                        }
+                                    }
                                 } else {
-                                    st.start_core_flow()
+                                    core_ready = st
+                                        .start_local_core_only()
                                         .await
                                         .map(|(_, rep)| rep.ok)
-                                        .unwrap_or(false)
-                                };
-                                if started_ok {
-                                    if settings.system_proxy_enabled {
+                                        .unwrap_or(false);
+                                    if core_ready && settings.system_proxy_enabled {
                                         if let Ok(guard) = st.netguard.lock() {
                                             let _ = guard.enable_system_proxy(
                                                 "127.0.0.1",
@@ -210,15 +255,42 @@ pub fn run() {
                                             );
                                         }
                                     }
+                                    if settings.app_proxy_enabled {
+                                        if let Err(err) =
+                                            st.apply_capture_mode(CaptureMode::Apps).await
+                                        {
+                                            clear_persisted_capture_flags(&st);
+                                            log_startup_capture_fallback(&st, "App Proxy", &err);
+                                        }
+                                    }
+                                }
+
+                                if core_ready && settings.system_proxy_enabled {
+                                    if let Ok(guard) = st.netguard.lock() {
+                                        if !guard.is_armed() {
+                                            let _ = guard.enable_system_proxy(
+                                                "127.0.0.1",
+                                                settings.mixed_port,
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if core_ready {
                                     st.push_log(
                                         "INFO",
-                                        "autostart: core started silently in background",
+                                        if launched_via_autostart {
+                                            "startup: auto-started GUI proxy session silently in background"
+                                        } else {
+                                            "startup: restored saved proxy preferences for GUI session"
+                                        },
                                     );
-                                    let active = settings.system_proxy_enabled
-                                        || st.current_capture_mode() != CaptureMode::Off;
-                                    tray::update_tray_icon_state(&start_handle, active, false);
-                                    let _ = start_handle.emit("bypax-state-sync", ());
                                 }
+                                let active =
+                                    st.netguard.lock().map(|g| g.is_armed()).unwrap_or(false)
+                                        || st.current_capture_mode() != CaptureMode::Off;
+                                tray::update_tray_icon_state(&start_handle, active, false);
+                                let _ = start_handle.emit("bypax-state-sync", ());
                             });
                         }
                     }
@@ -363,6 +435,30 @@ pub fn run() {
                         continue;
                     };
                     let running = state.is_core_running();
+                    // Fail-open guard: on Windows, if local sing-box dies unexpectedly while
+                    // WinDivert App Proxy is capturing, immediately stop capture to prevent a blackhole.
+                    if cfg!(target_os = "windows")
+                        && state
+                            .app_proxy_active
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        && !running
+                    {
+                        state
+                            .app_proxy_active
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                        let _ = state
+                            .service_request(
+                                bypax_ipc::ServiceCommand::StopAppProxy,
+                                Duration::from_secs(2),
+                            )
+                            .await;
+                        state.push_log(
+                            "WARN",
+                            "app-proxy: paused capture because local proxy core stopped unexpectedly",
+                        );
+                        let _ = bg_handle.emit("bypax-state-sync", ());
+                    }
+
                     let capture = state.current_capture_mode();
                     let has_warn = state
                         .last_service_error
@@ -511,4 +607,30 @@ pub fn run() {
             }
         }
     });
+}
+
+fn clear_persisted_capture_flags(st: &AppState) {
+    if let Ok(store) = st.store.lock() {
+        if let Ok(mut updated) = store.load_settings() {
+            if updated.app_proxy_enabled || updated.tun_enabled {
+                updated.app_proxy_enabled = false;
+                updated.tun_enabled = false;
+                let _ = store.save_settings(&updated);
+            }
+        }
+    }
+}
+
+fn log_startup_capture_fallback(st: &AppState, label: &str, err: &str) {
+    if err.contains("UAC_CANCELLED") {
+        st.push_log(
+            "INFO",
+            format!("startup: {label} elevation cancelled; fell back to capture off"),
+        );
+    } else {
+        st.push_log(
+            "WARN",
+            format!("startup: {label} auto-restore failed ({err}); fell back to capture off"),
+        );
+    }
 }

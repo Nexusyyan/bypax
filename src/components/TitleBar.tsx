@@ -551,20 +551,20 @@ export function TitleBar({
               <SlidersHorizontal className="h-3.5 w-3.5" strokeWidth={1.5} />
             </button>
             {appearanceOpen && (
-              <div className="ui-popover absolute top-full right-0 z-50 mt-1.5 w-48 space-y-1 p-1.5 text-[12px]">
+              <div className="ui-popover absolute top-full right-0 z-50 mt-1.5 min-w-[232px] w-max max-w-[calc(100vw-24px)] space-y-1 p-1.5 text-[12px]">
                 <button
                   type="button"
                   onClick={() => {
                     onToggleLocale();
                     setAppearanceOpen(false);
                   }}
-                  className="flex w-full items-center justify-between rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                  className="flex w-full items-center justify-between gap-4 rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
                 >
-                  <span className="inline-flex items-center gap-2">
-                    <Globe className="h-3.5 w-3.5 text-[var(--text-secondary)]" strokeWidth={1.5} />
-                    {dict.titlebar.switchLang}
+                  <span className="inline-flex shrink-0 items-center gap-2 whitespace-nowrap">
+                    <Globe className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]" strokeWidth={1.5} />
+                    <span>{dict.titlebar.switchLang}</span>
                   </span>
-                  <span className="font-mono text-[11px] text-[var(--text-secondary)]">
+                  <span className="shrink-0 whitespace-nowrap font-mono text-[11px] text-[var(--text-secondary)]">
                     {locale === "zh-CN" ? "ZH" : "EN"}
                   </span>
                 </button>
@@ -574,19 +574,19 @@ export function TitleBar({
                     onCycleTheme();
                     setAppearanceOpen(false);
                   }}
-                  className="flex w-full items-center justify-between rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                  className="flex w-full items-center justify-between gap-4 rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
                 >
-                  <span className="inline-flex items-center gap-2">
+                  <span className="inline-flex shrink-0 items-center gap-2 whitespace-nowrap">
                     {theme === "dark" ? (
-                      <Moon className="h-3.5 w-3.5 text-[var(--text-secondary)]" strokeWidth={1.5} />
+                      <Moon className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]" strokeWidth={1.5} />
                     ) : theme === "light" ? (
-                      <Sun className="h-3.5 w-3.5 text-[var(--text-secondary)]" strokeWidth={1.5} />
+                      <Sun className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]" strokeWidth={1.5} />
                     ) : (
-                      <Monitor className="h-3.5 w-3.5 text-[var(--text-secondary)]" strokeWidth={1.5} />
+                      <Monitor className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]" strokeWidth={1.5} />
                     )}
-                    {dict.titlebar.switchTheme}
+                    <span>{dict.titlebar.switchTheme}</span>
                   </span>
-                  <span className="font-mono text-[11px] text-[var(--text-secondary)]">
+                  <span className="shrink-0 whitespace-nowrap font-mono text-[11px] text-[var(--text-secondary)]">
                     {theme === "dark"
                       ? dict.settings.themeDark
                       : theme === "light"

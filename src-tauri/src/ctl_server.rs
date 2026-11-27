@@ -678,7 +678,9 @@ async fn dispatch_ctl_request(
             };
             let core_info = state.build_core_info();
             let service_status = state.query_service_status().await;
-            let driver = state.probe_windivert(None);
+            let driver = state
+                .probe_windivert_with_service(None, service_status.connected)
+                .await;
             let ctl_ep = default_ctl_endpoint(&state.paths.runtime_dir);
 
             Ok((

@@ -300,13 +300,14 @@ export function buildTakeoverSummary(
 }
 
 export type NormalizedRecoveryFault =
+  | "legacy_conflict"
   | "hvci_blocked"
   | "driver_missing"
   | "signature_failed"
   | "pipe_timeout";
 
 /**
- * Canonicalizes backend/driver error kinds to the 4 actionable UI recovery banners.
+ * Canonicalizes backend/driver error kinds to the actionable UI recovery banners.
  * Unknown kinds, "access_denied", and "other" NEVER fall through to "pipe_timeout".
  */
 export function normalizeRecoveryFaultKind(
@@ -314,6 +315,7 @@ export function normalizeRecoveryFaultKind(
 ): NormalizedRecoveryFault | null {
   if (!raw) return null;
   const k = raw.trim().toLowerCase();
+  if (k === "legacy_conflict") return "legacy_conflict";
   if (k === "hvci_blocked" || k === "blocked_by_security") return "hvci_blocked";
   if (k === "driver_missing" || k === "missing_dll" || k === "missing_sys") {
     return "driver_missing";
@@ -326,7 +328,8 @@ export function normalizeRecoveryFaultKind(
 /**
  * Single-source-of-truth recovery fault gate shared by AppsView, App (Sidebar/TitleBar),
  * and TrayPopup. Never triggers false alarms or amber dots during healthy standby
- * (serviceMode="off", not installed, and captureMode="off").
+ * (serviceMode="off", not installed, and captureMode="off"), except when conflicting
+ * legacy Windows services or stale driver locks are actively detected.
  */
 export function resolveActiveRecoveryFault(params: {
   captureMode: CaptureMode;
@@ -335,6 +338,15 @@ export function resolveActiveRecoveryFault(params: {
   driverStatus?: DriverProbeDto | null;
 }): NormalizedRecoveryFault | null {
   const { captureMode, serviceStatus, appProxyStatus, driverStatus } = params;
+  if (
+    (serviceStatus?.legacyServices && serviceStatus.legacyServices.length > 0) ||
+    normalizeRecoveryFaultKind(serviceStatus?.errorKind) === "legacy_conflict" ||
+    normalizeRecoveryFaultKind(appProxyStatus?.errorKind) === "legacy_conflict" ||
+    normalizeRecoveryFaultKind(driverStatus?.errorKind) === "legacy_conflict"
+  ) {
+    return "legacy_conflict";
+  }
+
   const serviceRequestedOrActive =
     captureMode === "apps" ||
     (serviceStatus != null && (serviceStatus.mode !== "off" || serviceStatus.installed));

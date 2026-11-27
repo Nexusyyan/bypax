@@ -1,3 +1,4 @@
+use crate::platform_svc;
 #[cfg(windows)]
 use bypax_appproxy::engine::AppProxyEngine;
 use bypax_appproxy::engine::AppProxyHandle;
@@ -27,6 +28,8 @@ struct RunningAppProxy {
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
     last_config: AppProxyStartConfig,
+    sing_box_pid: Option<u32>,
+    dead_core_ticks: u8,
 }
 
 struct InnerState {
@@ -41,8 +44,9 @@ struct InnerState {
     last_app_proxy_error_kind: Option<String>,
 }
 
-/// Core privileged daemon controller shared by Windows SCM (`BypaxService`), Windows on-demand
-/// UAC worker (`worker-run`), macOS `launchd` LaunchDaemon (`daemon-run`), and integration tests.
+/// Core privileged helper controller shared by Windows GUI-bound on-demand worker (`worker-run`),
+/// macOS `launchd` LaunchDaemon (`daemon-run`), and integration tests. Enforces a strict GUI
+/// lease boundary so no proxy capture or TUN can run while the desktop GUI is closed.
 pub struct ServiceController {
     inner: Mutex<InnerState>,
     capture_mutex: tokio::sync::Mutex<()>,
@@ -51,14 +55,18 @@ pub struct ServiceController {
 
 impl ServiceController {
     pub fn new(paths: &DataPaths, expected_token: String) -> Arc<Self> {
+        Self::new_with_runtime_dir(paths.runtime_dir.clone(), expected_token)
+    }
+
+    pub fn new_with_runtime_dir(runtime_dir: PathBuf, expected_token: String) -> Arc<Self> {
         let logs = Arc::new(Mutex::new(LogRing::new(MAX_LOG_RING_ENTRIES)));
         let tracker = Arc::new(SnapshotProcessTracker::default());
         Arc::new(Self {
             inner: Mutex::new(InnerState {
                 expected_token,
-                supervisor: CoreSupervisor::new(paths.runtime_dir.clone(), logs),
+                supervisor: CoreSupervisor::new(runtime_dir.clone(), logs),
                 tun_active: false,
-                netguard: NetGuard::new(&paths.runtime_dir),
+                netguard: NetGuard::new(&runtime_dir),
                 last_heartbeat: None,
                 gui_pid: None,
                 app_proxy: None,
@@ -68,6 +76,40 @@ impl ServiceController {
             capture_mutex: tokio::sync::Mutex::new(()),
             tracker,
         })
+    }
+
+    /// Binds this controller to a specific parent GUI PID before IPC starts.
+    pub fn set_gui_pid(&self, gui_pid: u32) {
+        if let Ok(mut st) = self.inner.lock() {
+            st.gui_pid = Some(gui_pid);
+            st.last_heartbeat = Some(Instant::now());
+        }
+    }
+
+    /// Validates that a live desktop GUI process holds the lease before activating capture.
+    fn require_live_gui_lease(&self, incoming_gui_pid: Option<u32>) -> Result<u32, String> {
+        let candidate = {
+            let Ok(st) = self.inner.lock() else {
+                return Err("State lock poisoned".to_string());
+            };
+            incoming_gui_pid.filter(|&p| p > 0).or(st.gui_pid)
+        };
+        let Some(pid) = candidate else {
+            return Err(
+                "GUI_LEASE_REQUIRED: Launch Bypax GUI to activate App Proxy or TUN capture"
+                    .to_string(),
+            );
+        };
+        if !platform_svc::is_parent_alive(pid) {
+            return Err(format!(
+                "GUI_LEASE_REQUIRED: Bound Bypax GUI process (pid {pid}) is no longer running"
+            ));
+        }
+        if let Ok(mut st) = self.inner.lock() {
+            st.gui_pid = Some(pid);
+            st.last_heartbeat = Some(Instant::now());
+        }
+        Ok(pid)
     }
 
     /// Stops all active data planes (App Proxy + Core Supervisor) and restores NetGuard if dirty.
@@ -82,27 +124,79 @@ impl ServiceController {
         }
     }
 
-    /// Executes one watchdog tick; returns `true` if a heartbeat timeout triggered emergency
-    /// rollback (stops App Proxy + Core Supervisor + recovers NetGuard).
+    /// Executes one watchdog tick; returns `true` if a dead GUI lease, heartbeat timeout, or
+    /// unexpected local proxy core exit triggered automatic fail-safe teardown.
     pub async fn check_heartbeat_timeout(&self, timeout: Duration) -> bool {
-        let timed_out = {
+        let (should_stop_all, reason, pause_app_proxy_only) = {
             let Ok(mut st) = self.inner.lock() else {
                 return false;
             };
             let active = st.supervisor.is_running() || st.app_proxy.is_some();
-            if let Some(last) = st.last_heartbeat {
-                active && last.elapsed() > timeout
+            if !active {
+                (false, "", false)
+            } else if st
+                .gui_pid
+                .is_some_and(|pid| !platform_svc::is_parent_alive(pid))
+            {
+                (true, "bound GUI process exited", false)
+            } else if st
+                .last_heartbeat
+                .is_some_and(|last| last.elapsed() > timeout)
+            {
+                (true, "GUI heartbeat timed out", false)
+            } else if let Some(ref mut running) = st.app_proxy {
+                if let Some(sb_pid) = running.sing_box_pid.filter(|&p| p > 4) {
+                    if !platform_svc::is_parent_alive(sb_pid) {
+                        running.dead_core_ticks = running.dead_core_ticks.saturating_add(1);
+                        if running.dead_core_ticks == 1 {
+                            running
+                                .handle
+                                .reset_proxied_sessions("local proxy core process exited");
+                        }
+                        if running.dead_core_ticks >= 2 {
+                            (false, "local proxy core exited unexpectedly", true)
+                        } else {
+                            (false, "", false)
+                        }
+                    } else {
+                        running.dead_core_ticks = 0;
+                        (false, "", false)
+                    }
+                } else {
+                    (false, "", false)
+                }
             } else {
-                false
+                (false, "", false)
             }
         };
 
-        if timed_out {
+        if should_stop_all {
             warn!(
+                reason,
                 timeout_secs = timeout.as_secs(),
-                "GUI heartbeat lost; stopping App Proxy & Core and restoring NetGuard"
+                "GUI lease lost; stopping App Proxy & Core and restoring NetGuard"
             );
             self.stop_all_and_restore().await;
+            return true;
+        }
+
+        if pause_app_proxy_only {
+            warn!(
+                reason,
+                "local proxy core disappeared; pausing WinDivert App Proxy (fail-open)"
+            );
+            let _guard = self.capture_mutex.lock().await;
+            self.stop_app_proxy_locked().await;
+            if let Ok(mut st) = self.inner.lock() {
+                st.last_app_proxy_error = Some(
+                    "Proxy core exited unexpectedly; App Proxy paused to prevent traffic blackhole"
+                        .to_string(),
+                );
+                st.last_app_proxy_error_kind = Some("core_exited".to_string());
+                if !st.supervisor.is_running() {
+                    st.last_heartbeat = None;
+                }
+            }
             return true;
         }
         false
@@ -139,6 +233,15 @@ impl ServiceController {
     async fn start_app_proxy(&self, id: String, mut cfg: AppProxyStartConfig) -> ServiceResponse {
         let _lock = self.capture_mutex.lock().await;
 
+        let leased_gui_pid = match self.require_live_gui_lease(cfg.gui_pid) {
+            Ok(pid) => pid,
+            Err(msg) => {
+                let mut resp = ServiceResponse::error(id, msg);
+                resp.app_proxy_status = Some(self.build_app_proxy_status());
+                return resp;
+            }
+        };
+
         // Kernel-level mutual exclusion: stop TUN core if currently active before starting WinDivert.
         {
             if let Ok(mut st) = self.inner.lock() {
@@ -147,23 +250,23 @@ impl ServiceController {
                     st.supervisor.stop();
                     st.tun_active = false;
                 }
-                if let Some(gui_pid) = st.gui_pid {
-                    if !cfg.exempt_pids.contains(&gui_pid) {
-                        cfg.exempt_pids.push(gui_pid);
-                    }
-                }
             }
+        }
+        if !cfg.exempt_pids.contains(&leased_gui_pid) {
+            cfg.exempt_pids.push(leased_gui_pid);
         }
         let self_pid = std::process::id();
         if !cfg.exempt_pids.contains(&self_pid) {
             cfg.exempt_pids.push(self_pid);
         }
+        let sing_box_pid = cfg.sing_box_pid;
 
         // Stop any previous App Proxy engine cleanly first.
         self.stop_app_proxy_locked().await;
 
         #[cfg(not(windows))]
         {
+            let _ = sing_box_pid;
             // On macOS/Linux, App Proxy runs via `sing-box` `utun` path routing (StartCore).
             let mut resp = ServiceResponse::success(
                 id,
@@ -212,21 +315,33 @@ impl ServiceController {
 
             let handle = engine.handle();
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
-            let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+            let (started_tx, started_rx) = oneshot::channel::<Result<(), String>>();
 
             let task = tokio::spawn(async move {
-                // Engine starts WinDivert immediately inside `run()`. Report startup failure if it
-                // exits rapidly before shutdown.
-                let res = engine.run(shutdown_rx).await;
-                if let Err(err) = res {
-                    let _ = ready_tx.send(Err(err.to_string()));
-                } else {
-                    let _ = ready_tx.send(Ok(()));
-                }
+                let _ = engine.run_with_ready(shutdown_rx, Some(started_tx)).await;
             });
 
-            // Wait briefly (250ms) to catch immediate WinDivertOpen errors (HVCI / Access Denied / missing sys).
-            match tokio::time::timeout(Duration::from_millis(250), ready_rx).await {
+            // Await deterministic capture startup (WinDivertOpen across SOCKET/FLOW/NETWORK)
+            // instead of a fixed sleep that can miss slow driver loads or report dead tasks as running.
+            match tokio::time::timeout(Duration::from_secs(5), started_rx).await {
+                Ok(Ok(Ok(()))) => {
+                    if let Ok(mut st) = self.inner.lock() {
+                        st.last_app_proxy_error = None;
+                        st.last_app_proxy_error_kind = None;
+                        st.last_heartbeat = Some(Instant::now());
+                        st.app_proxy = Some(RunningAppProxy {
+                            handle,
+                            shutdown_tx: Some(shutdown_tx),
+                            task,
+                            last_config: cfg,
+                            sing_box_pid,
+                            dead_core_ticks: 0,
+                        });
+                    }
+                    let mut resp = ServiceResponse::success(id, "App Proxy started");
+                    resp.app_proxy_status = Some(self.build_app_proxy_status());
+                    resp
+                }
                 Ok(Ok(Err(err_msg))) => {
                     let kind =
                         bypax_windivert::windows_engine::classify_windivert_error(true, &err_msg);
@@ -238,19 +353,24 @@ impl ServiceController {
                     resp.app_proxy_status = Some(self.build_app_proxy_status());
                     resp
                 }
-                _ => {
-                    // Engine is still running cleanly after 250ms!
+                Ok(Err(_)) => {
+                    let err_msg = "App Proxy engine task exited before signaling readiness".to_string();
                     if let Ok(mut st) = self.inner.lock() {
-                        st.last_app_proxy_error = None;
-                        st.last_app_proxy_error_kind = None;
-                        st.app_proxy = Some(RunningAppProxy {
-                            handle,
-                            shutdown_tx: Some(shutdown_tx),
-                            task,
-                            last_config: cfg,
-                        });
+                        st.last_app_proxy_error = Some(err_msg.clone());
+                        st.last_app_proxy_error_kind = Some("other".to_string());
                     }
-                    let mut resp = ServiceResponse::success(id, "App Proxy started");
+                    let mut resp = ServiceResponse::error(id, err_msg);
+                    resp.app_proxy_status = Some(self.build_app_proxy_status());
+                    resp
+                }
+                Err(_) => {
+                    let _ = shutdown_tx.send(());
+                    let err_msg = "Timed out waiting for WinDivert App Proxy startup".to_string();
+                    if let Ok(mut st) = self.inner.lock() {
+                        st.last_app_proxy_error = Some(err_msg.clone());
+                        st.last_app_proxy_error_kind = Some("other".to_string());
+                    }
+                    let mut resp = ServiceResponse::error(id, err_msg);
                     resp.app_proxy_status = Some(self.build_app_proxy_status());
                     resp
                 }
@@ -264,6 +384,7 @@ impl ServiceController {
         if !cfg.exempt_pids.contains(&self_pid) {
             cfg.exempt_pids.push(self_pid);
         }
+        let next_sb_pid = cfg.sing_box_pid;
         let res = {
             let Ok(mut st) = self.inner.lock() else {
                 return ServiceResponse::error(id, "State lock poisoned");
@@ -274,9 +395,25 @@ impl ServiceController {
                 }
             }
             if let Some(ref mut running) = st.app_proxy {
+                let prev_sb_pid = running.sing_box_pid;
+                let prev_port = running.last_config.app_proxy_port;
+                let next_port = cfg.app_proxy_port;
                 let r = running.handle.reload_config(&cfg);
                 if r.is_ok() {
+                    let sb_restarted = prev_sb_pid.is_some()
+                        && next_sb_pid.filter(|&p| p > 0).is_some()
+                        && prev_sb_pid != next_sb_pid;
+                    let port_changed = prev_port != next_port;
+                    if sb_restarted || port_changed {
+                        running
+                            .handle
+                            .reset_proxied_sessions("sing-box restarted or app-proxy port changed");
+                    }
                     running.last_config = cfg;
+                    if let Some(pid) = next_sb_pid.filter(|&p| p > 0) {
+                        running.sing_box_pid = Some(pid);
+                        running.dead_core_ticks = 0;
+                    }
                 }
                 Some(r)
             } else {
@@ -305,7 +442,10 @@ impl ServiceController {
         } else {
             None
         };
-        let app_running = st.app_proxy.is_some();
+        let app_running = st
+            .app_proxy
+            .as_ref()
+            .is_some_and(|r| !r.task.is_finished());
         let capture_mode = if running && st.tun_active {
             "tun"
         } else if app_running {
@@ -326,25 +466,26 @@ impl ServiceController {
             return AppProxyStatusDto::default();
         };
         if let Some(ref running) = st.app_proxy {
-            AppProxyStatusDto {
-                running: true,
-                mode: "windivert_zero_tun".to_string(),
-                active_rules: running.handle.active_rule_count(),
-                exempt_pids: running.handle.exempt_pids(),
-                last_error: st.last_app_proxy_error.clone(),
-                error_kind: st.last_app_proxy_error_kind.clone(),
-                stats: running.handle.stats_snapshot(),
+            if !running.task.is_finished() {
+                return AppProxyStatusDto {
+                    running: true,
+                    mode: "windivert_zero_tun".to_string(),
+                    active_rules: running.handle.active_rule_count(),
+                    exempt_pids: running.handle.exempt_pids(),
+                    last_error: st.last_app_proxy_error.clone(),
+                    error_kind: st.last_app_proxy_error_kind.clone(),
+                    stats: running.handle.stats_snapshot(),
+                };
             }
-        } else {
-            AppProxyStatusDto {
-                running: false,
-                mode: "inactive".to_string(),
-                active_rules: 0,
-                exempt_pids: Vec::new(),
-                last_error: st.last_app_proxy_error.clone(),
-                error_kind: st.last_app_proxy_error_kind.clone(),
-                stats: Default::default(),
-            }
+        }
+        AppProxyStatusDto {
+            running: false,
+            mode: "inactive".to_string(),
+            active_rules: 0,
+            exempt_pids: Vec::new(),
+            last_error: st.last_app_proxy_error.clone(),
+            error_kind: st.last_app_proxy_error_kind.clone(),
+            stats: Default::default(),
         }
     }
 
@@ -443,8 +584,12 @@ impl ServiceHandler for ServiceController {
                     sing_box_path,
                     config_json,
                     tun_mode,
+                    gui_pid,
                 } => {
                     let _lock = self.capture_mutex.lock().await;
+                    if let Err(msg) = self.require_live_gui_lease(gui_pid) {
+                        return (ServiceResponse::error(env.id, msg), false);
+                    }
                     if tun_mode {
                         // Kernel-level mutual exclusion: stop App Proxy before starting TUN.
                         self.stop_app_proxy_locked().await;
@@ -470,6 +615,7 @@ impl ServiceHandler for ServiceController {
                     {
                         Ok(rep) if rep.ok => {
                             st.tun_active = tun_mode;
+                            st.last_heartbeat = Some(Instant::now());
                             let pid = st.supervisor.require_running_pid().ok();
                             drop(st);
                             let mut resp = ServiceResponse::success(env.id, "Core started");
@@ -496,6 +642,9 @@ impl ServiceHandler for ServiceController {
                     if let Ok(mut st) = self.inner.lock() {
                         st.supervisor.stop();
                         st.tun_active = false;
+                        if st.app_proxy.is_none() {
+                            st.last_heartbeat = None;
+                        }
                     }
                     let mut resp = ServiceResponse::success(env.id, "Core stopped");
                     resp.core_running = Some(false);
@@ -518,6 +667,11 @@ impl ServiceHandler for ServiceController {
                 ServiceCommand::StopAppProxy => {
                     let _lock = self.capture_mutex.lock().await;
                     self.stop_app_proxy_locked().await;
+                    if let Ok(mut st) = self.inner.lock() {
+                        if !st.supervisor.is_running() {
+                            st.last_heartbeat = None;
+                        }
+                    }
                     let mut resp = ServiceResponse::success(env.id, "App Proxy stopped");
                     resp.app_proxy_status = Some(self.build_app_proxy_status());
                     (resp, false)
@@ -619,6 +773,46 @@ mod tests {
         assert!(ping.ok);
         assert_eq!(ping.message, "pong");
 
+        // Strict GUI lease: StartCore MUST be rejected when no live GUI PID holds a lease.
+        let denied_start = send_service_request(
+            &ep,
+            &ServiceEnvelope {
+                id: "sc-denied".into(),
+                session_token: token.clone(),
+                command: ServiceCommand::StartCore {
+                    sing_box_path: "nonexistent".into(),
+                    config_json: "{}".into(),
+                    tun_mode: true,
+                    gui_pid: None,
+                },
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(!denied_start.ok);
+        assert!(denied_start.message.contains("GUI_LEASE_REQUIRED"));
+
+        // Dead GUI PID MUST also be rejected.
+        let denied_dead = send_service_request(
+            &ep,
+            &ServiceEnvelope {
+                id: "sc-dead".into(),
+                session_token: token.clone(),
+                command: ServiceCommand::StartCore {
+                    sing_box_path: "nonexistent".into(),
+                    config_json: "{}".into(),
+                    tun_mode: true,
+                    gui_pid: Some(1),
+                },
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(!denied_dead.ok);
+        assert!(denied_dead.message.contains("GUI_LEASE_REQUIRED"));
+
         let hb = send_service_request(
             &ep,
             &ServiceEnvelope {
@@ -650,6 +844,22 @@ mod tests {
 
         // Verify watchdog triggers when heartbeat is stale and no active crash occurs.
         assert!(!ctrl.check_heartbeat_timeout(Duration::from_secs(15)).await);
+
+        // Stopping App Proxy when no core is active must clear the recorded heartbeat so
+        // a later start is never killed immediately by a stale timestamp.
+        let stop_app = send_service_request(
+            &ep,
+            &ServiceEnvelope {
+                id: "sa1".into(),
+                session_token: token.clone(),
+                command: ServiceCommand::StopAppProxy,
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(stop_app.ok);
+        assert!(ctrl.inner.lock().unwrap().last_heartbeat.is_none());
 
         let _ = tx.send(());
         let _ = task.await;

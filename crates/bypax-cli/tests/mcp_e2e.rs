@@ -166,11 +166,15 @@ fn stdio_mcp_e2e_offline_all_20_tools_and_zero_stdout_pollution() {
         r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"bypax_test_route","arguments":{"target":"https://www.baidu.com"}}}"#,
         r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"bypax_doctor","arguments":{}}}"#,
         r#"{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"bypax_app_delete_rule","arguments":{"id":"Antigravity IDE"}}}"#,
+        r#"{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"bypax_toggle_core","arguments":{"action":"start"}}}"#,
+        r#"{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"bypax_toggle_system_proxy","arguments":{"enabled":true}}}"#,
+        r#"{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"bypax_app_toggle","arguments":{"enabled":true}}}"#,
+        r#"{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"bypax_app_toggle","arguments":{"enabled":false}}}"#,
     ];
 
     let (frames, _stderr) = spawn_mcp_exchange(dir.path(), &dead_ep, &dead_ep, &requests);
-    // 13 responses (notification produces 0 responses).
-    assert_eq!(frames.len(), 13);
+    // 17 responses (notification produces 0 responses).
+    assert_eq!(frames.len(), 17);
 
     // initialize
     assert_eq!(frames[0]["result"]["protocolVersion"], "2024-11-05");
@@ -222,6 +226,19 @@ fn stdio_mcp_e2e_offline_all_20_tools_and_zero_stdout_pollution() {
         serde_json::from_str(frames[12]["result"]["content"][0]["text"].as_str().unwrap())
             .unwrap();
     assert_eq!(del_res["remainingRules"], 0);
+
+    // Offline GUI-only boundary: enabling core / system proxy / app capture MUST be refused.
+    for idx in [13usize, 14, 15] {
+        assert_eq!(frames[idx]["result"]["isError"], true);
+        let msg = frames[idx]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            msg.contains("GUI_NOT_RUNNING"),
+            "expected GUI_NOT_RUNNING for offline frame {idx}, got: {msg}"
+        );
+    }
+
+    // Disabling capture offline MUST remain allowed for safe recovery.
+    assert_eq!(frames[16]["result"]["isError"], false);
 }
 
 #[tokio::test]

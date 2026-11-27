@@ -24,12 +24,14 @@ import type {
   CliIntegrationInfo,
   CoreInfo,
   Locale,
+  PlatformKind,
   ThemeMode,
 } from "../../types";
 import { formatBytes } from "../../utils/nodes";
 
 interface SettingsViewProps {
   dict: Dict;
+  platform: PlatformKind | string;
   locale: Locale;
   theme: ThemeMode;
   appVersion: string;
@@ -44,6 +46,7 @@ interface SettingsViewProps {
   onChangeTheme: (theme: ThemeMode) => void;
   onUpdateSettings: (next: AppSettings) => void;
   onRestoreNetguard: () => void;
+  onCleanupLegacy: () => Promise<void>;
   onGoToDns: () => void;
   onCopyText: (text: string) => void;
   onCheckAppUpdate: () => Promise<void>;
@@ -63,6 +66,7 @@ const TEST_URL_PRESETS = [
 
 export function SettingsView({
   dict,
+  platform,
   locale,
   theme,
   appVersion,
@@ -77,6 +81,7 @@ export function SettingsView({
   onChangeTheme,
   onUpdateSettings,
   onRestoreNetguard,
+  onCleanupLegacy,
   onGoToDns,
   onCopyText,
   onCheckAppUpdate,
@@ -522,13 +527,24 @@ export function SettingsView({
                 {dict.settings.netguardDesc}
               </p>
             </div>
-            <button
-              type="button"
-              onClick={onRestoreNetguard}
-              className="ui-btn-secondary h-8 shrink-0"
-            >
-              {dict.settings.restoreNow}
-            </button>
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={onRestoreNetguard}
+                className="ui-btn-secondary h-8 shrink-0"
+              >
+                {dict.settings.restoreNow}
+              </button>
+              {platform !== "macos" && (
+                <button
+                  type="button"
+                  onClick={() => void onCleanupLegacy()}
+                  className="ui-btn-secondary h-8 shrink-0"
+                >
+                  {dict.settings.cleanupLegacyBtn}
+                </button>
+              )}
+            </div>
           </div>
 
           <div className="space-y-1 px-4 py-3 text-[12px]">

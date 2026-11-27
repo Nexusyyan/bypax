@@ -360,12 +360,8 @@ export function AppsView({
     }
   }, [activeFaultKind]);
 
-  const winServiceSegValue: "off" | "onDemand" | "background" =
-    serviceStatus.mode === "service"
-      ? "background"
-      : serviceStatus.mode === "elevated_worker"
-        ? "onDemand"
-        : "off";
+  const winServiceSegValue: "off" | "onDemand" =
+    serviceStatus.connected && serviceStatus.mode !== "off" ? "onDemand" : "off";
 
   const enabledCount = sortedRules.filter((r) => r.enabled).length;
   const engineStatusLabel =
@@ -900,14 +896,9 @@ export function AppsView({
                       label: dict.service.onDemand,
                       title: dict.service.captionOnDemand,
                     },
-                    {
-                      value: "background",
-                      label: dict.service.background,
-                      title: dict.service.captionBackground,
-                    },
                   ]}
                   onChange={(m) => void onServiceModeChange(m)}
-                  ariaLabel={dict.service.background}
+                  ariaLabel={dict.service.onDemand}
                 />
               ) : (
                 <div className="flex items-center gap-2">
@@ -946,28 +937,28 @@ export function AppsView({
                   <MoreHorizontal className="h-4 w-4" strokeWidth={1.6} />
                 </button>
                 {menuOpen && (
-                  <div className="ui-popover absolute top-full right-0 z-40 mt-1.5 w-48 space-y-0.5 p-1.5 text-[12px]">
+                  <div className="ui-popover absolute top-full right-0 z-40 mt-1.5 min-w-[216px] w-max space-y-0.5 p-1.5 text-[12px]">
                     {!isMac ? (
                       <>
                         <button
                           type="button"
                           onClick={() => {
                             setMenuOpen(false);
-                            void onServiceAction("stop");
+                            void onServiceAction("stop_worker");
                           }}
-                          className="flex w-full items-center rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                          className="flex w-full items-center whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
                         >
-                          {dict.service.menuStop}
+                          {dict.service.menuStopWorker}
                         </button>
                         <button
                           type="button"
                           onClick={() => {
                             setMenuOpen(false);
-                            void onServiceAction("uninstall");
+                            void onServiceAction("cleanup_legacy");
                           }}
-                          className="flex w-full items-center rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--danger-bg-hover)] hover:text-[var(--danger-text-on-bg)] cursor-pointer"
+                          className="flex w-full items-center whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
                         >
-                          {dict.service.menuUninstall}
+                          {dict.service.menuCleanupLegacy}
                         </button>
                         <button
                           type="button"
@@ -975,7 +966,7 @@ export function AppsView({
                             setMenuOpen(false);
                             void onProbeDriver();
                           }}
-                          className="flex w-full items-center rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                          className="flex w-full items-center whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
                         >
                           {dict.service.menuProbe}
                         </button>
@@ -988,7 +979,7 @@ export function AppsView({
                             setMenuOpen(false);
                             void onServiceAction("install");
                           }}
-                          className="flex w-full items-center rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                          className="flex w-full items-center whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
                         >
                           {dict.service.menuReinstall}
                         </button>
@@ -998,7 +989,7 @@ export function AppsView({
                             setMenuOpen(false);
                             void onServiceAction("uninstall");
                           }}
-                          className="flex w-full items-center rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--danger-bg-hover)] hover:text-[var(--danger-text-on-bg)] cursor-pointer"
+                          className="flex w-full items-center whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--danger-bg-hover)] hover:text-[var(--danger-text-on-bg)] cursor-pointer"
                         >
                           {dict.service.menuUninstall}
                         </button>
@@ -1010,7 +1001,7 @@ export function AppsView({
                         setMenuOpen(false);
                         onOpenLogs();
                       }}
-                      className="flex w-full items-center rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                      className="flex w-full items-center whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
                     >
                       {dict.service.menuLogs}
                     </button>
@@ -1043,31 +1034,60 @@ export function AppsView({
                     className="text-[13px] font-semibold"
                     style={{ color: "var(--warning-text)" }}
                   >
-                    {activeFaultKind === "hvci_blocked"
-                      ? dict.recovery.blockedTitle
-                      : activeFaultKind === "driver_missing"
-                        ? dict.recovery.missingTitle
-                        : activeFaultKind === "signature_failed"
-                          ? dict.recovery.sigTitle
-                          : activeFaultKind === "pipe_timeout"
-                            ? dict.recovery.pipeTitle
-                            : null}
+                    {activeFaultKind === "legacy_conflict"
+                      ? dict.recovery.conflictTitle
+                      : activeFaultKind === "hvci_blocked"
+                        ? dict.recovery.blockedTitle
+                        : activeFaultKind === "driver_missing"
+                          ? dict.recovery.missingTitle
+                          : activeFaultKind === "signature_failed"
+                            ? dict.recovery.sigTitle
+                            : activeFaultKind === "pipe_timeout"
+                              ? dict.recovery.pipeTitle
+                              : null}
                   </div>
                   <div className="text-[12px] text-[var(--text-secondary)]">
-                    {activeFaultKind === "hvci_blocked"
-                      ? dict.recovery.blockedDesc
-                      : activeFaultKind === "driver_missing"
-                        ? dict.recovery.missingDesc
-                        : activeFaultKind === "signature_failed"
-                          ? dict.recovery.sigDesc
-                          : activeFaultKind === "pipe_timeout"
-                            ? dict.recovery.pipeDesc
-                            : null}
+                    {activeFaultKind === "legacy_conflict"
+                      ? serviceStatus.legacyServices && serviceStatus.legacyServices.length > 0
+                        ? dict.recovery.conflictDescServices.replace(
+                            "{services}",
+                            serviceStatus.legacyServices.join(", "),
+                          )
+                        : dict.recovery.conflictDescGeneric
+                      : activeFaultKind === "hvci_blocked"
+                        ? dict.recovery.blockedDesc
+                        : activeFaultKind === "driver_missing"
+                          ? dict.recovery.missingDesc
+                          : activeFaultKind === "signature_failed"
+                            ? dict.recovery.sigDesc
+                            : activeFaultKind === "pipe_timeout"
+                              ? isMac
+                                ? dict.recovery.pipeDesc
+                                : dict.recovery.pipeDescWin
+                              : null}
                   </div>
                 </div>
               </div>
 
               <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+                {activeFaultKind === "legacy_conflict" && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => void onServiceAction("cleanup_legacy")}
+                      className="ui-btn-primary h-7 text-[11.5px]"
+                    >
+                      {dict.recovery.cleanupNow}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void onProbeDriver()}
+                      className="ui-btn-secondary h-7 text-[11.5px]"
+                    >
+                      {dict.recovery.retry}
+                    </button>
+                  </>
+                )}
                 {activeFaultKind === "hvci_blocked" && (
                   <>
                     <button
@@ -1103,10 +1123,10 @@ export function AppsView({
                   <>
                     <button
                       type="button"
-                      onClick={() => void onServiceAction("restart")}
+                      onClick={() => void onServiceAction(isMac ? "restart" : "start_worker")}
                       className="ui-btn-primary h-7 text-[11.5px]"
                     >
-                      {dict.recovery.restartService}
+                      {isMac ? dict.recovery.restartService : dict.recovery.restartHelper}
                     </button>
                     <button
                       type="button"

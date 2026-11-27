@@ -192,7 +192,8 @@ impl WinDivertLib {
                 2 => "WinDivert64.sys driver file was not found alongside WinDivert.dll.",
                 577 => "Driver signature verification failed (check Secure Boot / HVCI / official WinDivert 2.2.2-A).",
                 1275 => "Driver blocked by Windows Security / HVCI Memory Integrity or antivirus.",
-                87 => "Invalid WinDivert filter expression or parameter.",
+                87 => "Invalid WinDivert filter expression or parameter (or another WinDivert proxy service is already holding the same layer/priority).",
+                1072 => "WinDivert kernel driver service is marked for deletion; stop any conflicting WinDivert service and retry.",
                 _ => "Check administrator privileges, WinDivert64.sys presence, and Windows Security logs.",
             };
             bail!("WinDivertOpen(layer={layer}, filter='{filter}') failed with OS error {code} ({os_err}). {hint}");

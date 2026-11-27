@@ -87,6 +87,14 @@ pub fn classify_windivert_error(dll_loaded: bool, msg: &str) -> String {
     if contains_os_error_code(&lower, "577") || lower.contains("signature") {
         return "signature_failed".to_string();
     }
+    if contains_os_error_code(&lower, "87")
+        || contains_os_error_code(&lower, "1072")
+        || lower.contains("marked for deletion")
+        || lower.contains("conflicting windivert")
+        || lower.contains("same layer/priority")
+    {
+        return "legacy_conflict".to_string();
+    }
     if contains_os_error_code(&lower, "5") || lower.contains("access denied") {
         return "access_denied".to_string();
     }
@@ -217,146 +225,155 @@ impl CaptureEngine for WinDivertCaptureEngine {
             return Ok(());
         }
 
-        let sock = Arc::new(self.lib.open(
-            "tcp or udp",
-            WINDIVERT_LAYER_SOCKET,
-            100,
-            WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY,
-        )?);
+        let init_result: Result<()> = (|| {
+            let sock = Arc::new(self.lib.open(
+                "tcp or udp",
+                WINDIVERT_LAYER_SOCKET,
+                100,
+                WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY,
+            )?);
 
-        let flow = Arc::new(self.lib.open(
-            "outbound and !loopback and (tcp or udp)",
-            WINDIVERT_LAYER_FLOW,
-            90,
-            WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY,
-        )?);
+            let flow = Arc::new(self.lib.open(
+                "outbound and !loopback and (tcp or udp)",
+                WINDIVERT_LAYER_FLOW,
+                90,
+                WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY,
+            )?);
 
-        let net = Arc::new(self.lib.open(
-            "outbound and !loopback and (tcp or udp)",
-            WINDIVERT_LAYER_NETWORK,
-            0,
-            0,
-        )?);
+            let net = Arc::new(self.lib.open(
+                "outbound and !loopback and (tcp or udp)",
+                WINDIVERT_LAYER_NETWORK,
+                0,
+                0,
+            )?);
 
-        let _ = net.set_param(WINDIVERT_PARAM_QUEUE_LENGTH, 8192);
-        let _ = net.set_param(WINDIVERT_PARAM_QUEUE_TIME, 4000);
-        let _ = net.set_param(WINDIVERT_PARAM_QUEUE_SIZE, 16 * 1024 * 1024);
+            let _ = net.set_param(WINDIVERT_PARAM_QUEUE_LENGTH, 8192);
+            let _ = net.set_param(WINDIVERT_PARAM_QUEUE_TIME, 4000);
+            let _ = net.set_param(WINDIVERT_PARAM_QUEUE_SIZE, 16 * 1024 * 1024);
 
-        *self.sock_handle.lock().unwrap() = Some(Arc::clone(&sock));
-        *self.flow_handle.lock().unwrap() = Some(Arc::clone(&flow));
-        *self.net_handle.lock().unwrap() = Some(Arc::clone(&net));
+            *self.sock_handle.lock().unwrap() = Some(Arc::clone(&sock));
+            *self.flow_handle.lock().unwrap() = Some(Arc::clone(&flow));
+            *self.net_handle.lock().unwrap() = Some(Arc::clone(&net));
 
-        let warm_tx = self.process_tracker.as_ref().map(|tracker| {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(512);
-            let tracker_clone = Arc::clone(tracker);
-            let running_clone = Arc::clone(&self.running);
-            let _ = thread::Builder::new()
-                .name("bypax-wd-pid-warmer".into())
-                .spawn(move || {
-                    while running_clone.load(Ordering::Relaxed) {
-                        match rx.recv_timeout(std::time::Duration::from_millis(250)) {
-                            Ok(pid) => tracker_clone.warm_pid(pid),
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                        }
-                    }
-                });
-            tx
-        });
-
-        {
-            let running = Arc::clone(&self.running);
-            let tuple_pids = Arc::clone(&self.tuple_pids);
-            let port_pids = Arc::clone(&self.port_pids);
-            let warm_tx = warm_tx.clone();
-            thread::Builder::new()
-                .name("bypax-wd-socket".into())
-                .spawn(move || {
-                    let mut empty = [];
-                    while running.load(Ordering::Relaxed) {
-                        match sock.recv(&mut empty) {
-                            Ok((_, addr)) => {
-                                handle_socket_or_flow_event(
-                                    &addr,
-                                    &tuple_pids,
-                                    &port_pids,
-                                    warm_tx.as_ref(),
-                                );
+            let warm_tx = self.process_tracker.as_ref().map(|tracker| {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(512);
+                let tracker_clone = Arc::clone(tracker);
+                let running_clone = Arc::clone(&self.running);
+                let _ = thread::Builder::new()
+                    .name("bypax-wd-pid-warmer".into())
+                    .spawn(move || {
+                        while running_clone.load(Ordering::Relaxed) {
+                            match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                                Ok(pid) => tracker_clone.warm_pid(pid),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                             }
-                            Err(err) => {
-                                if running.load(Ordering::Relaxed) {
-                                    debug!(?err, "WinDivert SOCKET recv ended");
+                        }
+                    });
+                tx
+            });
+
+            {
+                let running = Arc::clone(&self.running);
+                let tuple_pids = Arc::clone(&self.tuple_pids);
+                let port_pids = Arc::clone(&self.port_pids);
+                let warm_tx = warm_tx.clone();
+                thread::Builder::new()
+                    .name("bypax-wd-socket".into())
+                    .spawn(move || {
+                        let mut empty = [];
+                        while running.load(Ordering::Relaxed) {
+                            match sock.recv(&mut empty) {
+                                Ok((_, addr)) => {
+                                    handle_socket_or_flow_event(
+                                        &addr,
+                                        &tuple_pids,
+                                        &port_pids,
+                                        warm_tx.as_ref(),
+                                    );
                                 }
-                                break;
-                            }
-                        }
-                    }
-                })?;
-        }
-
-        {
-            let running = Arc::clone(&self.running);
-            let tuple_pids = Arc::clone(&self.tuple_pids);
-            let port_pids = Arc::clone(&self.port_pids);
-            let warm_tx = warm_tx.clone();
-            thread::Builder::new()
-                .name("bypax-wd-flow".into())
-                .spawn(move || {
-                    let mut empty = [];
-                    while running.load(Ordering::Relaxed) {
-                        match flow.recv(&mut empty) {
-                            Ok((_, addr)) => {
-                                handle_socket_or_flow_event(
-                                    &addr,
-                                    &tuple_pids,
-                                    &port_pids,
-                                    warm_tx.as_ref(),
-                                );
-                            }
-                            Err(err) => {
-                                if running.load(Ordering::Relaxed) {
-                                    debug!(?err, "WinDivert FLOW recv ended");
-                                }
-                                break;
-                            }
-                        }
-                    }
-                })?;
-        }
-
-        {
-            let running = Arc::clone(&self.running);
-            thread::Builder::new()
-                .name("bypax-wd-network".into())
-                .spawn(move || {
-                    let mut buf = vec![0u8; 65_535];
-                    while running.load(Ordering::Relaxed) {
-                        match net.recv(&mut buf) {
-                            Ok((n, addr)) if n > 0 => {
-                                let net_data = addr.network();
-                                let captured = CapturedPacket {
-                                    payload: buf[..n].to_vec(),
-                                    meta: PacketMeta {
-                                        iface_index: net_data.if_idx,
-                                        sub_iface_index: net_data.sub_if_idx,
-                                        outbound: addr.outbound(),
-                                        is_ipv6: addr.ipv6(),
-                                    },
-                                };
-                                if tx.blocking_send(captured).is_err() {
+                                Err(err) => {
+                                    if running.load(Ordering::Relaxed) {
+                                        debug!(?err, "WinDivert SOCKET recv ended");
+                                    }
                                     break;
                                 }
                             }
-                            Ok(_) => {}
-                            Err(err) => {
-                                if running.load(Ordering::Relaxed) {
-                                    warn!(?err, "WinDivert NETWORK recv error");
+                        }
+                    })?;
+            }
+
+            {
+                let running = Arc::clone(&self.running);
+                let tuple_pids = Arc::clone(&self.tuple_pids);
+                let port_pids = Arc::clone(&self.port_pids);
+                let warm_tx = warm_tx.clone();
+                thread::Builder::new()
+                    .name("bypax-wd-flow".into())
+                    .spawn(move || {
+                        let mut empty = [];
+                        while running.load(Ordering::Relaxed) {
+                            match flow.recv(&mut empty) {
+                                Ok((_, addr)) => {
+                                    handle_socket_or_flow_event(
+                                        &addr,
+                                        &tuple_pids,
+                                        &port_pids,
+                                        warm_tx.as_ref(),
+                                    );
                                 }
-                                break;
+                                Err(err) => {
+                                    if running.load(Ordering::Relaxed) {
+                                        debug!(?err, "WinDivert FLOW recv ended");
+                                    }
+                                    break;
+                                }
                             }
                         }
-                    }
-                })?;
+                    })?;
+            }
+
+            {
+                let running = Arc::clone(&self.running);
+                thread::Builder::new()
+                    .name("bypax-wd-network".into())
+                    .spawn(move || {
+                        let mut buf = vec![0u8; 65_535];
+                        while running.load(Ordering::Relaxed) {
+                            match net.recv(&mut buf) {
+                                Ok((n, addr)) if n > 0 => {
+                                    let net_data = addr.network();
+                                    let captured = CapturedPacket {
+                                        payload: buf[..n].to_vec(),
+                                        meta: PacketMeta {
+                                            iface_index: net_data.if_idx,
+                                            sub_iface_index: net_data.sub_if_idx,
+                                            outbound: addr.outbound(),
+                                            is_ipv6: addr.ipv6(),
+                                        },
+                                    };
+                                    if tx.blocking_send(captured).is_err() {
+                                        break;
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(err) => {
+                                    if running.load(Ordering::Relaxed) {
+                                        warn!(?err, "WinDivert NETWORK recv error");
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    })?;
+            }
+
+            Ok(())
+        })();
+
+        if let Err(err) = init_result {
+            let _ = self.shutdown();
+            return Err(err);
         }
 
         Ok(())
@@ -492,6 +509,14 @@ mod tests {
         assert_eq!(
             classify_windivert_error(true, "WinDivertOpen failed: os error 577 invalid signature"),
             "signature_failed"
+        );
+        assert_eq!(
+            classify_windivert_error(true, "WinDivertOpen failed: os error 87 parameter conflict"),
+            "legacy_conflict"
+        );
+        assert_eq!(
+            classify_windivert_error(true, "WinDivertOpen failed: os error 1072 marked for deletion"),
+            "legacy_conflict"
         );
         assert_eq!(classify_windivert_error(true, "unexpected error"), "other");
     }

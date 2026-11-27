@@ -87,6 +87,8 @@ const DEFAULT_SERVICE_STATUS: PrivilegedServiceStatus = {
   tunRunning: false,
   error: null,
   errorKind: null,
+  legacyServices: [],
+  conflictDetail: null,
 };
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -460,7 +462,7 @@ export default function App() {
     void poll();
     const timer = window.setInterval(() => void poll(), 1800);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [bootstrapped]);
 
   const mainNode = useMemo(
     () => nodes.find((n) => n.id === settings.mainNodeId) ?? nodes[0] ?? null,
@@ -595,7 +597,11 @@ export default function App() {
   const handleSelectCapture = async (next: CaptureMode) => {
     if (next === captureMode) return;
     setCaptureError(null);
-    if (next !== "off" && serviceStatus.mode === "off") {
+    const needsAuth =
+      platform === "macos"
+        ? serviceStatus.mode === "off" || !serviceStatus.connected
+        : !serviceStatus.connected;
+    if (next !== "off" && needsAuth) {
       setAuthPromptTarget(next);
       return;
     }
@@ -655,8 +661,14 @@ export default function App() {
 
   const handleServiceAction = async (action: ServiceActionKind) => {
     try {
+      if (action === "cleanup_legacy") {
+        pushToast(dict.service.cleaningLegacy, "neutral");
+      }
       const nextSvc = await api.serviceAction(action);
       setServiceStatus(nextSvc);
+      if (action === "cleanup_legacy") {
+        pushToast(dict.toast.legacyCleaned, "ok");
+      }
       await reloadBootstrap();
     } catch (err) {
       const msg = String(err);
@@ -1056,7 +1068,14 @@ export default function App() {
     try {
       const info = await api.restoreNetguardNow();
       setCoreInfo(info);
-      setSettings((prev) => ({ ...prev, systemProxyEnabled: false }));
+      setCaptureMode("off");
+      setSettings((prev) => ({
+        ...prev,
+        systemProxyEnabled: false,
+        appProxyEnabled: false,
+        tunEnabled: false,
+      }));
+      await reloadBootstrap();
       pushToast(dict.toast.netguardRestored);
     } catch (err) {
       pushToast(String(err), "err");
@@ -1410,6 +1429,7 @@ export default function App() {
           {activeTab === "settings" && (
             <SettingsView
               dict={dict}
+              platform={platform}
               locale={locale}
               theme={theme}
               appVersion={appVersion}

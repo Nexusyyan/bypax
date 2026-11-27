@@ -248,7 +248,7 @@ Users answer exactly two orthogonal questions:
      - Switching shows `switching` spinner (`12px`) and locks sibling options.
      - Failure snaps the slider **back** to its prior position, shows an inline error link, and emits a danger Toast.
      - Selecting `Apps` with 0 enabled rules is permitted and displays an amber hint dot linking to the Preset App Wall.
-     - Selecting `Apps` or `TUN` while privileged service mode is `Off` opens an anchored `320px` **Inline Auth Popover** (`Allow once (UAC)` / `Install background service (recommended)`) and resumes the capture toggle after approval.
+     - Selecting `Apps` or `TUN` while no session helper is connected opens an anchored `320px` **Inline Auth Popover** (Windows: single GUI-bound `Authorize for this session (UAC)` option with zero background service registration; macOS: `Install background helper` via `launchd`) and resumes the capture toggle after approval.
 
 ### 5.3 Frameless TitleBar (`44px`) Responsive Ladder
 
@@ -268,8 +268,8 @@ Users answer exactly two orthogonal questions:
 
 ### 5.5 Core View Specifications
 - **`AppsView`:**
-  1. Single-row `48px` **Engine & Service Strip** (`--bg-surface` card): engine status + platform subtitle (`WinDivert . Zero-TUN` on Windows, `utun . Path Routing` on macOS), Windows 3-way service mode (`Off | On-Demand | Background Service`) or macOS `launchd Daemon` pill + Install CTA, and overflow menu (`...`).
-  2. **Quiet Recovery Banner** (rendered ONLY on real faults -- HVCI block, missing driver, signature failure, pipe timeout; NEVER on healthy standby). HVCI block MUST provide a one-click `Use all-traffic mode (TUN) instead` fallback. Fault raises amber dots in Sidebar `Apps`, TitleBar `Capture: Apps`, and Tray icon.
+  1. Single-row `48px` **Engine & Service Strip** (`--bg-surface` card): engine status + platform subtitle (`WinDivert . Zero-TUN` on Windows, `utun . Path Routing` on macOS), Windows 2-way GUI-bound helper mode (`Off | On-Demand`, strictly bound to GUI lifetime; zero background SCM service) or macOS `launchd Daemon` pill + Install CTA, and overflow menu (`...`) with 1-click legacy service/driver cleanup.
+  2. **Quiet Recovery Banner** (rendered ONLY on real faults -- legacy service/driver conflict, HVCI block, missing driver, signature failure, helper timeout; NEVER on healthy standby). Legacy conflicts surface even in standby with 1-click `Clean Up & Repair`; HVCI block MUST provide a one-click `Use all-traffic mode (TUN) instead` fallback. Fault raises amber dots in Sidebar `Apps`, TitleBar `Capture: Apps`, and Tray icon.
   3. **Preset App Wall** (`grid-template-columns: repeat(auto-fill, minmax(208px, 1fr))`, `gap: 10px`): 7 fixed presets (`Antigravity`, `Cursor`, `VS Code`, `Git & SSH`, `Discord`, `Telegram`, `Steam`), `92px` card height, neutral initial tile fallback (zero emojis), live detection status, toggle switch, and unified 6-option **Target Selector** (`Follow Routing` / `Main Exit` / `Auto Region` / `Specific Node` / `Direct` / `Reject`). Deleted target nodes auto-fallback to `Follow Routing` with an amber recovery chip.
   4. **Custom Rules Table** (`52px` rows): drag + `Alt+Up/Down` keyboard reorder, inline expandable L4 process + L7 3-state domain override editor (icon + text + color triple-encoding), macOS external child process 1-click `Include` / `Ignore` inline prompt bar.
   5. **Running Process / macOS `.app` Picker Modal (`640px`):** Running Processes + Installed Apps tabs, expandable ancestor process tree (`Antigravity.exe -> language_server -> node.exe`), middle-truncated paths with `title`.

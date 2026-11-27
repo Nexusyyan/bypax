@@ -292,6 +292,8 @@ export interface PrivilegedServiceStatus {
   tunRunning: boolean;
   error?: string | null;
   errorKind?: string | null;
+  legacyServices?: string[];
+  conflictDetail?: string | null;
 }
 
 export interface DriverProbeDto {
@@ -368,7 +370,8 @@ export type ServiceActionKind =
   | "stop"
   | "restart"
   | "start_worker"
-  | "stop_worker";
+  | "stop_worker"
+  | "cleanup_legacy";
 
 export interface AppSettings {
   locale: string;

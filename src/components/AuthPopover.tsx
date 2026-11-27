@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { Loader2, Shield, ShieldCheck } from "lucide-react";
+import { Loader2, ShieldCheck } from "lucide-react";
 import type { Dict } from "../i18n";
 import type { CaptureMode, PlatformKind } from "../types";
 
@@ -71,39 +71,39 @@ export function AuthPopover({
         </div>
       ) : (
         <div className="space-y-2">
-          {!isMac && (
+          {!isMac ? (
             <button
               type="button"
               onClick={onSelectOnce}
-              className="flex w-full items-start gap-2.5 rounded-[10px] border border-[var(--border-strong)] bg-[var(--bg-subtle)] p-2.5 text-left transition-colors hover:bg-[var(--bg-hover)] cursor-pointer"
+              className="flex w-full items-start gap-2.5 rounded-[10px] border border-[var(--border-strong)] bg-[var(--bg-surface)] p-2.5 text-left transition-colors hover:bg-[var(--bg-hover)] cursor-pointer"
             >
-              <Shield className="mt-0.5 h-4 w-4 shrink-0 text-[var(--text-secondary)]" strokeWidth={1.5} />
+              <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent-focus)]" strokeWidth={1.6} />
               <div className="min-w-0">
-                <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
+                <div className="text-[12.5px] font-semibold text-[var(--text-primary)]">
                   {dict.authPopover.once}
                 </div>
-                <div className="text-[11.5px] text-[var(--text-secondary)]">
+                <div className="mt-0.5 text-[11.5px] leading-relaxed text-[var(--text-secondary)]">
                   {dict.authPopover.onceDesc}
                 </div>
               </div>
             </button>
+          ) : (
+            <button
+              type="button"
+              onClick={onSelectInstall}
+              className="flex w-full items-start gap-2.5 rounded-[10px] border border-[var(--border-strong)] bg-[var(--bg-surface)] p-2.5 text-left transition-colors hover:bg-[var(--bg-hover)] cursor-pointer"
+            >
+              <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent-focus)]" strokeWidth={1.6} />
+              <div className="min-w-0">
+                <div className="text-[12.5px] font-semibold text-[var(--text-primary)]">
+                  {dict.service.macInstall}
+                </div>
+                <div className="mt-0.5 text-[11.5px] leading-relaxed text-[var(--text-secondary)]">
+                  {dict.authPopover.macInstallDesc}
+                </div>
+              </div>
+            </button>
           )}
-
-          <button
-            type="button"
-            onClick={onSelectInstall}
-            className="flex w-full items-start gap-2.5 rounded-[10px] border border-[var(--border-strong)] bg-[var(--bg-surface)] p-2.5 text-left transition-colors hover:bg-[var(--bg-hover)] cursor-pointer"
-          >
-            <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent-focus)]" strokeWidth={1.6} />
-            <div className="min-w-0">
-              <div className="text-[12.5px] font-semibold text-[var(--text-primary)]">
-                {isMac ? dict.service.macInstall : dict.authPopover.install}
-              </div>
-              <div className="text-[11.5px] text-[var(--text-secondary)]">
-                {isMac ? dict.authPopover.macInstallDesc : dict.authPopover.installDesc}
-              </div>
-            </div>
-          </button>
 
           <div className="flex justify-end pt-1">
             <button

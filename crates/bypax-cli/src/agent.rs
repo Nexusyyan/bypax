@@ -1,9 +1,7 @@
 use crate::service_cmd::query_os_service_status;
 use anyhow::{anyhow, bail, Result};
 use bypax_appproxy::{AppRuleTestQuery, ProcessTracker, RuleEngine, SnapshotProcessTracker};
-use bypax_core::compiler::{
-    build_app_proxy_target_bindings, CompileInput, CompilePlatform, SingBox114Compiler,
-};
+use bypax_core::compiler::build_app_proxy_target_bindings;
 use bypax_core::core_manager::CoreManager;
 use bypax_core::model::{AppProxyRule, CaptureMode, NodeIR, RouteMode};
 use bypax_core::netguard::NetGuard;
@@ -242,62 +240,14 @@ impl AgentClient {
                 "ok": true,
                 "controlMode": "offline",
                 "coreRunning": false,
-                "message": "GUI is closed and no privileged core was running"
+                "message": "GUI is closed and no proxy core was running"
             }));
         }
 
-        let core_mgr = CoreManager::new(self.paths.core_dir.clone());
-        let bin = core_mgr
-            .resolve_binary_path()
-            .ok_or_else(|| anyhow!("CORE_NOT_INSTALLED"))?;
-        let store = self.open_store()?;
-        let nodes = store.list_nodes()?;
-        let rules = store.list_rules()?;
-        let app_rules = store.list_app_proxy_rules()?;
-        let extra_ports = store.list_inbound_ports()?;
-        let settings = store.load_settings()?;
-        let rule_cache = RuleCache::new(self.paths.rule_sets_dir.clone());
-        let cache_db = self.paths.runtime_dir.join("cache.db");
-        let secret = bypax_ipc::generate_session_token();
-
-        let compiled = SingBox114Compiler::compile(&CompileInput {
-            nodes: &nodes,
-            rules: &rules,
-            app_rules: &app_rules,
-            extra_ports: &extra_ports,
-            settings: &settings,
-            control_secret: &secret,
-            cache_db_path: Some(&cache_db),
-            rule_cache: Some(&rule_cache),
-            platform: CompilePlatform::current(),
-        })?;
-        let preflight = SingBox114Compiler::preflight_check(&bin, &compiled.config)?;
-        if !preflight.ok {
-            bail!("Preflight check failed: {}", preflight.stderr);
-        }
-
-        let Some(resp) = self
-            .try_service(ServiceCommand::StartCore {
-                sing_box_path: bin.to_string_lossy().to_string(),
-                config_json: serde_json::to_string(&compiled.config)?,
-                tun_mode: settings.tun_enabled,
-            })
-            .await
-        else {
-            bail!("Bypax GUI is not running and bypax-service is unreachable; launch Bypax or start BypaxService");
-        };
-
-        if !resp.ok {
-            bail!("{}", resp.message);
-        }
-
-        Ok(json!({
-            "ok": true,
-            "controlMode": "offline",
-            "coreRunning": true,
-            "corePid": resp.core_pid,
-            "message": resp.message
-        }))
+        bail!(
+            "GUI_NOT_RUNNING: Bypax GUI must be open to start the proxy core. \
+             Launch Bypax first so proxy lifecycle stays bound to the GUI."
+        );
     }
 
     fn offline_set_mode(&self, mode_raw: &str) -> Result<Value> {
@@ -315,20 +265,22 @@ impl AgentClient {
     }
 
     fn offline_toggle_system_proxy(&self, enabled: bool) -> Result<Value> {
+        if enabled {
+            bail!(
+                "GUI_NOT_RUNNING: Refusing to enable OS system proxy while Bypax GUI is closed \
+                 because the local proxy core is not running. Launch Bypax first."
+            );
+        }
         let store = self.open_store()?;
         let mut settings = store.load_settings()?;
-        settings.system_proxy_enabled = enabled;
+        settings.system_proxy_enabled = false;
         store.save_settings(&settings)?;
         let guard = NetGuard::new(&self.paths.runtime_dir);
-        if enabled {
-            guard.enable_system_proxy("127.0.0.1", settings.mixed_port)?;
-        } else {
-            guard.disable_system_proxy()?;
-        }
+        guard.disable_system_proxy()?;
         Ok(json!({
             "ok": true,
             "controlMode": "offline",
-            "systemProxyEnabled": enabled,
+            "systemProxyEnabled": false,
             "mixedPort": settings.mixed_port,
             "netguardArmed": guard.is_armed()
         }))
@@ -347,39 +299,34 @@ impl AgentClient {
     async fn offline_set_capture_mode(&self, raw: &str) -> Result<Value> {
         let mode = CaptureMode::parse(raw)
             .ok_or_else(|| anyhow!("Invalid capture mode '{raw}': expected off, apps, or tun"))?;
+        if mode != CaptureMode::Off {
+            bail!(
+                "GUI_NOT_RUNNING: Launch Bypax GUI to activate {} capture. \
+                 Live proxy and per-app capture are strictly bound to the GUI lifecycle.",
+                mode.as_str()
+            );
+        }
         let store = self.open_store()?;
         let mut settings = store.load_settings()?;
-        match mode {
-            CaptureMode::Off => {
-                settings.app_proxy_enabled = false;
-                settings.tun_enabled = false;
-            }
-            CaptureMode::Apps => {
-                settings.app_proxy_enabled = true;
-                settings.tun_enabled = false;
-            }
-            CaptureMode::Tun => {
-                settings.app_proxy_enabled = false;
-                settings.tun_enabled = true;
-            }
-        }
+        settings.app_proxy_enabled = false;
+        settings.tun_enabled = false;
         store.save_settings(&settings)?;
 
         let mut service_synced = false;
-        if mode == CaptureMode::Off {
-            if let Some(r) = self.try_service(ServiceCommand::StopAppProxy).await {
-                service_synced |= r.ok;
-            }
+        if let Some(r) = self.try_service(ServiceCommand::StopAppProxy).await {
+            service_synced |= r.ok;
+        }
+        if let Some(r) = self.try_service(ServiceCommand::StopCore).await {
+            service_synced |= r.ok;
         }
 
         Ok(json!({
             "ok": true,
             "controlMode": "offline",
-            "captureMode": mode.as_str(),
-            "appProxyEnabled": settings.app_proxy_enabled,
-            "tunEnabled": settings.tun_enabled,
-            "serviceSynced": service_synced,
-            "note": "Persisted to SQLite WAL; launch Bypax GUI to activate live runtime capture"
+            "captureMode": "off",
+            "appProxyEnabled": false,
+            "tunEnabled": false,
+            "serviceSynced": service_synced
         }))
     }
 
@@ -672,6 +619,7 @@ impl AgentClient {
                 "installed": os_svc.installed,
                 "running": os_svc.running,
                 "state": os_svc.state,
+                "legacyServices": os_svc.legacy_services,
                 "plane1Connected": svc_connected,
                 "servicePid": svc_ping.as_ref().and_then(|r| r.service_pid),
                 "elevated": svc_ping.as_ref().and_then(|r| r.elevated).unwrap_or(false)

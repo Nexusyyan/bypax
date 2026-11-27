@@ -435,5 +435,18 @@ describe("Bypax frontend utilities, brand hygiene & i18n parity", () => {
         serviceStatus: { ...activeService, errorKind: "pipe_timeout" },
       }),
     ).toBe("pipe_timeout");
+
+    // Legacy service conflict surfaces even during standby so users can clean up in one click
+    expect(normalizeRecoveryFaultKind("legacy_conflict")).toBe("legacy_conflict");
+    expect(
+      resolveActiveRecoveryFault({
+        captureMode: "off",
+        serviceStatus: {
+          ...standbyService,
+          legacyServices: ["BypaxService"],
+          errorKind: "legacy_conflict",
+        },
+      }),
+    ).toBe("legacy_conflict");
   });
 });

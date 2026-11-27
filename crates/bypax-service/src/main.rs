@@ -1,4 +1,5 @@
 use anyhow::Result;
+use bypax_core::netguard::NetGuard;
 use bypax_core::storage::DataPaths;
 use bypax_ipc::{
     default_svc_endpoint, resolve_or_create_ipc_token, PipeAclMode, ServiceIpcServer,
@@ -6,12 +7,12 @@ use bypax_ipc::{
 use bypax_service::controller::ServiceController;
 use bypax_service::platform_svc;
 use clap::{Parser, Subcommand};
-use std::time::Duration;
+use std::path::PathBuf;
 use tokio::sync::oneshot;
 use tracing::info;
 
 #[derive(Parser, Debug)]
-#[command(name = "bypax-service", about = "Bypax privileged proxy & app-routing daemon")]
+#[command(name = "bypax-service", about = "Bypax privileged proxy & app-routing helper")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -19,9 +20,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Windows Service Control Manager entry point (`BypaxService`).
+    /// Legacy Windows Service Control Manager entry point (`BypaxService`).
     ServiceRun,
-    /// On-demand elevated worker bound to a parent GUI PID (exits when parent terminates).
+    /// On-demand elevated worker strictly bound to a parent GUI PID (exits in 0ms when GUI terminates).
     WorkerRun {
         #[arg(long)]
         parent_pid: u32,
@@ -29,6 +30,10 @@ enum Commands {
         endpoint: Option<String>,
         #[arg(long)]
         token: Option<String>,
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        #[arg(long)]
+        runtime_dir: Option<PathBuf>,
     },
     /// Foreground / macOS launchd LaunchDaemon run loop.
     DaemonRun {
@@ -38,15 +43,27 @@ enum Commands {
         endpoint: Option<String>,
         #[arg(long)]
         token: Option<String>,
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        #[arg(long)]
+        runtime_dir: Option<PathBuf>,
     },
-    /// Installs the Windows Service (`BypaxService`) or macOS LaunchDaemon.
+    /// Cleans up legacy persistent Windows services (`BypaxService`/`BypathService`), stale
+    /// WinDivert driver locks, and optionally restores NetGuard system proxy state.
+    CleanupLegacy {
+        #[arg(long)]
+        runtime_dir: Option<PathBuf>,
+    },
+    /// Installs the macOS LaunchDaemon (`com.bypax.service`). Disabled on Windows.
     Install {
         #[arg(long)]
         autostart: bool,
+        #[arg(long)]
+        start: bool,
     },
-    /// Uninstalls the Windows Service or macOS LaunchDaemon.
+    /// Uninstalls any legacy Windows Service or macOS LaunchDaemon.
     Uninstall,
-    /// Starts the installed service.
+    /// Starts the installed service (macOS).
     Start,
     /// Stops the installed service.
     Stop,
@@ -69,31 +86,67 @@ fn main() -> Result<()> {
         parent_pid: None,
         endpoint: None,
         token: None,
+        token_file: None,
+        runtime_dir: None,
     }) {
         Commands::ServiceRun => platform_svc::run_windows_service(),
         Commands::WorkerRun {
             parent_pid,
             endpoint,
             token,
+            token_file,
+            runtime_dir,
         } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(run_daemon_loop(endpoint, Some(parent_pid), token))
+            rt.block_on(run_daemon_loop(
+                endpoint,
+                Some(parent_pid),
+                token,
+                token_file,
+                runtime_dir,
+            ))
         }
         Commands::DaemonRun {
             parent_pid,
             endpoint,
             token,
+            token_file,
+            runtime_dir,
         } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(run_daemon_loop(endpoint, parent_pid, token))
+            rt.block_on(run_daemon_loop(
+                endpoint,
+                parent_pid,
+                token,
+                token_file,
+                runtime_dir,
+            ))
         }
-        Commands::Install { autostart } => {
+        Commands::CleanupLegacy { runtime_dir } => {
+            let mut actions = platform_svc::cleanup_legacy_services_and_driver()?;
+            if let Some(rt_dir) = runtime_dir {
+                let guard = NetGuard::new(&rt_dir);
+                if guard.disable_system_proxy().is_ok() {
+                    actions.push("restored:netguard".to_string());
+                }
+            }
+            if actions.is_empty() {
+                println!("No legacy services or stale driver locks found");
+            } else {
+                println!("Cleaned up legacy state: {}", actions.join(", "));
+            }
+            Ok(())
+        }
+        Commands::Install { autostart, start } => {
             let exe = std::env::current_exe()?;
             platform_svc::install(&exe, autostart)?;
+            if start {
+                platform_svc::start()?;
+            }
             println!("Installed Bypax privileged service");
             Ok(())
         }
@@ -142,39 +195,59 @@ async fn run_daemon_loop(
     endpoint_override: Option<String>,
     parent_pid: Option<u32>,
     token_override: Option<String>,
+    token_file: Option<PathBuf>,
+    runtime_dir_override: Option<PathBuf>,
 ) -> Result<()> {
-    let paths = DataPaths::resolve()?;
-    let token = token_override
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| resolve_or_create_ipc_token(Some(&paths.runtime_dir)));
-    let controller = ServiceController::new(&paths, token);
+    let runtime_dir = match runtime_dir_override {
+        Some(dir) => {
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        }
+        None => DataPaths::resolve()?.runtime_dir,
+    };
+
+    let file_token = token_file.and_then(|tf| {
+        let raw = std::fs::read_to_string(&tf).ok();
+        // Immediately delete ephemeral one-shot token file once loaded into memory.
+        let _ = std::fs::remove_file(&tf);
+        raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    });
+
+    let token = file_token
+        .or_else(|| token_override.filter(|t| !t.trim().is_empty()))
+        .unwrap_or_else(|| resolve_or_create_ipc_token(Some(&runtime_dir)));
+
+    let controller = ServiceController::new_with_runtime_dir(runtime_dir, token);
+    if let Some(ppid) = parent_pid {
+        controller.set_gui_pid(ppid);
+    }
     let _watchdog = controller.spawn_watchdog();
 
     let endpoint = endpoint_override.unwrap_or_else(default_svc_endpoint);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    // If running as an on-demand elevated worker, watch the parent GUI PID and tear down
-    // cleanly the moment the GUI exits or crashes.
+    // If running as an on-demand elevated worker, pin a kernel handle on the parent GUI PID
+    // so GUI exit or crash triggers 0ms cleanup of WinDivert, TUN, and user NetGuard proxy.
     if let Some(ppid) = parent_pid {
+        let (exit_tx, exit_rx) = oneshot::channel::<()>();
+        std::thread::Builder::new()
+            .name("bypax-parent-watch".into())
+            .spawn(move || {
+                platform_svc::wait_for_process_exit(ppid);
+                let _ = exit_tx.send(());
+            })?;
+
         let ctrl_watch = controller.clone();
-        let tx_slot = std::sync::Arc::new(std::sync::Mutex::new(Some(shutdown_tx)));
-        let tx_watch = tx_slot.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(2));
-            loop {
-                interval.tick().await;
-                if !platform_svc::is_parent_alive(ppid) {
-                    info!(parent_pid = ppid, "parent GUI process exited; shutting down worker");
-                    ctrl_watch.stop_all_and_restore().await;
-                    if let Ok(mut g) = tx_watch.lock() {
-                        if let Some(tx) = g.take() {
-                            let _ = tx.send(());
-                        }
-                    }
-                    break;
-                }
-            }
+            let _ = exit_rx.await;
+            info!(
+                parent_pid = ppid,
+                "parent GUI process exited; tearing down capture and restoring network"
+            );
+            ctrl_watch.stop_all_and_restore().await;
+            let _ = shutdown_tx.send(());
         });
+
         let server = ServiceIpcServer::new(endpoint, PipeAclMode::PrivilegedService, controller.clone());
         server.run(shutdown_rx).await?;
         controller.stop_all_and_restore().await;

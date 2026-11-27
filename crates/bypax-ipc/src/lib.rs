@@ -57,6 +57,24 @@ pub fn default_svc_endpoint() -> String {
     }
 }
 
+/// Builds a per-GUI-session Plane 1 IPC endpoint for the GUI-bound elevated worker.
+/// Scoping the endpoint to `(gui_pid, nonce)` prevents collisions with legacy services
+/// or stale crashed instances and eliminates cross-account token split-brain.
+pub fn worker_svc_endpoint(runtime_dir: &Path, gui_pid: u32, nonce: &str) -> String {
+    #[cfg(windows)]
+    {
+        let _ = runtime_dir;
+        format!(r"\\.\pipe\bypax-worker-{}-{}", gui_pid, nonce)
+    }
+    #[cfg(not(windows))]
+    {
+        runtime_dir
+            .join(format!("bypax-worker-{}-{}.sock", gui_pid, nonce))
+            .to_string_lossy()
+            .to_string()
+    }
+}
+
 pub fn default_ctl_endpoint(runtime_dir: &Path) -> String {
     #[cfg(windows)]
     {
@@ -73,29 +91,44 @@ pub fn default_ctl_endpoint(runtime_dir: &Path) -> String {
 }
 
 /// Returns candidate paths for the persisted Plane 1 shared IPC token file.
+///
+/// The machine-wide shared path (`%ProgramData%\Bypax\ipc.token` on Windows,
+/// `/var/run/bypax-svc.token` on Unix) MUST come before any per-user `runtime_dir`
+/// so a privileged service running as `LocalSystem` or `root` shares the exact same
+/// token file as non-elevated desktop GUI and CLI processes.
 pub fn ipc_token_candidates(runtime_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Some(dir) = runtime_dir {
-        out.push(dir.join("ipc.token"));
-    }
     #[cfg(windows)]
     {
         if let Ok(program_data) = std::env::var("ProgramData") {
-            out.push(PathBuf::from(program_data).join("Bypax").join("ipc.token"));
+            let trimmed = program_data.trim();
+            if !trimmed.is_empty() {
+                out.push(PathBuf::from(trimmed).join("Bypax").join("ipc.token"));
+            }
         }
     }
     #[cfg(not(windows))]
     {
         out.push(PathBuf::from("/var/run/bypax-svc.token"));
+    }
+    if let Some(dir) = runtime_dir {
+        let cand = dir.join("ipc.token");
+        if !out.contains(&cand) {
+            out.push(cand);
+        }
+    }
+    #[cfg(not(windows))]
+    {
         if let Ok(home) = std::env::var("HOME") {
-            out.push(
-                PathBuf::from(home)
-                    .join("Library")
-                    .join("Application Support")
-                    .join("Bypax")
-                    .join("runtime")
-                    .join("ipc.token"),
-            );
+            let cand = PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("Bypax")
+                .join("runtime")
+                .join("ipc.token");
+            if !out.contains(&cand) {
+                out.push(cand);
+            }
         }
     }
     out
@@ -173,5 +206,35 @@ mod tests {
         let dec_ctl: CtlEnvelope =
             serde_json::from_str(&enc_ctl).expect("deserialize ctl envelope");
         assert_eq!(dec_ctl, ctl);
+    }
+
+    #[test]
+    fn ipc_token_candidates_prefers_shared_system_path_before_user_runtime_dir() {
+        let user_dir = PathBuf::from("custom-user-runtime");
+        let cands = ipc_token_candidates(Some(&user_dir));
+        assert!(cands.len() >= 2);
+        #[cfg(windows)]
+        {
+            let first = cands[0].to_string_lossy().to_ascii_lowercase();
+            assert!(
+                first.ends_with(r"\bypax\ipc.token"),
+                "expected ProgramData shared path first, got {first}"
+            );
+            assert_eq!(cands[1], user_dir.join("ipc.token"));
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(cands[0], PathBuf::from("/var/run/bypax-svc.token"));
+            assert_eq!(cands[1], user_dir.join("ipc.token"));
+        }
+    }
+
+    #[test]
+    fn worker_svc_endpoint_is_scoped_to_gui_session() {
+        let rt = PathBuf::from("rt");
+        let ep = worker_svc_endpoint(&rt, 4242, "abcd1234");
+        assert!(ep.contains("4242") && ep.contains("abcd1234"));
+        #[cfg(windows)]
+        assert_eq!(ep, r"\\.\pipe\bypax-worker-4242-abcd1234");
     }
 }

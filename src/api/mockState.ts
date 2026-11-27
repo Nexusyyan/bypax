@@ -56,6 +56,7 @@ export type PreviewScenario =
   | "empty"
   | "hvci"
   | "missing-driver"
+  | "legacy-conflict"
   | "service-off"
   | "uac-cancel"
   | "macos"
@@ -69,6 +70,7 @@ function readScenario(): PreviewScenario {
     raw === "empty" ||
     raw === "hvci" ||
     raw === "missing-driver" ||
+    raw === "legacy-conflict" ||
     raw === "service-off" ||
     raw === "uac-cancel" ||
     raw === "macos" ||
@@ -214,6 +216,7 @@ const MOCK_NODES: NodeIR[] = [
     wgLocalAddress: [],
     tcpingMs: 38,
     realDelayMs: 64,
+    rawUri: "vless://11111111-1111-1111-1111-111111111111@tokyo02.edge-relay.example:443?security=reality#JP%20Tokyo-02%20Direct-IPLC",
     createdAt: "2026-11-26T00:00:00Z",
   },
   {
@@ -227,6 +230,7 @@ const MOCK_NODES: NodeIR[] = [
     wgLocalAddress: [],
     tcpingMs: 24,
     realDelayMs: 42,
+    rawUri: "hysteria2://samplepass@hk01.edge-relay.example:8443?sni=hk01.edge-relay.example#HK%20Kowloon-01",
     createdAt: "2026-11-26T00:00:00Z",
   },
   {
@@ -770,20 +774,21 @@ function ensureInit(): void {
     netguardRecoveredFromCrash: false,
   };
 
-  const serviceOff = sc === "service-off" || sc === "uac-cancel";
+  const legacyConflict = sc === "legacy-conflict";
+  const serviceOff = sc === "service-off" || sc === "uac-cancel" || legacyConflict;
   store.captureMode = sc === "empty" || serviceOff ? "off" : "apps";
   store.settings.systemProxyEnabled = sc !== "empty";
   store.settings.appProxyEnabled = store.captureMode === "apps";
   store.settings.tunEnabled = false;
   store.settings.mainNodeId = sc === "empty" ? null : "n-jp-02";
-  store.settings.serviceMode = serviceOff ? "off" : "service";
+  store.settings.serviceMode = serviceOff ? "off" : isMac ? "service" : "elevated_worker";
 
   const hvci = sc === "hvci";
   const missingDriver = sc === "missing-driver";
   store.serviceStatus = {
     platform: store.platform,
     mode: store.settings.serviceMode,
-    installed: !serviceOff,
+    installed: isMac ? !serviceOff : false,
     running: !serviceOff,
     connected: !serviceOff,
     elevated: !serviceOff,
@@ -791,12 +796,24 @@ function ensureInit(): void {
     servicePid: serviceOff ? null : 3288,
     appProxyRunning: store.captureMode === "apps" && !hvci && !missingDriver,
     tunRunning: false,
-    error: hvci
-      ? "Windows Security or Memory Integrity prevented WinDivert64.sys from loading."
-      : missingDriver
-        ? "WinDivert.dll or WinDivert64.sys is missing from runtime/windivert."
-        : null,
-    errorKind: hvci ? "hvci_blocked" : missingDriver ? "driver_missing" : null,
+    error: legacyConflict
+      ? "Legacy background services detected: BypaxService"
+      : hvci
+        ? "Windows Security or Memory Integrity prevented WinDivert64.sys from loading."
+        : missingDriver
+          ? "WinDivert.dll or WinDivert64.sys is missing from runtime/windivert."
+          : null,
+    errorKind: legacyConflict
+      ? "legacy_conflict"
+      : hvci
+        ? "hvci_blocked"
+        : missingDriver
+          ? "driver_missing"
+          : null,
+    legacyServices: legacyConflict ? ["BypaxService"] : [],
+    conflictDetail: legacyConflict
+      ? "Legacy background services detected: BypaxService"
+      : null,
   };
 
   store.driverStatus = {
@@ -1134,7 +1151,7 @@ export const mockBackend = {
 
   setCaptureMode(mode: CaptureMode): SetCaptureModeResult {
     ensureInit();
-    if (mode !== "off" && store.serviceStatus.mode === "off") {
+    if (mode !== "off" && (!store.serviceStatus.connected || store.serviceStatus.mode === "off")) {
       throw new Error("SERVICE_OFF");
     }
     store.captureMode = mode;
@@ -1195,6 +1212,32 @@ export const mockBackend = {
         error: null,
         errorKind: null,
       };
+    } else if (action === "cleanup_legacy") {
+      store.settings.serviceMode = "off";
+      store.captureMode = "off";
+      store.settings.appProxyEnabled = false;
+      store.settings.tunEnabled = false;
+      store.serviceStatus = {
+        ...store.serviceStatus,
+        mode: "off",
+        installed: false,
+        running: false,
+        connected: false,
+        elevated: false,
+        state: "stopped",
+        servicePid: null,
+        appProxyRunning: false,
+        tunRunning: false,
+        error: null,
+        errorKind: null,
+        legacyServices: [],
+        conflictDetail: null,
+      };
+      store.driverStatus.error = null;
+      store.driverStatus.errorKind = null;
+      store.appProxyStatus.running = false;
+      store.appProxyStatus.lastError = null;
+      store.appProxyStatus.errorKind = null;
     } else if (action === "stop" || action === "stop_worker" || action === "uninstall") {
       store.settings.serviceMode = "off";
       store.captureMode = "off";
@@ -1683,7 +1726,13 @@ export const mockBackend = {
 
   restoreNetguardNow(): CoreInfo {
     ensureInit();
+    store.captureMode = "off";
     store.settings.systemProxyEnabled = false;
+    store.settings.appProxyEnabled = false;
+    store.settings.tunEnabled = false;
+    store.serviceStatus.appProxyRunning = false;
+    store.serviceStatus.tunRunning = false;
+    store.appProxyStatus.running = false;
     store.coreInfo.netguardArmed = false;
     return { ...store.coreInfo };
   },

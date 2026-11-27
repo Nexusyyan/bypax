@@ -2248,20 +2248,29 @@ pub fn clear_logs(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn restore_netguard_now(
+pub async fn restore_netguard_now(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CoreInfo, String> {
+    if state.current_capture_mode() != CaptureMode::Off {
+        let _ = state.apply_capture_mode(CaptureMode::Off).await;
+    }
     if let Ok(guard) = state.netguard.lock() {
         guard.disable_system_proxy().map_err(|e| e.to_string())?;
     }
     if let Ok(store) = state.store.lock() {
         if let Ok(mut settings) = store.load_settings() {
             settings.system_proxy_enabled = false;
+            settings.app_proxy_enabled = false;
+            settings.tun_enabled = false;
             let _ = store.save_settings(&settings);
         }
     }
-    state.push_log("INFO", "netguard: manual OS proxy restoration completed");
+    tray::update_tray_icon_state(&app, false, false);
+    state.push_log(
+        "INFO",
+        "netguard: manual network recovery disabled system proxy and active capture",
+    );
     notify_sync(&app);
     Ok(state.build_core_info())
 }

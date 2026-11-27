@@ -16,9 +16,10 @@ use bypax_core::updater::{
     take_last_update_result, AppUpdateCheckReport, AppUpdateState, UpdateApplyResult,
 };
 use bypax_ipc::{
-    default_svc_endpoint, generate_session_token, resolve_or_create_ipc_token,
-    send_service_request, AppProxyRuleWire, AppProxyStartConfig, AppProxyStatusDto, DriverProbeDto,
-    FlowOriginDto, ServiceCommand, ServiceEnvelope, ServiceResponse,
+    default_svc_endpoint, generate_session_token, load_ipc_token, resolve_or_create_ipc_token,
+    send_service_request, worker_svc_endpoint, AppProxyRuleWire, AppProxyStartConfig,
+    AppProxyStatusDto, DriverProbeDto, FlowOriginDto, ServiceCommand, ServiceEnvelope,
+    ServiceResponse,
 };
 use bypax_windivert::probe_windivert;
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,10 @@ pub struct PrivilegedServiceStatus {
     pub service_pid: Option<u32>,
     pub app_proxy_running: bool,
     pub tun_running: bool,
+    #[serde(default)]
+    pub legacy_services: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_detail: Option<String>,
     pub error: Option<String>,
     pub error_kind: Option<String>,
 }
@@ -162,7 +167,7 @@ pub struct AppState {
     pub supervisor: Mutex<CoreSupervisor>,
     pub logs: Arc<Mutex<LogRing>>,
     pub control_secret: String,
-    pub ipc_token: String,
+    pub ipc_token: Mutex<String>,
     pub service_endpoint: String,
     pub process_tracker: Arc<SnapshotProcessTracker>,
     pub core_via_service: AtomicBool,
@@ -232,8 +237,18 @@ impl AppState {
         let core_manager = CoreManager::new(paths.core_dir.clone());
         let supervisor = CoreSupervisor::new(paths.runtime_dir.clone(), Arc::clone(&logs));
         let control_secret = generate_session_token();
-        let ipc_token = resolve_or_create_ipc_token(Some(&paths.runtime_dir));
-        let service_endpoint = default_svc_endpoint();
+        let (ipc_token, service_endpoint) = if cfg!(target_os = "windows") {
+            // Windows uses an ephemeral per-GUI-session named pipe + random token strictly
+            // bound to this GUI PID (zero SCM registration, zero cross-account token split).
+            let nonce = uuid::Uuid::new_v4().simple().to_string();
+            let ep = worker_svc_endpoint(&paths.runtime_dir, std::process::id(), &nonce[..8]);
+            (generate_session_token(), ep)
+        } else {
+            (
+                resolve_or_create_ipc_token(Some(&paths.runtime_dir)),
+                default_svc_endpoint(),
+            )
+        };
         let process_tracker = Arc::new(SnapshotProcessTracker::new(Duration::from_millis(800)));
 
         Ok(Self {
@@ -247,7 +262,7 @@ impl AppState {
             supervisor: Mutex::new(supervisor),
             logs,
             control_secret,
-            ipc_token,
+            ipc_token: Mutex::new(ipc_token),
             service_endpoint,
             process_tracker,
             core_via_service: AtomicBool::new(false),
@@ -517,49 +532,236 @@ impl AppState {
         self.probe_windivert(custom_dir)
     }
 
+    pub fn current_ipc_token(&self) -> String {
+        if cfg!(target_os = "windows") {
+            return self
+                .ipc_token
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+        }
+        if let Some(disk_token) = load_ipc_token(Some(&self.paths.runtime_dir)) {
+            if let Ok(mut guard) = self.ipc_token.lock() {
+                if *guard != disk_token {
+                    *guard = disk_token.clone();
+                }
+            }
+            return disk_token;
+        }
+        self.ipc_token
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    fn persist_service_mode(&self, mode: &str) {
+        if let Ok(store) = self.store.lock() {
+            if let Ok(mut settings) = store.load_settings() {
+                if settings.service_mode != mode {
+                    settings.service_mode = mode.to_string();
+                    let _ = store.save_settings(&settings);
+                }
+            }
+        }
+    }
+
     pub async fn service_request(
         &self,
         cmd: ServiceCommand,
         timeout: Duration,
     ) -> Result<ServiceResponse, String> {
+        let token = self.current_ipc_token();
         let env = ServiceEnvelope {
             id: uuid::Uuid::new_v4().simple().to_string(),
-            session_token: self.ipc_token.clone(),
-            command: cmd,
+            session_token: token.clone(),
+            command: cmd.clone(),
         };
-        send_service_request(&self.service_endpoint, &env, timeout)
+        let resp = send_service_request(&self.service_endpoint, &env, timeout)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if !cfg!(target_os = "windows")
+            && !resp.ok
+            && resp.message.to_ascii_lowercase().contains("unauthorized")
+        {
+            if let Some(fresh_token) = load_ipc_token(Some(&self.paths.runtime_dir)) {
+                if fresh_token != token {
+                    if let Ok(mut guard) = self.ipc_token.lock() {
+                        *guard = fresh_token.clone();
+                    }
+                    let retry_env = ServiceEnvelope {
+                        id: uuid::Uuid::new_v4().simple().to_string(),
+                        session_token: fresh_token,
+                        command: cmd,
+                    };
+                    return send_service_request(&self.service_endpoint, &retry_env, timeout)
+                        .await
+                        .map_err(|e| e.to_string());
+                }
+            }
+        }
+        Ok(resp)
     }
 
-    pub async fn send_service_heartbeat(&self) {
+    /// Sends a heartbeat to the active privileged helper and returns `true` if the helper
+    /// disconnected unexpectedly so callers can sync UI state immediately.
+    pub async fn send_service_heartbeat(&self) -> bool {
         let active = self.core_via_service.load(Ordering::Relaxed)
             || self.app_proxy_active.load(Ordering::Relaxed)
             || self.tun_active.load(Ordering::Relaxed);
         if !active {
-            return;
+            return false;
         }
-        let _ = self
-            .service_request(
+        let ok = matches!(
+            self.service_request(
                 ServiceCommand::Heartbeat {
                     gui_pid: std::process::id(),
                 },
                 Duration::from_millis(800),
             )
-            .await;
+            .await,
+            Ok(resp) if resp.ok
+        );
+        if ok {
+            return false;
+        }
+        // Single quick retry before declaring helper lost.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let retry_ok = matches!(
+            self.service_request(
+                ServiceCommand::Heartbeat {
+                    gui_pid: std::process::id(),
+                },
+                Duration::from_millis(800),
+            )
+            .await,
+            Ok(resp) if resp.ok
+        );
+        if !retry_ok {
+            self.core_via_service.store(false, Ordering::Relaxed);
+            self.app_proxy_active.store(false, Ordering::Relaxed);
+            self.tun_active.store(false, Ordering::Relaxed);
+            self.push_log(
+                "WARN",
+                "helper: privileged helper disconnected; reset active capture state to off",
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Inspects Windows SCM (read-only) for legacy persistent services (`BypaxService`,
+    /// active/enabled `BypathService`) or an externally locked `WinDivert` kernel driver.
+    pub fn detect_windows_conflicts(&self, own_app_proxy_running: bool) -> (Vec<String>, Option<String>) {
+        #[cfg(target_os = "windows")]
+        {
+            use windows::core::PCWSTR;
+            use windows::Win32::System::Services::{
+                CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceConfigW,
+                QueryServiceStatus, QUERY_SERVICE_CONFIGW, SC_MANAGER_CONNECT, SERVICE_DISABLED,
+                SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START_PENDING,
+                SERVICE_STATUS, SERVICE_STOP_PENDING,
+            };
+
+            fn wide(s: &str) -> Vec<u16> {
+                s.encode_utf16().chain(std::iter::once(0)).collect()
+            }
+
+            let mut legacy = Vec::new();
+            let mut detail: Option<String> = None;
+
+            unsafe {
+                let Ok(scm) = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT)
+                else {
+                    return (legacy, detail);
+                };
+
+                for name in ["BypaxService", "BypathService"] {
+                    let w = wide(name);
+                    let Ok(svc) = OpenServiceW(
+                        scm,
+                        PCWSTR(w.as_ptr()),
+                        SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG,
+                    ) else {
+                        continue;
+                    };
+                    let mut st = SERVICE_STATUS::default();
+                    let running = QueryServiceStatus(svc, &mut st).is_ok()
+                        && (st.dwCurrentState == SERVICE_RUNNING
+                            || st.dwCurrentState == SERVICE_START_PENDING);
+                    let mut disabled = false;
+                    let mut needed = 0u32;
+                    let _ = QueryServiceConfigW(svc, None, 0, &mut needed);
+                    if needed > 0 {
+                        let mut buf = vec![0u8; needed as usize];
+                        if QueryServiceConfigW(
+                            svc,
+                            Some(buf.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW),
+                            needed,
+                            &mut needed,
+                        )
+                        .is_ok()
+                        {
+                            let cfg = &*(buf.as_ptr() as *const QUERY_SERVICE_CONFIGW);
+                            disabled = cfg.dwStartType == SERVICE_DISABLED;
+                        }
+                    }
+                    let _ = CloseServiceHandle(svc);
+
+                    if name == "BypaxService" || running || !disabled {
+                        legacy.push(name.to_string());
+                    }
+                }
+
+                // Check if WinDivert kernel driver service is externally locked or stuck deleting.
+                let wd_w = wide("WinDivert");
+                if let Ok(wd_svc) = OpenServiceW(
+                    scm,
+                    PCWSTR(wd_w.as_ptr()),
+                    SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG,
+                ) {
+                    let mut st = SERVICE_STATUS::default();
+                    if QueryServiceStatus(wd_svc, &mut st).is_ok() {
+                        if st.dwCurrentState == SERVICE_STOP_PENDING {
+                            detail = Some(
+                                "WinDivert kernel driver is pending unload from another process"
+                                    .to_string(),
+                            );
+                        } else if !own_app_proxy_running
+                            && (st.dwCurrentState == SERVICE_RUNNING
+                                || st.dwCurrentState == SERVICE_START_PENDING)
+                        {
+                            detail = Some(
+                                "WinDivert kernel driver is currently held by another service or process"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    let _ = CloseServiceHandle(wd_svc);
+                }
+
+                let _ = CloseServiceHandle(scm);
+            }
+
+            if detail.is_none() && !legacy.is_empty() {
+                detail = Some(format!(
+                    "Legacy background proxy service detected: {}",
+                    legacy.join(", ")
+                ));
+            }
+            (legacy, detail)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = own_app_proxy_running;
+            (Vec::new(), None)
+        }
     }
 
     pub fn is_service_installed_on_os(&self) -> bool {
         #[cfg(target_os = "windows")]
         {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            std::process::Command::new("sc.exe")
-                .args(["query", "BypaxService"])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
+            // Windows uses the GUI-bound on-demand helper (`worker-run`), not an SCM service.
+            false
         }
         #[cfg(target_os = "macos")]
         {
@@ -571,29 +773,6 @@ impl AppState {
         }
     }
 
-    pub fn is_service_running_on_os(&self) -> bool {
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            std::process::Command::new("sc.exe")
-                .args(["query", "BypaxService"])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()
-                .map(|o| {
-                    o.status.success()
-                        && String::from_utf8_lossy(&o.stdout)
-                            .to_ascii_uppercase()
-                            .contains("RUNNING")
-                })
-                .unwrap_or(false)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            false
-        }
-    }
-
     pub async fn query_service_status(&self) -> PrivilegedServiceStatus {
         let (mode, capture_requested) = self
             .store
@@ -601,7 +780,7 @@ impl AppState {
             .ok()
             .and_then(|s| s.load_settings().ok())
             .map(|s| (s.service_mode, s.app_proxy_enabled || s.tun_enabled))
-            .unwrap_or_else(|| ("auto".to_string(), false));
+            .unwrap_or_else(|| ("off".to_string(), false));
         let installed = self.is_service_installed_on_os();
 
         let ping = self
@@ -640,13 +819,32 @@ impl AppState {
                     self.app_proxy_active.store(mac_apps, Ordering::Relaxed);
                 }
 
+                let (legacy_services, conflict_detail) =
+                    self.detect_windows_conflicts(svc_app_running);
+                let has_legacy_conflict = !legacy_services.is_empty();
+
                 if let Ok(mut err_g) = self.last_service_error.lock() {
-                    *err_g = None;
+                    if has_legacy_conflict {
+                        *err_g = Some((
+                            conflict_detail.clone().unwrap_or_default(),
+                            Some("legacy_conflict".to_string()),
+                        ));
+                    } else {
+                        *err_g = None;
+                    }
                 }
+
+                let effective_mode = if cfg!(target_os = "windows") {
+                    "elevated_worker".to_string()
+                } else if installed && mode != "elevated_worker" {
+                    "service".to_string()
+                } else {
+                    "elevated_worker".to_string()
+                };
 
                 PrivilegedServiceStatus {
                     platform: self.platform_name().to_string(),
-                    mode,
+                    mode: effective_mode,
                     installed,
                     running: true,
                     connected: true,
@@ -655,31 +853,44 @@ impl AppState {
                     service_pid,
                     app_proxy_running: self.app_proxy_active.load(Ordering::Relaxed),
                     tun_running: svc_tun_running,
-                    error: None,
-                    error_kind: None,
+                    legacy_services,
+                    conflict_detail: conflict_detail.clone(),
+                    error: if has_legacy_conflict {
+                        conflict_detail
+                    } else {
+                        None
+                    },
+                    error_kind: if has_legacy_conflict {
+                        Some("legacy_conflict".to_string())
+                    } else {
+                        None
+                    },
                 }
             }
             Ok(resp) => {
-                let kind = classify_service_error_kind(
-                    &resp.message,
-                    installed,
-                    capture_requested,
-                );
+                let (legacy_services, conflict_detail) = self.detect_windows_conflicts(false);
+                let kind = if !legacy_services.is_empty() || conflict_detail.is_some() {
+                    Some("legacy_conflict".to_string())
+                } else {
+                    classify_service_error_kind(&resp.message, installed, capture_requested)
+                };
+                let err_msg = conflict_detail.clone().unwrap_or(resp.message);
+                let has_fault = kind.is_some();
                 if let Ok(mut err_g) = self.last_service_error.lock() {
-                    if kind.is_some() {
-                        *err_g = Some((resp.message.clone(), kind.clone()));
+                    if has_fault {
+                        *err_g = Some((err_msg.clone(), kind.clone()));
                     } else {
                         *err_g = None;
                     }
                 }
                 PrivilegedServiceStatus {
                     platform: self.platform_name().to_string(),
-                    mode,
+                    mode: "off".to_string(),
                     installed,
                     running: false,
                     connected: false,
                     elevated: false,
-                    state: if kind.is_some() {
+                    state: if has_fault {
                         "error".to_string()
                     } else if installed {
                         "stopped".to_string()
@@ -689,62 +900,66 @@ impl AppState {
                     service_pid: None,
                     app_proxy_running: false,
                     tun_running: false,
-                    error: if kind.is_some() {
-                        Some(resp.message)
-                    } else {
-                        None
-                    },
+                    legacy_services,
+                    conflict_detail,
+                    error: if has_fault { Some(err_msg) } else { None },
                     error_kind: kind,
                 }
             }
             Err(_) => {
-                // Service not reachable right now.
                 self.core_via_service.store(false, Ordering::Relaxed);
                 self.app_proxy_active.store(false, Ordering::Relaxed);
                 self.tun_active.store(false, Ordering::Relaxed);
 
-                if !installed {
-                    // Healthy standby: service is simply not installed yet -> clear any stale fault.
-                    if let Ok(mut err_g) = self.last_service_error.lock() {
-                        *err_g = None;
-                    }
-                    return PrivilegedServiceStatus {
-                        platform: self.platform_name().to_string(),
-                        mode,
-                        installed: false,
-                        running: false,
-                        connected: false,
-                        elevated: false,
-                        state: "not_installed".to_string(),
-                        service_pid: None,
-                        app_proxy_running: false,
-                        tun_running: false,
-                        error: None,
-                        error_kind: None,
-                    };
-                }
-
-                let os_running = self.is_service_running_on_os();
-                if os_running {
-                    let msg = "BypaxService is running in OS service manager but Plane 1 IPC did not respond"
-                        .to_string();
-                    let kind = Some("pipe_timeout".to_string());
+                let (legacy_services, conflict_detail) = self.detect_windows_conflicts(false);
+                if !legacy_services.is_empty() || conflict_detail.is_some() {
+                    let msg = conflict_detail.clone().unwrap_or_else(|| {
+                        format!(
+                            "Legacy background proxy service detected: {}",
+                            legacy_services.join(", ")
+                        )
+                    });
+                    let kind = Some("legacy_conflict".to_string());
                     if let Ok(mut err_g) = self.last_service_error.lock() {
                         *err_g = Some((msg.clone(), kind.clone()));
                     }
                     return PrivilegedServiceStatus {
                         platform: self.platform_name().to_string(),
-                        mode,
-                        installed: true,
-                        running: true,
+                        mode: "off".to_string(),
+                        installed,
+                        running: false,
                         connected: false,
                         elevated: false,
-                        state: "error".to_string(),
+                        state: "conflict".to_string(),
                         service_pid: None,
                         app_proxy_running: false,
                         tun_running: false,
+                        legacy_services,
+                        conflict_detail,
                         error: Some(msg),
                         error_kind: kind,
+                    };
+                }
+
+                if !installed && !capture_requested {
+                    if let Ok(mut err_g) = self.last_service_error.lock() {
+                        *err_g = None;
+                    }
+                    return PrivilegedServiceStatus {
+                        platform: self.platform_name().to_string(),
+                        mode: "off".to_string(),
+                        installed: false,
+                        running: false,
+                        connected: false,
+                        elevated: false,
+                        state: "stopped".to_string(),
+                        service_pid: None,
+                        app_proxy_running: false,
+                        tun_running: false,
+                        legacy_services: Vec::new(),
+                        conflict_detail: None,
+                        error: None,
+                        error_kind: None,
                     };
                 }
 
@@ -761,10 +976,15 @@ impl AppState {
                     }
                     (None, None)
                 };
+                let effective_mode = if !cfg!(target_os = "windows") && mode == "service" {
+                    "service".to_string()
+                } else {
+                    "off".to_string()
+                };
                 PrivilegedServiceStatus {
                     platform: self.platform_name().to_string(),
-                    mode,
-                    installed: true,
+                    mode: effective_mode,
+                    installed,
                     running: false,
                     connected: false,
                     elevated: false,
@@ -772,6 +992,8 @@ impl AppState {
                     service_pid: None,
                     app_proxy_running: false,
                     tun_running: false,
+                    legacy_services: Vec::new(),
+                    conflict_detail: None,
                     error,
                     error_kind,
                 }
@@ -820,6 +1042,12 @@ impl AppState {
             bypass_lan: settings.app_proxy_bypass_lan,
             block_quic_when_needed: settings.app_proxy_block_quic_when_needed,
             windivert_dir: settings.app_proxy_windivert_dir.clone(),
+            gui_pid: Some(std::process::id()),
+            sing_box_pid: if sing_box_pid != 0 {
+                Some(sing_box_pid)
+            } else {
+                None
+            },
             exempt_pids,
             rules: wire_rules,
             target_bindings: bindings,
@@ -835,6 +1063,18 @@ impl AppState {
             return Ok(());
         }
 
+        if cfg!(target_os = "windows") {
+            // Windows strictly uses the GUI-bound on-demand elevated helper (zero SCM service).
+            let status = self.perform_service_action("start_worker").await?;
+            return if status.connected {
+                Ok(())
+            } else {
+                Err(status.error.unwrap_or_else(|| {
+                    "SERVICE_UNAVAILABLE: Unable to connect to Bypax elevated helper".to_string()
+                }))
+            };
+        }
+
         let service_mode = self
             .store
             .lock()
@@ -847,7 +1087,6 @@ impl AppState {
             return Err("SERVICE_DISABLED: Privileged service is disabled in settings".to_string());
         }
 
-        // If OS service is installed, try starting it; otherwise try elevated worker in auto/worker mode.
         let action = if self.is_service_installed_on_os() && service_mode != "elevated_worker" {
             "start"
         } else {
@@ -858,10 +1097,38 @@ impl AppState {
         if status.connected {
             Ok(())
         } else {
-            Err(status
-                .error
-                .unwrap_or_else(|| "SERVICE_UNAVAILABLE: Unable to connect to Bypax Service".to_string()))
+            Err(status.error.unwrap_or_else(|| {
+                "SERVICE_UNAVAILABLE: Unable to connect to Bypax helper".to_string()
+            }))
         }
+    }
+
+    /// Starts ONLY the local non-privileged `sing-box` proxy core (never spawns UAC / WinDivert).
+    pub async fn start_local_core_only(&self) -> Result<(CoreInfo, PreflightReport), String> {
+        let bin = self.require_core_binary()?;
+        let settings = {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| "store lock poisoned".to_string())?;
+            store.load_settings().map_err(|e| e.to_string())?
+        };
+        let compiled = self.compile_current()?;
+        let report = {
+            let mut sup = self
+                .supervisor
+                .lock()
+                .map_err(|_| "supervisor lock poisoned".to_string())?;
+            sup.apply_config(&bin, compiled.config)
+                .map_err(|e| e.to_string())?
+        };
+        if !report.ok {
+            return Ok((self.build_core_info(), report));
+        }
+        self.core_via_service.store(false, Ordering::Relaxed);
+        self.tun_active.store(false, Ordering::Relaxed);
+        self.sync_clash_control(&settings).await;
+        Ok((self.build_core_info(), report))
     }
 
     pub async fn start_core_flow(&self) -> Result<(CoreInfo, PreflightReport), String> {
@@ -899,6 +1166,7 @@ impl AppState {
                         sing_box_path: bin.to_string_lossy().to_string(),
                         config_json,
                         tun_mode: settings.tun_enabled,
+                        gui_pid: Some(std::process::id()),
                     },
                     Duration::from_secs(8),
                 )
@@ -911,6 +1179,7 @@ impl AppState {
                     !settings.tun_enabled && settings.app_proxy_enabled,
                     Ordering::Relaxed,
                 );
+                self.send_service_heartbeat().await;
             } else {
                 return Err(if resp.message.is_empty() {
                     "Privileged service failed to start sing-box".to_string()
@@ -947,20 +1216,47 @@ impl AppState {
                 .ok()
                 .and_then(|mut s| s.require_running_pid().ok())
                 .unwrap_or(0);
-            if self.ensure_service_connected().await.is_ok() {
-                let cfg = self.build_app_proxy_start_config(&settings, &app_rules, sing_box_pid)?;
-                if let Ok(resp) = self
-                    .service_request(
-                        ServiceCommand::StartAppProxy { config: cfg },
-                        Duration::from_secs(6),
-                    )
-                    .await
-                {
-                    if resp.ok {
-                        if let Some(st) = resp.app_proxy_status {
-                            self.app_proxy_active.store(st.running, Ordering::Relaxed);
+            match self.ensure_service_connected().await {
+                Ok(()) => {
+                    let cfg =
+                        self.build_app_proxy_start_config(&settings, &app_rules, sing_box_pid)?;
+                    match self
+                        .service_request(
+                            ServiceCommand::StartAppProxy { config: cfg },
+                            Duration::from_secs(8),
+                        )
+                        .await
+                    {
+                        Ok(resp) if resp.ok => {
+                            let running = resp
+                                .app_proxy_status
+                                .as_ref()
+                                .map(|st| st.running)
+                                .unwrap_or(true);
+                            self.app_proxy_active.store(running, Ordering::Relaxed);
+                            if running {
+                                self.send_service_heartbeat().await;
+                            }
+                        }
+                        Ok(resp) => {
+                            self.push_log(
+                                "WARN",
+                                format!("app-proxy: auto-attach failed: {}", resp.message),
+                            );
+                        }
+                        Err(err) => {
+                            self.push_log(
+                                "WARN",
+                                format!("app-proxy: auto-attach IPC failed: {}", err),
+                            );
                         }
                     }
+                }
+                Err(err) => {
+                    self.push_log(
+                        "WARN",
+                        format!("app-proxy: service unavailable during core start: {}", err),
+                    );
                 }
             }
         }
@@ -1098,13 +1394,14 @@ impl AppState {
                         let resp = self
                             .service_request(
                                 ServiceCommand::StartAppProxy { config: start_cfg },
-                                Duration::from_secs(6),
+                                Duration::from_secs(8),
                             )
                             .await?;
                         if resp.ok {
                             if let Some(st) = resp.app_proxy_status {
                                 if st.running {
                                     self.app_proxy_active.store(true, Ordering::Relaxed);
+                                    self.send_service_heartbeat().await;
                                     self.push_log(
                                         "INFO",
                                         format!(
@@ -1120,6 +1417,7 @@ impl AppState {
                                 }
                             } else {
                                 self.app_proxy_active.store(true, Ordering::Relaxed);
+                                self.send_service_heartbeat().await;
                                 Ok(())
                             }
                         } else {
@@ -1295,6 +1593,7 @@ impl AppState {
                     sing_box_path: bin_path.to_string_lossy().to_string(),
                     config_json,
                     tun_mode,
+                    gui_pid: Some(std::process::id()),
                 },
                 Duration::from_secs(6),
             )
@@ -1417,13 +1716,23 @@ impl AppState {
     ) -> Result<PrivilegedServiceStatus, String> {
         match action {
             "stop_worker" => {
+                self.app_proxy_active.store(false, Ordering::Relaxed);
+                self.tun_active.store(false, Ordering::Relaxed);
+                self.core_via_service.store(false, Ordering::Relaxed);
                 let _ = self
                     .service_request(ServiceCommand::Shutdown, Duration::from_secs(3))
                     .await;
+                self.persist_service_mode("off");
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 return Ok(self.query_service_status().await);
             }
-            "install" | "uninstall" | "start" | "stop" | "restart" | "start_worker" => {}
+            "install"
+            | "uninstall"
+            | "start"
+            | "stop"
+            | "restart"
+            | "start_worker"
+            | "cleanup_legacy" => {}
             other => {
                 return Err(format!("Unknown service action: {}", other));
             }
@@ -1437,44 +1746,80 @@ impl AppState {
         {
             match action {
                 "install" => {
-                    run_elevated_windows(&svc_bin, &["install"], true)?;
+                    return Err(
+                        "WINDOWS_SERVICE_REMOVED: Windows Bypax uses the GUI-bound on-demand \
+                         elevated helper instead of registering a background system service."
+                            .to_string(),
+                    );
                 }
-                "uninstall" => {
+                "uninstall" | "cleanup_legacy" => {
+                    self.app_proxy_active.store(false, Ordering::Relaxed);
+                    self.tun_active.store(false, Ordering::Relaxed);
+                    self.core_via_service.store(false, Ordering::Relaxed);
                     let _ = self
                         .service_request(ServiceCommand::Shutdown, Duration::from_secs(2))
                         .await;
-                    run_elevated_windows(&svc_bin, &["uninstall"], true)?;
-                }
-                "start" => {
-                    run_elevated_windows(&svc_bin, &["start"], true)?;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    run_elevated_windows(&svc_bin, &["cleanup-legacy"], true)?;
+                    if let Ok(mut err_g) = self.last_service_error.lock() {
+                        *err_g = None;
+                    }
+                    self.persist_service_mode("off");
                 }
                 "stop" => {
+                    self.app_proxy_active.store(false, Ordering::Relaxed);
+                    self.tun_active.store(false, Ordering::Relaxed);
+                    self.core_via_service.store(false, Ordering::Relaxed);
                     let _ = self
-                        .service_request(ServiceCommand::StopAppProxy, Duration::from_secs(2))
+                        .service_request(ServiceCommand::Shutdown, Duration::from_secs(2))
                         .await;
-                    let _ = self
-                        .service_request(ServiceCommand::StopCore, Duration::from_secs(2))
-                        .await;
-                    run_elevated_windows(&svc_bin, &["stop"], true)?;
+                    self.persist_service_mode("off");
                 }
-                "restart" => {
-                    run_elevated_windows(&svc_bin, &["stop"], true)?;
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    run_elevated_windows(&svc_bin, &["start"], true)?;
-                }
-                "start_worker" => {
+                "start" | "restart" | "start_worker" => {
+                    if action == "restart" {
+                        self.app_proxy_active.store(false, Ordering::Relaxed);
+                        self.tun_active.store(false, Ordering::Relaxed);
+                        self.core_via_service.store(false, Ordering::Relaxed);
+                        let _ = self
+                            .service_request(ServiceCommand::Shutdown, Duration::from_secs(2))
+                            .await;
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
                     let pid_str = std::process::id().to_string();
-                    run_elevated_windows(
+                    let token = self.current_ipc_token();
+                    let token_file = self.paths.runtime_dir.join(format!(
+                        "worker-{}-{}.token",
+                        std::process::id(),
+                        &uuid::Uuid::new_v4().simple().to_string()[..8]
+                    ));
+                    std::fs::create_dir_all(&self.paths.runtime_dir)
+                        .map_err(|e| format!("Failed to prepare runtime directory: {e}"))?;
+                    std::fs::write(&token_file, &token)
+                        .map_err(|e| format!("Failed to write ephemeral helper token: {e}"))?;
+
+                    let ep_str = self.service_endpoint.clone();
+                    let tf_str = token_file.to_string_lossy().to_string();
+                    let rt_str = self.paths.runtime_dir.to_string_lossy().to_string();
+                    let launch_res = run_elevated_windows(
                         &svc_bin,
                         &[
                             "worker-run",
                             "--parent-pid",
                             &pid_str,
-                            "--token",
-                            &self.ipc_token,
+                            "--endpoint",
+                            &ep_str,
+                            "--token-file",
+                            &tf_str,
+                            "--runtime-dir",
+                            &rt_str,
                         ],
                         false,
-                    )?;
+                    );
+                    if let Err(err) = launch_res {
+                        let _ = std::fs::remove_file(&token_file);
+                        return Err(err);
+                    }
+                    self.persist_service_mode("elevated_worker");
                 }
                 _ => {}
             }
@@ -1483,18 +1828,33 @@ impl AppState {
         #[cfg(target_os = "macos")]
         {
             match action {
-                "install" => run_elevated_macos(&svc_bin, &["install-launchd"])?,
-                "uninstall" => run_elevated_macos(&svc_bin, &["uninstall-launchd"])?,
+                "install" => {
+                    run_elevated_macos(&svc_bin, &["install-launchd"])?;
+                    self.persist_service_mode("service");
+                }
+                "uninstall" => {
+                    self.app_proxy_active.store(false, Ordering::Relaxed);
+                    self.tun_active.store(false, Ordering::Relaxed);
+                    self.core_via_service.store(false, Ordering::Relaxed);
+                    run_elevated_macos(&svc_bin, &["uninstall-launchd"])?;
+                    self.persist_service_mode("off");
+                }
                 "start" | "restart" => {
                     run_elevated_macos(&svc_bin, &["install-launchd"])?;
+                    self.persist_service_mode("service");
                 }
                 "stop" => {
+                    self.app_proxy_active.store(false, Ordering::Relaxed);
+                    self.tun_active.store(false, Ordering::Relaxed);
+                    self.core_via_service.store(false, Ordering::Relaxed);
                     let _ = self
                         .service_request(ServiceCommand::Shutdown, Duration::from_secs(2))
                         .await;
+                    self.persist_service_mode("off");
                 }
                 "start_worker" => {
                     let pid_str = std::process::id().to_string();
+                    let token = self.current_ipc_token();
                     run_elevated_macos(
                         &svc_bin,
                         &[
@@ -1502,9 +1862,10 @@ impl AppState {
                             "--parent-pid",
                             &pid_str,
                             "--token",
-                            &self.ipc_token,
+                            &token,
                         ],
                     )?;
+                    self.persist_service_mode("elevated_worker");
                 }
                 _ => {}
             }
@@ -1523,7 +1884,7 @@ impl AppState {
         {
             // Poll until connected for start / restart / start_worker / install.
             if matches!(action, "install" | "start" | "restart" | "start_worker") {
-                for _ in 0..16 {
+                for _ in 0..20 {
                     let st = self.query_service_status().await;
                     if st.connected {
                         return Ok(st);
@@ -1543,15 +1904,31 @@ impl AppState {
         let stop_svc_core = self.core_via_service.swap(false, Ordering::Relaxed);
         self.tun_active.store(false, Ordering::Relaxed);
 
-        if stop_app || stop_svc_core {
+        if cfg!(target_os = "windows") || stop_app || stop_svc_core {
             let endpoint = self.service_endpoint.clone();
-            let token = self.ipc_token.clone();
+            let token = self.current_ipc_token();
             let _ = std::thread::spawn(move || {
                 if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                 {
                     rt.block_on(async {
+                        if cfg!(target_os = "windows") {
+                            // Gracefully terminate the GUI-bound elevated helper (also releases
+                            // WinDivert handles and any privileged TUN core atomically).
+                            let env = ServiceEnvelope {
+                                id: "shutdown-worker".to_string(),
+                                session_token: token,
+                                command: ServiceCommand::Shutdown,
+                            };
+                            let _ = send_service_request(
+                                &endpoint,
+                                &env,
+                                Duration::from_millis(1200),
+                            )
+                            .await;
+                            return;
+                        }
                         if stop_app {
                             let env = ServiceEnvelope {
                                 id: "shutdown-app".to_string(),
@@ -1568,7 +1945,7 @@ impl AppState {
                         if stop_svc_core {
                             let env = ServiceEnvelope {
                                 id: "shutdown-core".to_string(),
-                                session_token: token.clone(),
+                                session_token: token,
                                 command: ServiceCommand::StopCore,
                             };
                             let _ = send_service_request(
@@ -1688,6 +2065,7 @@ pub fn normalize_gui_driver_probe(
         }
         Some("hvci_blocked" | "blocked_by_security") => Some("hvci_blocked".to_string()),
         Some("signature_failed" | "invalid_signature") => Some("signature_failed".to_string()),
+        Some("legacy_conflict") => Some("legacy_conflict".to_string()),
         Some("pipe_timeout") => Some("pipe_timeout".to_string()),
         Some("access_denied") => {
             if !dto.elevated && !service_connected {
@@ -1736,12 +2114,24 @@ pub fn classify_service_error_kind(
     {
         return Some("driver_missing".to_string());
     }
+    if lower.contains("legacy_conflict")
+        || lower.contains("os error 87")
+        || lower.contains("os error 1072")
+        || lower.contains("marked for deletion")
+        || lower.contains("conflicting windivert")
+        || lower.contains("same layer/priority")
+        || lower.contains("legacy background proxy service")
+    {
+        return Some("legacy_conflict".to_string());
+    }
     if (service_installed || capture_requested)
         && (lower.contains("pipe")
             || lower.contains("timed out")
             || lower.contains("timeout")
             || lower.contains("service_unavailable")
-            || lower.contains("unable to connect"))
+            || lower.contains("unable to connect")
+            || lower.contains("unauthorized")
+            || lower.contains("session token"))
     {
         return Some("pipe_timeout".to_string());
     }
@@ -1844,6 +2234,10 @@ mod tests {
         assert_eq!(
             classify_service_error_kind("WinDivert.dll not found", false, true).as_deref(),
             Some("driver_missing")
+        );
+        assert_eq!(
+            classify_service_error_kind("Unauthorized session token", true, false).as_deref(),
+            Some("pipe_timeout")
         );
     }
 }

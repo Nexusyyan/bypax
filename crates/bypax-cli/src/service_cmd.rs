@@ -6,6 +6,9 @@ use std::process::Command;
 #[cfg(windows)]
 pub const SERVICE_NAME: &str = "BypaxService";
 
+#[cfg(windows)]
+pub const LEGACY_WINDOWS_SERVICES: &[&str] = &["BypaxService", "BypathService"];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceStatusReport {
@@ -14,6 +17,8 @@ pub struct ServiceStatusReport {
     pub installed: bool,
     pub running: bool,
     pub state: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_services: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
 }
@@ -59,6 +64,68 @@ fn to_wide_null(s: &str) -> Vec<u16> {
 }
 
 #[cfg(windows)]
+pub fn detect_legacy_windows_services() -> Vec<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceConfigW, QueryServiceStatus,
+        QUERY_SERVICE_CONFIGW, SC_MANAGER_CONNECT, SERVICE_DISABLED, SERVICE_QUERY_CONFIG,
+        SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS,
+    };
+
+    let mut found = Vec::new();
+    unsafe {
+        let Ok(scm) = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) else {
+            return found;
+        };
+        for name in LEGACY_WINDOWS_SERVICES {
+            let wide = to_wide_null(name);
+            let Ok(svc) = OpenServiceW(
+                scm,
+                PCWSTR(wide.as_ptr()),
+                SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG,
+            ) else {
+                continue;
+            };
+            let mut st = SERVICE_STATUS::default();
+            let running = QueryServiceStatus(svc, &mut st).is_ok()
+                && (st.dwCurrentState == SERVICE_RUNNING
+                    || st.dwCurrentState == SERVICE_START_PENDING);
+
+            let mut disabled = false;
+            let mut needed = 0u32;
+            let _ = QueryServiceConfigW(svc, None, 0, &mut needed);
+            if needed > 0 {
+                let mut buf = vec![0u8; needed as usize];
+                if QueryServiceConfigW(
+                    svc,
+                    Some(buf.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW),
+                    needed,
+                    &mut needed,
+                )
+                .is_ok()
+                {
+                    let cfg = &*(buf.as_ptr() as *const QUERY_SERVICE_CONFIGW);
+                    disabled = cfg.dwStartType == SERVICE_DISABLED;
+                }
+            }
+            let _ = CloseServiceHandle(svc);
+
+            // BypaxService is always legacy on Windows; BypathService is flagged when active or enabled.
+            if *name == SERVICE_NAME || running || !disabled {
+                found.push((*name).to_string());
+            }
+        }
+        let _ = CloseServiceHandle(scm);
+    }
+    found
+}
+
+#[cfg(not(windows))]
+pub fn detect_legacy_windows_services() -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(windows)]
 pub fn query_os_service_status() -> ServiceStatusReport {
     use windows::core::PCWSTR;
     use windows::Win32::System::Services::{
@@ -71,6 +138,7 @@ pub fn query_os_service_status() -> ServiceStatusReport {
     let binary_path = resolve_service_binary(None)
         .ok()
         .map(|p| p.to_string_lossy().to_string());
+    let legacy_services = detect_legacy_windows_services();
 
     let svc_wide = to_wide_null(SERVICE_NAME);
     unsafe {
@@ -81,6 +149,7 @@ pub fn query_os_service_status() -> ServiceStatusReport {
                 installed: false,
                 running: false,
                 state: "unknown".to_string(),
+                legacy_services,
                 binary_path,
             };
         };
@@ -92,6 +161,7 @@ pub fn query_os_service_status() -> ServiceStatusReport {
                 installed: false,
                 running: false,
                 state: "not_installed".to_string(),
+                legacy_services,
                 binary_path,
             };
         };
@@ -113,6 +183,7 @@ pub fn query_os_service_status() -> ServiceStatusReport {
                 installed: true,
                 running,
                 state: state.to_string(),
+                legacy_services,
                 binary_path,
             }
         } else {
@@ -122,6 +193,7 @@ pub fn query_os_service_status() -> ServiceStatusReport {
                 installed: true,
                 running: false,
                 state: "unknown".to_string(),
+                legacy_services,
                 binary_path,
             }
         };
@@ -160,6 +232,7 @@ pub fn query_os_service_status() -> ServiceStatusReport {
         installed,
         running,
         state: state.to_string(),
+        legacy_services: Vec::new(),
         binary_path: resolve_service_binary(None)
             .ok()
             .map(|p| p.to_string_lossy().to_string()),
@@ -174,32 +247,42 @@ pub fn query_os_service_status() -> ServiceStatusReport {
         installed: false,
         running: false,
         state: "unsupported".to_string(),
+        legacy_services: Vec::new(),
         binary_path: resolve_service_binary(None)
             .ok()
             .map(|p| p.to_string_lossy().to_string()),
     }
 }
 
-/// Delegates `install` / `uninstall` / `start` / `stop` to the sibling `bypax-service` binary.
+/// Delegates `install` / `uninstall` / `start` / `stop` / `cleanup` to `bypax-service`.
 pub fn run_service_subcommand(
     action: &str,
     service_exe_override: Option<&Path>,
 ) -> Result<String> {
     let svc_bin = resolve_service_binary(service_exe_override)?;
-    let mapped_arg = if cfg!(target_os = "macos") {
+    let mapped_args: Vec<&str> = if cfg!(target_os = "macos") {
         match action {
-            "install" => "install-launchd",
-            "uninstall" => "uninstall-launchd",
-            other => other,
+            "install" => vec!["install-launchd"],
+            "uninstall" => vec!["uninstall-launchd"],
+            "cleanup" => vec!["cleanup-legacy"],
+            other => vec![other],
         }
+    } else if action == "cleanup" {
+        vec!["cleanup-legacy"]
     } else {
-        action
+        vec![action]
     };
 
     let output = Command::new(&svc_bin)
-        .arg(mapped_arg)
+        .args(&mapped_args)
         .output()
-        .with_context(|| format!("Failed to invoke {} {}", svc_bin.display(), mapped_arg))?;
+        .with_context(|| {
+            format!(
+                "Failed to invoke {} {}",
+                svc_bin.display(),
+                mapped_args.join(" ")
+            )
+        })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -214,7 +297,7 @@ pub fn run_service_subcommand(
         };
         bail!(
             "bypax-service {} failed (Administrator/root privileges may be required): {}",
-            mapped_arg,
+            mapped_args.join(" "),
             detail
         );
     }
@@ -224,7 +307,7 @@ pub fn run_service_subcommand(
     } else {
         Ok(format!(
             "Service command '{}' completed successfully",
-            mapped_arg
+            mapped_args.join(" ")
         ))
     }
 }
