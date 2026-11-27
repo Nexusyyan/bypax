@@ -610,7 +610,6 @@ pub fn default_tun_route_exclude_cidrs() -> Vec<String> {
         "192.168.0.0/16".to_string(),
         "169.254.0.0/16".to_string(),
         "100.64.0.0/10".to_string(),
-        "198.19.0.0/16".to_string(),
         "fc00::/7".to_string(),
         "fe80::/10".to_string(),
     ]

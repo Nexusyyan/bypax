@@ -442,11 +442,7 @@ async fn dispatch_ctl_request(
 
             if let Ok(store) = state.store.lock() {
                 for r in &results {
-                    if is_real {
-                        let _ = store.update_node_latency(&r.node_id, None, r.delay_ms);
-                    } else {
-                        let _ = store.update_node_latency(&r.node_id, r.delay_ms, None);
-                    }
+                    let _ = store.record_latency_result(r);
                 }
             }
 

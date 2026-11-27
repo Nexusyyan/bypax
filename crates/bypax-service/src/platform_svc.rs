@@ -9,6 +9,10 @@ pub const WINDOWS_SERVICE_DESCRIPTION: &str =
 
 pub const MACOS_LAUNCHD_LABEL: &str = "com.bypax.service";
 pub const MACOS_LAUNCHD_PLIST_PATH: &str = "/Library/LaunchDaemons/com.bypax.service.plist";
+pub const MACOS_SYSTEM_DATA_DIR: &str = "/Library/Application Support/Bypax";
+pub const MACOS_SYSTEM_RUNTIME_DIR: &str = "/Library/Application Support/Bypax/runtime";
+pub const MACOS_LAUNCHD_LOG_DIR: &str = "/Library/Logs/Bypax";
+pub const MACOS_LAUNCHD_LOG_PATH: &str = "/Library/Logs/Bypax/bypax-service-launchd.log";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -474,6 +478,22 @@ mod platform {
     }
 
     pub fn install_launchd(service_exe: &Path) -> Result<()> {
+        let _ = std::fs::create_dir_all(MACOS_SYSTEM_RUNTIME_DIR);
+        let _ = std::fs::create_dir_all(format!("{MACOS_SYSTEM_DATA_DIR}/logs"));
+        let _ = std::fs::create_dir_all(MACOS_LAUNCHD_LOG_DIR);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [
+                MACOS_SYSTEM_DATA_DIR,
+                MACOS_SYSTEM_RUNTIME_DIR,
+                &format!("{MACOS_SYSTEM_DATA_DIR}/logs"),
+                MACOS_LAUNCHD_LOG_DIR,
+            ] {
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
         let escaped = service_exe
             .to_string_lossy()
             .replace('&', "&amp;")
@@ -490,7 +510,17 @@ mod platform {
   <array>\n\
     <string>{escaped}</string>\n\
     <string>daemon-run</string>\n\
+    <string>--runtime-dir</string>\n\
+    <string>{MACOS_SYSTEM_RUNTIME_DIR}</string>\n\
   </array>\n\
+  <key>WorkingDirectory</key>\n\
+  <string>{MACOS_SYSTEM_DATA_DIR}</string>\n\
+  <key>StandardOutPath</key>\n\
+  <string>{MACOS_LAUNCHD_LOG_PATH}</string>\n\
+  <key>StandardErrorPath</key>\n\
+  <string>{MACOS_LAUNCHD_LOG_PATH}</string>\n\
+  <key>ThrottleInterval</key>\n\
+  <integer>2</integer>\n\
   <key>RunAtLoad</key>\n\
   <true/>\n\
   <key>KeepAlive</key>\n\
@@ -506,8 +536,15 @@ mod platform {
         let _ = Command::new("chmod")
             .args(["644", MACOS_LAUNCHD_PLIST_PATH])
             .status();
+        let service_target = format!("system/{MACOS_LAUNCHD_LABEL}");
+        let _ = Command::new("launchctl")
+            .args(["bootout", &service_target])
+            .status();
         let _ = Command::new("launchctl")
             .args(["bootout", "system", MACOS_LAUNCHD_PLIST_PATH])
+            .status();
+        let _ = Command::new("launchctl")
+            .args(["enable", &service_target])
             .status();
         let status = Command::new("launchctl")
             .args(["bootstrap", "system", MACOS_LAUNCHD_PLIST_PATH])
@@ -516,10 +553,17 @@ mod platform {
         if !status.success() {
             anyhow::bail!("launchctl bootstrap failed with status {status}");
         }
+        let _ = Command::new("launchctl")
+            .args(["kickstart", "-k", &service_target])
+            .status();
         Ok(())
     }
 
     pub fn uninstall_launchd() -> Result<()> {
+        let service_target = format!("system/{MACOS_LAUNCHD_LABEL}");
+        let _ = Command::new("launchctl")
+            .args(["bootout", &service_target])
+            .status();
         let _ = Command::new("launchctl")
             .args(["bootout", "system", MACOS_LAUNCHD_PLIST_PATH])
             .status();
@@ -550,6 +594,10 @@ mod platform {
     }
 
     pub fn stop() -> Result<()> {
+        let service_target = format!("system/{MACOS_LAUNCHD_LABEL}");
+        let _ = Command::new("launchctl")
+            .args(["bootout", &service_target])
+            .status();
         let _ = Command::new("launchctl")
             .args(["bootout", "system", MACOS_LAUNCHD_PLIST_PATH])
             .status();

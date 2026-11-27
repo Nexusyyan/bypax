@@ -508,9 +508,10 @@ impl ServiceController {
             .app_proxy
             .as_ref()
             .is_some_and(|r| !r.task.is_finished());
+        let mac_utun_apps = !cfg!(windows) && running && !st.tun_active;
         let capture_mode = if running && st.tun_active {
             "tun"
-        } else if app_running {
+        } else if app_running || mac_utun_apps {
             "apps"
         } else {
             "off"
@@ -524,7 +525,7 @@ impl ServiceController {
     }
 
     fn build_app_proxy_status(&self) -> AppProxyStatusDto {
-        let Ok(st) = self.inner.lock() else {
+        let Ok(mut st) = self.inner.lock() else {
             return AppProxyStatusDto::default();
         };
         if let Some(ref running) = st.app_proxy {
@@ -539,6 +540,17 @@ impl ServiceController {
                     stats: running.handle.stats_snapshot(),
                 };
             }
+        }
+        if !cfg!(windows) && st.supervisor.is_running() && !st.tun_active {
+            return AppProxyStatusDto {
+                running: true,
+                mode: "macos_utun_path_routing".to_string(),
+                active_rules: 0,
+                exempt_pids: Vec::new(),
+                last_error: st.last_app_proxy_error.clone(),
+                error_kind: st.last_app_proxy_error_kind.clone(),
+                stats: Default::default(),
+            };
         }
         AppProxyStatusDto {
             running: false,

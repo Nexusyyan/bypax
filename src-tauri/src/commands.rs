@@ -1948,7 +1948,7 @@ pub async fn run_batch_tcping(
 
     if let Ok(store) = state.store.lock() {
         for r in &results {
-            let _ = store.update_node_latency(&r.node_id, r.delay_ms, None);
+            let _ = store.record_latency_result(r);
         }
     }
     state.push_log(
@@ -2004,7 +2004,7 @@ pub async fn run_batch_real_delay(
 
     if let Ok(store) = state.store.lock() {
         for r in &results {
-            let _ = store.update_node_latency(&r.node_id, None, r.delay_ms);
+            let _ = store.record_latency_result(r);
         }
     }
     state.push_log(

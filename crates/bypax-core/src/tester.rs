@@ -5,12 +5,120 @@ use crate::supervisor::spawn_managed_process;
 use anyhow::{anyhow, Result};
 use futures::stream::{self, StreamExt};
 use serde_json::{json, Value};
-use std::net::TcpListener;
+#[cfg(target_os = "macos")]
+use std::net::Ipv4Addr;
+use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
+
+#[cfg(target_os = "macos")]
+fn detect_default_physical_ifindex() -> Option<u32> {
+    let output = std::process::Command::new("route")
+        .args(["-n", "get", "default"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(iface) = trimmed.strip_prefix("interface:") {
+            let name = iface.trim();
+            if name.is_empty() || name.starts_with("utun") || name.starts_with("lo") {
+                return None;
+            }
+            let cname = std::ffi::CString::new(name).ok()?;
+            let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+            if idx != 0 {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_default_physical_ifindex() -> Option<u32> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    let is_unspecified = o[0] == 0;
+    let is_loopback = o[0] == 127;
+    let is_private_10 = o[0] == 10;
+    let is_cgnat = o[0] == 100 && (64..=127).contains(&o[1]);
+    let is_link_local = o[0] == 169 && o[1] == 254;
+    let is_private_172 = o[0] == 172 && (16..=31).contains(&o[1]);
+    let is_private_192 = o[0] == 192 && o[1] == 168;
+    let is_multicast_or_reserved = o[0] >= 224;
+    !(is_unspecified
+        || is_loopback
+        || is_private_10
+        || is_cgnat
+        || is_link_local
+        || is_private_172
+        || is_private_192
+        || is_multicast_or_reserved)
+}
+
+async fn connect_tcp_direct(
+    addr: &str,
+    physical_ifindex: Option<u32>,
+) -> std::io::Result<TcpStream> {
+    let resolved: Vec<SocketAddr> = tokio::net::lookup_host(addr).await?.collect();
+    if resolved.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "no addresses resolved",
+        ));
+    }
+
+    let mut last_err: Option<std::io::Error> = None;
+    for sa in resolved {
+        #[cfg(target_os = "macos")]
+        if let (SocketAddr::V4(v4), Some(ifidx)) = (sa, physical_ifindex) {
+            if is_public_ipv4(*v4.ip()) {
+                use std::os::fd::AsRawFd;
+                let sock = tokio::net::TcpSocket::new_v4()?;
+                let rc = unsafe {
+                    libc::setsockopt(
+                        sock.as_raw_fd(),
+                        libc::IPPROTO_IP,
+                        libc::IP_BOUND_IF,
+                        &ifidx as *const u32 as *const libc::c_void,
+                        std::mem::size_of::<u32>() as libc::socklen_t,
+                    )
+                };
+                if rc == 0 {
+                    match sock.connect(sa).await {
+                        Ok(stream) => return Ok(stream),
+                        Err(e) => {
+                            last_err = Some(e);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = physical_ifindex;
+
+        match TcpStream::connect(sa).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotConnected, "failed to connect")
+    }))
+}
 
 /// Concurrent TCPing latency tester (no sing-box needed, non-disruptive).
 pub async fn batch_tcping(
@@ -63,6 +171,7 @@ where
     let failed = Arc::new(AtomicUsize::new(0));
     let limit = concurrency.clamp(1, 64);
     let timeout = Duration::from_millis(timeout_ms.max(300));
+    let physical_ifindex = detect_default_physical_ifindex();
 
     let results: Vec<LatencyResult> = stream::iter(nodes.iter().cloned())
         .map(|node| {
@@ -73,7 +182,12 @@ where
             async move {
                 let addr = format!("{}:{}", node.server, node.port);
                 let started = Instant::now();
-                let res = match tokio::time::timeout(timeout, TcpStream::connect(&addr)).await {
+                let res = match tokio::time::timeout(
+                    timeout,
+                    connect_tcp_direct(&addr, physical_ifindex),
+                )
+                .await
+                {
                     Ok(Ok(_stream)) => LatencyResult {
                         node_id: node.id,
                         kind: "tcping".to_string(),
@@ -181,22 +295,24 @@ async fn probe_node_rtt(
         .timeout(per_req_timeout)
         .build()?;
 
+    let is_https = test_url.trim().to_ascii_lowercase().starts_with("https://");
+
     if strip_handshake {
         // Pass 1: Warm up DNS + proxy tunnel + inner TLS handshake.
-        let resp1 = http
-            .head(test_url)
-            .header(reqwest::header::CONNECTION, "keep-alive")
-            .send()
-            .await?;
+        let mut req1 = http.head(test_url);
+        if !is_https {
+            req1 = req1.header(reqwest::header::CONNECTION, "keep-alive");
+        }
+        let resp1 = req1.send().await?;
         let _ = resp1.bytes().await;
 
         // Pass 2: Timed pure round-trip over the warm keep-alive tunnel.
         let started = Instant::now();
-        let resp2 = http
-            .head(test_url)
-            .header(reqwest::header::CONNECTION, "keep-alive")
-            .send()
-            .await?;
+        let mut req2 = http.head(test_url);
+        if !is_https {
+            req2 = req2.header(reqwest::header::CONNECTION, "keep-alive");
+        }
+        let resp2 = req2.send().await?;
         let elapsed_ms = started.elapsed().as_millis().max(1) as u32;
         let _ = resp2.bytes().await;
         Ok(elapsed_ms)
@@ -303,6 +419,7 @@ where
     }]);
 
     let mut route_obj = serde_json::Map::new();
+    route_obj.insert("auto_detect_interface".to_string(), json!(true));
     route_obj.insert("default_domain_resolver".to_string(), json!("dns-local"));
     if !route_rules.is_empty() {
         route_obj.insert("rules".to_string(), Value::Array(route_rules));

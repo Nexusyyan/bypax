@@ -82,21 +82,31 @@ fn default_os_data_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
-                .join("Bypax");
+            let trimmed = home.trim();
+            if !trimmed.is_empty() && trimmed != "/var/empty" {
+                return PathBuf::from(trimmed)
+                    .join("Library")
+                    .join("Application Support")
+                    .join("Bypax");
+            }
         }
+        return PathBuf::from("/Library/Application Support/Bypax");
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-            return PathBuf::from(xdg).join("bypax");
+            if !xdg.trim().is_empty() {
+                return PathBuf::from(xdg).join("bypax");
+            }
         }
         if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(".local").join("share").join("bypax");
+            if !home.trim().is_empty() {
+                return PathBuf::from(home).join(".local").join("share").join("bypax");
+            }
         }
+        return PathBuf::from("/var/lib/bypax");
     }
+    #[allow(unreachable_code)]
     PathBuf::from("bypax-data")
 }
 
@@ -727,6 +737,31 @@ impl Store {
             self.conn.execute(
                 "UPDATE nodes SET payload = ?2 WHERE id = ?1",
                 params![id, updated],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn record_latency_result(&self, res: &crate::model::LatencyResult) -> Result<()> {
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT payload FROM nodes WHERE id = ?1",
+                params![res.node_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = existing {
+            let mut node: NodeIR = serde_json::from_str(&raw)?;
+            if res.kind == "real" {
+                node.real_delay_ms = res.delay_ms;
+            } else {
+                node.tcping_ms = res.delay_ms;
+            }
+            let updated = serde_json::to_string(&node)?;
+            self.conn.execute(
+                "UPDATE nodes SET payload = ?2 WHERE id = ?1",
+                params![res.node_id, updated],
             )?;
         }
         Ok(())

@@ -1760,3 +1760,104 @@ fn test_cgnat_mesh_vpn_bypass_compiler_dns_and_rule_set_mirrors() {
         );
     }
 }
+
+#[test]
+fn test_tun_route_exclude_subtracts_tun_subnet_and_fakeip_pool() {
+    let node = NodeIR::new(
+        "n-tuic-1",
+        Protocol::Tuic,
+        "AU-Test",
+        "example.com",
+        443,
+        "Test",
+    );
+    let settings = AppSettings {
+        main_node_id: Some(node.id.clone()),
+        app_proxy_enabled: true,
+        tun_enabled: false,
+        tun_inet4_address: "172.19.0.1/30".to_string(),
+        dns_fake_ip: true,
+        dns_fake_ip_inet4: "198.18.0.0/15".to_string(),
+        dns_fake_ip_inet6: "fc00::/18".to_string(),
+        tun_route_exclude_cidrs: vec![
+            "10.0.0.0/8".to_string(),
+            "172.16.0.0/12".to_string(),
+            "192.168.0.0/16".to_string(),
+            "198.19.0.0/16".to_string(),
+            "fc00::/7".to_string(),
+        ],
+        ..Default::default()
+    };
+
+    let compiled = SingBox114Compiler::compile(&CompileInput {
+        nodes: std::slice::from_ref(&node),
+        rules: &[],
+        app_rules: &[],
+        extra_ports: &[],
+        settings: &settings,
+        control_secret: "tun-cidr-test",
+        cache_db_path: None,
+        rule_cache: None,
+        platform: CompilePlatform::MacOs,
+    })
+    .expect("compile macOS utun config");
+
+    let tun = compiled.config["inbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["tag"] == "tun-in")
+        .expect("tun-in present");
+    let excludes: Vec<String> = tun["route_exclude_address"]
+        .as_array()
+        .expect("route_exclude_address array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+
+    let v4_contains = |cidr: &str, ip: &str| -> bool {
+        let Some((net_s, pfx_s)) = cidr.split_once('/') else {
+            return false;
+        };
+        let (Ok(net_ip), Ok(pfx), Ok(target)) = (
+            net_s.parse::<std::net::Ipv4Addr>(),
+            pfx_s.parse::<u8>(),
+            ip.parse::<std::net::Ipv4Addr>(),
+        ) else {
+            return false;
+        };
+        let mask = if pfx == 0 { 0 } else { u32::MAX << (32 - pfx) };
+        (u32::from(target) & mask) == (u32::from(net_ip) & mask)
+    };
+
+    // TUN host (172.19.0.1) and NAT peer (172.19.0.2) MUST NOT be excluded!
+    assert!(
+        !excludes.iter().any(|c| v4_contains(c, "172.19.0.1")),
+        "172.19.0.1 must not be in route_exclude_address: {:?}",
+        excludes
+    );
+    assert!(
+        !excludes.iter().any(|c| v4_contains(c, "172.19.0.2")),
+        "172.19.0.2 must not be in route_exclude_address: {:?}",
+        excludes
+    );
+    // Neighboring RFC1918 172.16.0.0/12 addresses MUST STILL be excluded!
+    assert!(excludes.iter().any(|c| v4_contains(c, "172.16.0.1")));
+    assert!(excludes.iter().any(|c| v4_contains(c, "172.19.0.4")));
+    assert!(excludes.iter().any(|c| v4_contains(c, "172.31.255.254")));
+    // FakeIP pool (198.18.0.0/15, including 198.19.x.x) MUST NOT be excluded!
+    assert!(
+        !excludes.iter().any(|c| v4_contains(c, "198.19.0.1")),
+        "FakeIP 198.19.0.1 must not be excluded: {:?}",
+        excludes
+    );
+
+    if let Some(sb) = find_test_singbox() {
+        let report = SingBox114Compiler::preflight_check(&sb, &compiled.config).expect("preflight");
+        assert!(
+            report.ok,
+            "sing-box check failed on CIDR-subtracted tun-in: {}",
+            report.stderr
+        );
+    }
+}

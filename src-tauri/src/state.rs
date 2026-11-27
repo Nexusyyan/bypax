@@ -948,7 +948,7 @@ impl AppState {
                     error_kind: kind,
                 }
             }
-            Err(_) => {
+            Err(connect_err) => {
                 self.core_via_service.store(false, Ordering::Relaxed);
                 self.app_proxy_active.store(false, Ordering::Relaxed);
                 self.tun_active.store(false, Ordering::Relaxed);
@@ -1005,17 +1005,19 @@ impl AppState {
                     };
                 }
 
-                let (error, error_kind) = if capture_requested {
-                    self.last_service_error
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.clone())
-                        .map(|(m, k)| (Some(m), k))
-                        .unwrap_or((None, None))
+                let cached_error = self
+                    .last_service_error
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone());
+                let (error, error_kind) = if let Some((m, k)) = cached_error {
+                    (Some(m), k)
+                } else if capture_requested || (installed && mode == "service") {
+                    (
+                        Some(format!("SERVICE_UNAVAILABLE: {connect_err}")),
+                        Some("pipe_timeout".to_string()),
+                    )
                 } else {
-                    if let Ok(mut err_g) = self.last_service_error.lock() {
-                        *err_g = None;
-                    }
                     (None, None)
                 };
                 let effective_mode = if !cfg!(target_os = "windows") && mode == "service" {
@@ -1030,7 +1032,11 @@ impl AppState {
                     running: false,
                     connected: false,
                     elevated: false,
-                    state: "stopped".to_string(),
+                    state: if error_kind.is_some() {
+                        "error".to_string()
+                    } else {
+                        "stopped".to_string()
+                    },
                     service_pid: None,
                     app_proxy_running: false,
                     tun_running: false,
@@ -2033,6 +2039,21 @@ impl AppState {
                     }
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
+                let msg = if cfg!(target_os = "macos") {
+                    format!(
+                        "SERVICE_UNAVAILABLE: launchd daemon did not connect on {} (check /Library/Logs/Bypax/bypax-service-launchd.log)",
+                        self.service_endpoint
+                    )
+                } else {
+                    format!(
+                        "SERVICE_UNAVAILABLE: Unable to connect to Bypax helper on {}",
+                        self.service_endpoint
+                    )
+                };
+                if let Ok(mut err_g) = self.last_service_error.lock() {
+                    *err_g = Some((msg.clone(), Some("pipe_timeout".to_string())));
+                }
+                self.push_log("WARN", &msg);
             }
 
             Ok(self.query_service_status().await)

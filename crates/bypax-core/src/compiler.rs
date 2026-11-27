@@ -392,13 +392,30 @@ impl SingBox114Compiler {
             );
             tun_obj.insert("strict_route".to_string(), json!(strict_route));
 
-            let exclude_cidrs: Vec<String> = input
+            let mut protected_cidrs: Vec<String> = vec![addr.to_string()];
+            if input.settings.dns_fake_ip {
+                let fake4 = if input.settings.dns_fake_ip_inet4.trim().is_empty() {
+                    "198.18.0.0/15"
+                } else {
+                    input.settings.dns_fake_ip_inet4.trim()
+                };
+                let fake6 = if input.settings.dns_fake_ip_inet6.trim().is_empty() {
+                    "fc00::/18"
+                } else {
+                    input.settings.dns_fake_ip_inet6.trim()
+                };
+                protected_cidrs.push(fake4.to_string());
+                protected_cidrs.push(fake6.to_string());
+            }
+
+            let raw_exclude_cidrs: Vec<String> = input
                 .settings
                 .tun_route_exclude_cidrs
                 .iter()
                 .map(|c| c.trim().to_string())
                 .filter(|c| !c.is_empty())
                 .collect();
+            let exclude_cidrs = subtract_protected_cidrs(&raw_exclude_cidrs, &protected_cidrs);
             if !exclude_cidrs.is_empty() {
                 tun_obj.insert("route_exclude_address".to_string(), json!(exclude_cidrs));
             }
@@ -1699,4 +1716,198 @@ fn merge_json(base: &mut Value, patch: Value) {
         }
         (b, p) => *b = p,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct V4Net {
+    net: u32,
+    prefix: u8,
+}
+
+impl V4Net {
+    fn parse(raw: &str) -> Option<Self> {
+        let (ip_s, pfx_s) = match raw.split_once('/') {
+            Some((a, b)) => (a.trim(), Some(b.trim())),
+            None => (raw.trim(), None),
+        };
+        let ip: std::net::Ipv4Addr = ip_s.parse().ok()?;
+        let prefix = match pfx_s {
+            Some(p) => p.parse::<u8>().ok()?,
+            None => 32,
+        };
+        if prefix > 32 {
+            return None;
+        }
+        let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+        Some(Self {
+            net: u32::from(ip) & mask,
+            prefix,
+        })
+    }
+
+    fn contains(self, other: Self) -> bool {
+        if self.prefix > other.prefix {
+            return false;
+        }
+        let mask = if self.prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - self.prefix)
+        };
+        (other.net & mask) == self.net
+    }
+
+    fn subtract(self, cut: Self) -> Vec<Self> {
+        if cut.contains(self) {
+            return Vec::new();
+        }
+        if !self.contains(cut) {
+            return vec![self];
+        }
+        let mut out = Vec::new();
+        let mut cur = self;
+        while cur.prefix < cut.prefix {
+            let next_prefix = cur.prefix + 1;
+            let bit = 1u32 << (32 - next_prefix);
+            let left = Self {
+                net: cur.net,
+                prefix: next_prefix,
+            };
+            let right = Self {
+                net: cur.net | bit,
+                prefix: next_prefix,
+            };
+            if left.contains(cut) {
+                out.push(right);
+                cur = left;
+            } else {
+                out.push(left);
+                cur = right;
+            }
+        }
+        out
+    }
+
+    fn format(self) -> String {
+        format!("{}/{}", std::net::Ipv4Addr::from(self.net), self.prefix)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct V6Net {
+    net: u128,
+    prefix: u8,
+}
+
+impl V6Net {
+    fn parse(raw: &str) -> Option<Self> {
+        let (ip_s, pfx_s) = match raw.split_once('/') {
+            Some((a, b)) => (a.trim(), Some(b.trim())),
+            None => (raw.trim(), None),
+        };
+        let ip: std::net::Ipv6Addr = ip_s.parse().ok()?;
+        let prefix = match pfx_s {
+            Some(p) => p.parse::<u8>().ok()?,
+            None => 128,
+        };
+        if prefix > 128 {
+            return None;
+        }
+        let mask = if prefix == 0 {
+            0
+        } else {
+            u128::MAX << (128 - prefix)
+        };
+        Some(Self {
+            net: u128::from(ip) & mask,
+            prefix,
+        })
+    }
+
+    fn contains(self, other: Self) -> bool {
+        if self.prefix > other.prefix {
+            return false;
+        }
+        let mask = if self.prefix == 0 {
+            0
+        } else {
+            u128::MAX << (128 - self.prefix)
+        };
+        (other.net & mask) == self.net
+    }
+
+    fn subtract(self, cut: Self) -> Vec<Self> {
+        if cut.contains(self) {
+            return Vec::new();
+        }
+        if !self.contains(cut) {
+            return vec![self];
+        }
+        let mut out = Vec::new();
+        let mut cur = self;
+        while cur.prefix < cut.prefix {
+            let next_prefix = cur.prefix + 1;
+            let bit = 1u128 << (128 - next_prefix);
+            let left = Self {
+                net: cur.net,
+                prefix: next_prefix,
+            };
+            let right = Self {
+                net: cur.net | bit,
+                prefix: next_prefix,
+            };
+            if left.contains(cut) {
+                out.push(right);
+                cur = left;
+            } else {
+                out.push(left);
+                cur = right;
+            }
+        }
+        out
+    }
+
+    fn format(self) -> String {
+        format!("{}/{}", std::net::Ipv6Addr::from(self.net), self.prefix)
+    }
+}
+
+/// Removes protected TUN / FakeIP subnets from `route_exclude_address` so
+/// sing-box `auto_route` never creates a routing hole over its own TUN peer IP
+/// (e.g. `172.19.0.2` inside `172.16.0.0/12`) or active FakeIP pool.
+pub(crate) fn subtract_protected_cidrs(excludes: &[String], protected: &[String]) -> Vec<String> {
+    let cuts_v4: Vec<V4Net> = protected.iter().filter_map(|p| V4Net::parse(p)).collect();
+    let cuts_v6: Vec<V6Net> = protected.iter().filter_map(|p| V6Net::parse(p)).collect();
+
+    let mut out = Vec::with_capacity(excludes.len());
+    for raw in excludes {
+        if let Some(net4) = V4Net::parse(raw) {
+            let mut pieces = vec![net4];
+            for cut in &cuts_v4 {
+                let mut next = Vec::new();
+                for piece in pieces {
+                    next.extend(piece.subtract(*cut));
+                }
+                pieces = next;
+            }
+            for p in pieces {
+                out.push(p.format());
+            }
+        } else if let Some(net6) = V6Net::parse(raw) {
+            let mut pieces = vec![net6];
+            for cut in &cuts_v6 {
+                let mut next = Vec::new();
+                for piece in pieces {
+                    next.extend(piece.subtract(*cut));
+                }
+                pieces = next;
+            }
+            for p in pieces {
+                out.push(p.format());
+            }
+        } else {
+            out.push(raw.clone());
+        }
+    }
+    out
 }

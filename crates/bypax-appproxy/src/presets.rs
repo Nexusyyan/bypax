@@ -55,6 +55,7 @@ pub fn list_app_presets() -> Vec<AppPresetDef> {
                 "language_server_windows_x64.exe".into(),
                 "ls_core.exe".into(),
                 "Antigravity".into(),
+                "language_server".into(),
                 "language_server_macos_arm".into(),
                 "language_server_macos_x64".into(),
             ],
