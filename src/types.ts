@@ -685,8 +685,13 @@ export interface SelectNodeResult {
   compiled: CompileOutput;
 }
 
+export interface InstanceConflictEvent {
+  runningPath: string;
+  attemptedCwd: string;
+}
+
 export interface ToastMessage {
   id: string;
   text: string;
-  tone: "ok" | "err" | "neutral";
+  tone: "ok" | "warn" | "err" | "neutral";
 }

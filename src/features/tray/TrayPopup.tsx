@@ -250,12 +250,20 @@ export function TrayPopup() {
 
   const handleSysProxy = async () => {
     const next = !sysProxy;
-    setSettings((prev) => (prev ? { ...prev, systemProxyEnabled: next } : prev));
+    setCaptureErr(null);
     try {
       const info = await api.toggleSystemProxy(next);
       setCoreInfo(info);
-    } catch {
-      // ignore
+      setSettings((prev) => (prev ? { ...prev, systemProxyEnabled: next } : prev));
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes("NO_NODES_CONFIGURED")) {
+        setCaptureErr(dict.toast.noNodesSysProxy);
+      } else if (msg.includes("CORE_NOT_INSTALLED")) {
+        setCaptureErr(dict.toast.coreMissingAction);
+      } else {
+        setCaptureErr(msg);
+      }
     }
   };
 

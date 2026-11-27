@@ -303,9 +303,12 @@ export function NodesView({
                 visibleNodes.map((n) => n.id),
               )
             }
-            className="ui-btn-primary h-8"
+            className={nodes.length === 0 ? "ui-btn-secondary h-8" : "ui-btn-primary h-8"}
           >
-            <Gauge className="h-3.5 w-3.5" strokeWidth={1.5} />
+            <Gauge
+              className={`h-3.5 w-3.5 ${nodes.length === 0 ? "text-[var(--text-secondary)]" : ""}`}
+              strokeWidth={1.5}
+            />
             {dict.nodes.realDelay}
           </button>
 
@@ -326,9 +329,12 @@ export function NodesView({
           <button
             type="button"
             onClick={() => setShowImport(true)}
-            className="ui-btn-secondary h-8"
+            className={nodes.length === 0 ? "ui-btn-primary h-8" : "ui-btn-secondary h-8"}
           >
-            <Plus className="h-3.5 w-3.5 text-[var(--text-secondary)]" strokeWidth={1.5} />
+            <Plus
+              className={`h-3.5 w-3.5 ${nodes.length === 0 ? "" : "text-[var(--text-secondary)]"}`}
+              strokeWidth={1.5}
+            />
             {dict.nodes.importBtn}
           </button>
         </div>
@@ -512,20 +518,27 @@ export function NodesView({
           <p className="max-w-md text-[12.5px] text-[var(--text-secondary)]">
             {dict.nodes.emptyDesc}
           </p>
-          <div className="mt-1 flex items-center gap-2">
-            <button type="button" onClick={() => setShowImport(true)} className="ui-btn-primary">
-              <Plus className="h-3.5 w-3.5" strokeWidth={1.5} />
-              {dict.nodes.importBtn}
-            </button>
+          <div className="mt-2 flex flex-col items-center gap-2">
             <button
               type="button"
-              onClick={() =>
-                void onImportPayload(SAMPLE_SHARE_URIS, dict.nodes.groupNamePlaceholder)
-              }
-              className="ui-btn-secondary"
+              onClick={() => setShowImport(true)}
+              className="ui-btn-primary h-9 px-4"
             >
-              {dict.nodes.importSample}
+              <Plus className="h-3.5 w-3.5" strokeWidth={1.6} />
+              {dict.nodes.emptyImportBtn}
             </button>
+            {nodes.length === 0 && (
+              <button
+                type="button"
+                title={dict.nodes.sampleTooltip}
+                onClick={() =>
+                  void onImportPayload(SAMPLE_SHARE_URIS, dict.nodes.demoGroupName)
+                }
+                className="ui-btn-ghost h-8 text-[12px] text-[var(--text-secondary)]"
+              >
+                {dict.nodes.importSample}
+              </button>
+            )}
           </div>
         </div>
       ) : (
@@ -1024,7 +1037,13 @@ export function NodesView({
                 {importTab === "paste" ? (
                   <button
                     type="button"
-                    onClick={() => setImportPayload(SAMPLE_SHARE_URIS)}
+                    title={dict.nodes.sampleTooltip}
+                    onClick={() => {
+                      setImportPayload(SAMPLE_SHARE_URIS);
+                      if (!importGroup.trim()) {
+                        setImportGroup(dict.nodes.demoGroupName);
+                      }
+                    }}
                     className="text-[12px] text-[var(--text-secondary)] underline hover:text-[var(--text-primary)] cursor-pointer"
                   >
                     {dict.nodes.fillSample}

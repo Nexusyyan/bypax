@@ -1144,6 +1144,12 @@ export const mockBackend = {
 
   toggleSystemProxy(enabled: boolean): CoreInfo {
     ensureInit();
+    if (enabled && store.nodes.length === 0) {
+      throw new Error("NO_NODES_CONFIGURED");
+    }
+    if (enabled && !store.coreInfo.installed) {
+      throw new Error("CORE_NOT_INSTALLED");
+    }
     store.settings.systemProxyEnabled = enabled;
     store.coreInfo.netguardArmed = enabled;
     return { ...store.coreInfo };

@@ -1,13 +1,13 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/bypax-banner-dark.svg" />
-    <source media="(prefers-color-scheme: light)" srcset="assets/bypax-banner-light.svg" />
-    <img src="assets/bypax-banner-light.svg" alt="Bypax -- Cross-platform app routing and proxy workbench" width="100%" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Nexusyyan/bypax/main/assets/bypax-banner-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/Nexusyyan/bypax/main/assets/bypax-banner-light.svg" />
+    <img src="https://raw.githubusercontent.com/Nexusyyan/bypax/main/assets/bypax-banner-light.svg" alt="Bypax -- Cross-platform app routing and proxy workbench" width="100%" />
   </picture>
 </p>
 
 <p align="center">
-  <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a> | <a href="DESIGN.md">Design System</a> | <a href="skills/bypax-agent/SKILL.md">Agent Skill</a>
+  <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a> | <a href="https://github.com/Nexusyyan/bypax/blob/main/DESIGN.md">Design System</a> | <a href="skills/bypax-agent/SKILL.md">Agent Skill</a>
 </p>
 
 <p align="center">
@@ -31,16 +31,16 @@ It combines a high-density node pool, plain-language split routing, full process
 | **Interception Engine** | Dynamically loaded (`libloading`) signed `WinDivert.dll` + `WinDivert64.sys` (`SOCKET`/`FLOW`/`NETWORK`) + `smoltcp` userspace TCP/IP stack -> single loopback SOCKS5 mux (`127.0.0.1:10818`) with `auth_user` exit routing | Zero paid Apple certificate: `launchd` LaunchDaemon (`com.bypax.service`) + `sing-box` `utun` (`strict_route: false`) + `.app` bundle `process_path_regex` + trailing nested `invert: true` direct catch-all gate |
 | **Routing Table & VPN Safety** | **Zero virtual NICs & zero OS route table edits** -- coexists seamlessly with corporate VPNs, WSL2, Docker Desktop, and Hyper-V | Unselected apps stay direct; automatic `route_exclude_address` bypass for RFC1918 LAN, OrbStack (`198.19.0.0/16`), Tailscale (`100.64.0.0/10`), and link-local IPv6 |
 | **Child Process Tree** | Microsecond `NtQueryInformationProcess` ancestry + `CreateToolhelp32Snapshot` fallback captures deeply spawned IDE helpers (`language_server`, `node.exe`, `uv.exe`) | Bundle children captured natively by path regex; `libproc` + `sysctl` detects out-of-bundle children (e.g. `/opt/homebrew/bin/node`) for 1-click capture or ignore |
-| **Privilege Isolation** | Non-elevated Medium Integrity GUI; privileged WinDivert/TUN isolated to `BypaxService` (LocalSystem) or on-demand UAC `worker-run` with 15s GUI heartbeat watchdog | Non-elevated GUI; privileged `utun` & NetGuard rollback isolated to `/Library/LaunchDaemons/com.bypax.service.plist` |
+| **Privilege Isolation** | Non-elevated Medium Integrity GUI; privileged WinDivert/TUN isolated to GUI-bound ephemeral `bypax-service.exe worker-run` (`elevated_worker`, strict GUI PID binding via Win32 `WaitForSingleObject`, 0ms teardown on exit/crash, zero SCM background service; `bypax-cli service cleanup` removes legacy services) | Non-elevated GUI; privileged `utun` & NetGuard rollback isolated to `/Library/LaunchDaemons/com.bypax.service.plist` with GUI lease watchdog |
 | **Connection Attribution** | PQ-TLS (`X25519MLKEM768`) SNI / HTTP / QUIC sniffing + `OriginRegistry` backfills real `Antigravity > node.exe` origins in Monitor with zero double-counting | Native `find_process` attribution with zero double-counting |
 
 ## Key Features
 
-- **Orthogonal Takeover Mental Model**: Separate **Mode** (`Rule | Global | Direct`) from **Takeover** (independent `System Proxy` switch + mutually exclusive 3-way `Capture: Off | Apps | TUN` control) synchronized across the custom frameless TitleBar and `304x456` System Tray Popover.
+- **Orthogonal Takeover Mental Model**: Separate **Mode** from **Takeover** in a calm frameless TitleBar (`[Rule | Global | Direct] | [System Proxy] [Off | App Proxy | TUN]`) -- pairing an independent `System Proxy` switch with a mutually exclusive 3-way `Off | App Proxy | TUN` segmented control, synchronized in real time with the `304x456` System Tray Popover.
 - **Per-App Routing (`Apps` View)**: 7 one-click presets (Antigravity, Cursor, VS Code, Git & SSH, Discord, Telegram, Steam) with 6-way outbound targeting (`Follow Routing`, `Main Exit`, `Auto Region`, `Specific Node`, `Direct`, `Reject`), drag-and-keyboard priority reordering, two-phase L4 process + L7 domain overrides, ancestor-tree process / `.app` picker, and a 3-step dry-run match tester.
-- **High-Density Node Pool & Community Routing**: Import share URIs (`VLESS Reality/WS/gRPC/HTTPUpgrade`, `VMess`, `Trojan`, `Shadowsocks`, `Hysteria2`, `TUIC`, `AnyTLS`, `WireGuard`, `HTTP(S)`, `SOCKS5`), Base64 subscriptions, `sing-box` JSON, or Clash YAML; 0ms hot-switching; 32 official SagerNet `.srs` presets; Unified RTT latency engine; and dedicated visual DNS configuration.
-- **Preflight Validation & NetGuard Crash Safety**: Every config swap runs `sing-box check -c` first; `NetGuard` snapshots OS proxy/DNS settings before mutation and restores them automatically within 15 seconds if the GUI terminates unexpectedly.
-- **Native Self-Updater & Core Manager**: Proxy-aware GitHub Releases checker with `SHA256SUMS.txt` verification, multi-binary atomic replacement (coordinating `BypaxService` graceful stop/restart and `.prev` rollback), and automatic post-update state resume (`--resume-core`, `--resume-sys-proxy`, `--resume-app-proxy`, `--resume-tun`).
+- **High-Density Node Pool & Community Routing**: Import share URIs (`VLESS Reality/WS/gRPC/HTTPUpgrade`, `VMess`, `Trojan`, `Shadowsocks`, `Hysteria2`, `TUIC`, `AnyTLS`, `WireGuard`, `HTTP(S)`, `SOCKS5`), Base64 subscriptions, `sing-box` JSON, or Clash YAML; 0ms hot-switching; 33 official SagerNet + MetaCubeX GeoIP mirror `.srs` presets (including Steam CN CDN direct); Unified RTT latency engine; and dedicated visual DNS configuration.
+- **Preflight Validation & NetGuard Crash Safety**: Every config swap runs `sing-box check -c` first; `NetGuard` snapshots OS proxy/DNS settings before mutation and restores them automatically on exit or crash (0ms teardown on Windows via GUI-bound `worker-run`; 15s lease watchdog on macOS `launchd`).
+- **Native Self-Updater & Core Manager**: Proxy-aware GitHub Releases checker with `SHA256SUMS.txt` verification, multi-binary atomic replacement (cleanly stopping the active GUI-bound `worker-run` helper or macOS `launchd` daemon with `.prev` rollback), and automatic post-update state resume (`--resume-core`, `--resume-sys-proxy`, `--resume-app-proxy`, `--resume-tun`).
 - **Studio Slate Bilingual UI**: Calm neutral Light (`#F6F7F9/#FFFFFF/#0F172A`) and Dark (`#0B1120/#0D1117/#161B22`) themes with zero external font/CDN requests, `@container` responsive tables down to `940x620`, and complete English / Simplified Chinese parity.
 
 ## Downloads & Installation
@@ -68,7 +68,7 @@ Every release publishes a unified `SHA256SUMS.txt`. Verify your download before 
 
 ```powershell
 # Windows (PowerShell)
-Get-FileHash .\bypax-v0.1.0-x86_64-windows-portable.zip -Algorithm SHA256
+Get-FileHash .\bypax-vX.Y.Z-x86_64-windows-portable.zip -Algorithm SHA256
 ```
 
 ```bash
@@ -78,7 +78,7 @@ shasum -a 256 -c SHA256SUMS.txt --ignore-missing
 
 ## AI Agent CLI & 20-Tool Stdio MCP Quickstart
 
-Bypax ships a dedicated console binary (`bypax-cli`) exposing both a **20-tool Stdio MCP Server** (`protocolVersion: "2024-11-05"`, `serverInfo.name: "bypax-mcp"`) and structured JSON commands (`bypax-cli ctl --json`). When the GUI is open, mutations hot-sync over Plane 2 IPC (`bypax-ctl-v1`) in real time; when the GUI is closed, `bypax-cli` automatically falls back to SQLite WAL (`bypax.db`) and Plane 1 service IPC.
+Bypax ships a dedicated console binary (`bypax-cli`) exposing both a **20-tool Stdio MCP Server** (`protocolVersion: "2024-11-05"`, `serverInfo.name: "bypax-mcp"`) and structured JSON commands (`bypax-cli ctl --json`). When the GUI is open, mutations hot-sync over Plane 2 IPC (`bypax-ctl-v1`) in real time; when the GUI is closed, `bypax-cli` automatically falls back to SQLite WAL (`bypax.db`) for offline inspection, rule edits, and safe stop/cleanup (active core, System Proxy, App Proxy, and TUN remain strictly bound to the GUI lifecycle).
 
 Add Bypax to Antigravity, Claude Code, or Cursor (or copy the auto-detected config from **Settings -> AI Agent Integration**):
 
@@ -98,10 +98,11 @@ On macOS, point `command` to `/Applications/Bypax.app/Contents/MacOS/bypax-cli`.
 ```powershell
 # Structured JSON CLI examples
 .\bypax-cli.exe ctl --json status
-.\bypax-cli.exe ctl --json nodes
+.\bypax-cli.exe ctl --json node list
 .\bypax-cli.exe ctl --json app test --process Antigravity.exe --host api.github.com --port 443
 .\bypax-cli.exe doctor
 .\bypax-cli.exe ps
+.\bypax-cli.exe service cleanup
 .\bypax-cli.exe ctl schema
 ```
 
@@ -115,8 +116,8 @@ bypax/
 │   ├── bypax-core/          # NodeIR, parsers, sing-box v1.14+ compiler, Control API, NetGuard, SQLite WAL, tester, supervisor, multi-binary updater
 │   ├── bypax-appproxy/      # Cross-platform process-tree tracker, L4/L7 rule engine, PQ-TLS SNI sniffer, smoltcp netstack, OriginRegistry
 │   ├── bypax-windivert/     # Windows dynamic libloading WinDivert driver wrapper (no-op stub on Unix)
-│   ├── bypax-ipc/           # Dual-plane JSON-RPC IPC (Plane 1 privileged service + Plane 2 user control)
-│   ├── bypax-service/       # Privileged daemon (Windows BypaxService / UAC worker + macOS launchd)
+│   ├── bypax-ipc/           # Dual-plane JSON-RPC IPC (Plane 1 privileged helper + Plane 2 user control)
+│   ├── bypax-service/       # Privileged helper (Windows GUI-bound worker-run + legacy cleanup; macOS launchd)
 │   └── bypax-cli/           # Console JSON CLI + 20-tool Stdio MCP Server (live IPC + offline WAL fallback)
 ├── src-tauri/               # Non-elevated Tauri v2 desktop host (com.bypax.desktop)
 ├── src/                     # React 19 + TypeScript + Tailwind v4 Studio Slate UI (en / zh-CN)

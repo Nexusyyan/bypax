@@ -25,6 +25,7 @@ import type {
   ImportSummary,
   InboundPort,
   InstalledAppItem,
+  InstanceConflictEvent,
   LatencyProgressEvent,
   LatencyResult,
   LiveMonitorPayload,
@@ -444,6 +445,13 @@ export const api = {
   async onStateSync(cb: () => void): Promise<() => void> {
     if (!isTauriEnv()) return () => {};
     return listen("bypax-state-sync", () => cb());
+  },
+
+  async onInstanceConflict(
+    cb: (ev: InstanceConflictEvent) => void,
+  ): Promise<() => void> {
+    if (!isTauriEnv()) return () => {};
+    return listen<InstanceConflictEvent>("bypax-instance-conflict", (e) => cb(e.payload));
   },
 
   async onAppUpdateProgress(

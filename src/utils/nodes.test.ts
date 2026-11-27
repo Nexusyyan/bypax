@@ -88,6 +88,17 @@ describe("Bypax frontend utilities, brand hygiene & i18n parity", () => {
     expect(allStrings).not.toMatch(/portline|bypath|sing-box|Network Extension/i);
   });
 
+  it("provides localized onboarding guards, conflict toast placeholder, and offline demo copy", () => {
+    expect(en.toast.noNodesSysProxy.length).toBeGreaterThan(0);
+    expect(zhCN.toast.noNodesSysProxy.length).toBeGreaterThan(0);
+    expect(en.toast.instanceConflict).toContain("{runningPath}");
+    expect(zhCN.toast.instanceConflict).toContain("{runningPath}");
+    expect(en.nodes.importSample.toLowerCase()).toContain("preview");
+    expect(zhCN.nodes.importSample).toContain("\u4ec5\u9884\u89c8");
+    expect(en.nodes.sampleTooltip.length).toBeGreaterThan(0);
+    expect(zhCN.nodes.sampleTooltip.length).toBeGreaterThan(0);
+  });
+
   it("formats one-line takeover summary and middle truncation cleanly", () => {
     const labels = {
       modeRule: "Rule",

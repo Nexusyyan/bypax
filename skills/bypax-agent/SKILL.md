@@ -39,7 +39,7 @@ macOS / Linux example:
 }
 ```
 
-Tip: Open **Settings -> Advanced -> AI Agent Integration** inside Bypax to copy a ready-to-paste snippet with the exact detected executable path.
+Tip: Open **Settings -> AI Agent Integration** inside Bypax to copy a ready-to-paste snippet with the exact detected executable path.
 
 ### Structured JSON CLI (Zero-Setup Terminal Fallback)
 
@@ -55,17 +55,18 @@ bypax-cli ctl --json node test --kind tcping
 bypax-cli ctl --json app list-rules
 bypax-cli ctl --json app test --process Cursor.exe --host api.openai.com --port 443
 bypax-cli ctl --json route test --target https://github.com
-bypax-cli ctl --json connections --limit 50
+bypax-cli ctl --json connections --source app_proxy
 bypax-cli ctl --json logs --level WARN --limit 50
 bypax-cli ctl schema
 bypax-cli doctor
 bypax-cli ps --filter code
 bypax-cli service status
+bypax-cli service cleanup
 ```
 
 ## 2. Live Mode vs. Automatic Offline Fallback
 
-- **Live Mode (GUI open)**: `bypax-cli` connects to the non-elevated Bypax GUI over Plane 2 Control IPC (`\\.\pipe\bypax-ctl-v1` on Windows, `<runtime_dir>/bypax-ctl.sock` with mode `0600` on macOS/Linux). Node switches are 0ms hot-switches, and every mutation emits `bypax-state-sync` so the desktop UI refreshes immediately.
+- **Live Mode (GUI open)**: `bypax-cli` connects to the non-elevated Bypax GUI over Plane 2 Control IPC (`\\.\pipe\bypax-ctl-v1` on Windows, `<runtime_dir>/bypax-ctl.sock` with mode `0600` on macOS/Linux). Node switches are 0ms hot-switches, and every mutation emits `bypax-state-sync` so the desktop UI refreshes immediately. Enabling System Proxy requires at least one configured node (otherwise returns `NO_NODES_CONFIGURED`).
 - **Offline Fallback (GUI closed)**: If Plane 2 is unavailable, `bypax-cli` automatically falls back to SQLite WAL (`bypax.db` with `busy_timeout = 5000`) for persistent settings, nodes, and rules. **No-GUI, No-Active-Proxy boundary**: offline mode can inspect state, edit nodes/rules, and run stop/disable/cleanup operations, but enabling active core, OS system proxy, App Proxy, or TUN returns `GUI_NOT_RUNNING` until Bypax GUI is open.
 
 ## 3. Complete 20-Tool MCP Catalog
@@ -90,7 +91,7 @@ bypax-cli service status
 | :--- | :--- |
 | `bypax_list_route_rules` | Lists configured routing rules in priority order. |
 | `bypax_test_route` | Dry-runs domain/IP routing evaluation (`target`, optional `process_name`) and explains matched rule + DNS server. |
-| `bypax_list_connections` | Lists live active connections with attributed ancestor/process names, source (`System Proxy` / `App Proxy` / `TUN`), and optional `process` / `source` / `limit` filters. |
+| `bypax_list_connections` | Lists live active connections with attributed ancestor/process names, source (`sys_proxy` / `app_proxy` / `tun` / `dedicated_port`), and optional `query` (or `process`) and `source` filters. |
 | `bypax_get_logs` | Retrieves recent diagnostic log entries (`min_level: "INFO" \| "WARN" \| "ERROR"`, `limit`). |
 | `bypax_doctor` | Runs full environment diagnostics: core binary, database/WAL, Plane 1 service, WinDivert driver (Windows) or launchd daemon (macOS), and NetGuard state. |
 
@@ -133,8 +134,8 @@ bypax-cli service status
        "target": "main"
      }
      ```
-3. Add a higher-priority L7 domain bypass rule if corporate domains must stay direct:
-   - Call `bypax_app_upsert_rule` with lower `priority` (evaluated first), `domains: ["*.corp.internal"]`, `target: "direct"`.
+3. Add an L7 domain bypass override if corporate domains must stay direct:
+   - Either add `domains: [{"pattern": "*.corp.internal", "action": "direct"}]` on the Cursor rule, or add a higher-priority rule (lower `priority`) with `target: "direct"`.
 4. Always dry-run verify both cases before enabling:
    - Call `bypax_app_test_rule` with `process_name: "Cursor.exe"`, `host: "api.openai.com"`, `dst_port: 443` (expect `main`).
    - Call `bypax_app_test_rule` with `process_name: "Cursor.exe"`, `host: "git.corp.internal"`, `dst_port: 443` (expect `direct`).
@@ -165,5 +166,5 @@ bypax-cli service status
    - Run `bypax_app_test_rule` and `bypax_test_route` to detect higher-priority rule shadowing.
    - On macOS, child processes spawned outside `.app` bundles (such as `/opt/homebrew/bin/node`) can be included by adding their path prefix to `path_prefixes` or `process_names`.
 5. **Service & legacy driver cleanup from terminal**:
-   - On Windows, Bypax uses a GUI-bound on-demand UAC helper (`worker-run`, stops immediately on GUI exit/crash) with zero background Windows SCM service. Run `bypax-cli service cleanup` (or `bypax-cli doctor`) to detect and remove any legacy background services or stale WinDivert locks.
+   - On Windows, Bypax uses a GUI-bound ephemeral UAC helper (`bypax-service.exe worker-run`, `elevated_worker`, strictly bound to the GUI PID via Win32 `WaitForSingleObject` for 0ms teardown on exit/crash) with zero Windows SCM background service. Run `bypax-cli service cleanup` (or `bypax-cli doctor`) to detect and remove any legacy background services or stale WinDivert locks.
    - On macOS, use `bypax-cli service status`, `bypax-cli service install`, `bypax-cli service start`, `bypax-cli service stop`, or `bypax-cli service uninstall`.

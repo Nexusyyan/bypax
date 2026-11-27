@@ -299,14 +299,19 @@ export default function App() {
   const mainProbeSeqRef = useRef(0);
 
   const dict = useMemo(() => getDict(locale), [locale]);
+  const instanceConflictTplRef = useRef(dict.toast.instanceConflict);
+  instanceConflictTplRef.current = dict.toast.instanceConflict;
 
-  const pushToast = useCallback((text: string, tone: "ok" | "err" | "neutral" = "ok") => {
-    const id = `${Date.now()}-${Math.random()}`;
-    setToasts((prev) => [...prev.slice(-3), { id, text, tone }]);
-    window.setTimeout(() => {
-      setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, 3200);
-  }, []);
+  const pushToast = useCallback(
+    (text: string, tone: ToastMessage["tone"] = "ok", durationMs = 3200) => {
+      const id = `${Date.now()}-${Math.random()}`;
+      setToasts((prev) => [...prev.slice(-3), { id, text, tone }]);
+      window.setTimeout(() => {
+        setToasts((prev) => prev.filter((t) => t.id !== id));
+      }, durationMs);
+    },
+    [],
+  );
 
   // Apply light/dark theme class immediately (R1 + J13); CSS --bg-chrome takes over after pre-paint
   useEffect(() => {
@@ -422,34 +427,54 @@ export default function App() {
     void api.listRulePresets().then(setRulePresets).catch(() => {});
   }, [reloadBootstrap]);
 
-  // Listen to state sync, app update progress, and core download progress events.
+  // Listen to state sync, instance conflict, app update progress, and core download progress events.
   useEffect(() => {
     if (!api.isDesktop()) return;
+    let active = true;
     let unlistenSync: (() => void) | undefined;
+    let unlistenConflict: (() => void) | undefined;
     let unlistenAppUpdate: (() => void) | undefined;
     let unlistenCoreProg: (() => void) | undefined;
 
     void api.onStateSync(() => void reloadBootstrap()).then((fn) => {
-      unlistenSync = fn;
+      if (!active) fn();
+      else unlistenSync = fn;
     });
+    void api
+      .onInstanceConflict((ev) => {
+        const runningPath = ev?.runningPath || ev?.attemptedCwd || "Bypax";
+        pushToast(
+          instanceConflictTplRef.current.replace("{runningPath}", runningPath),
+          "warn",
+          6500,
+        );
+      })
+      .then((fn) => {
+        if (!active) fn();
+        else unlistenConflict = fn;
+      });
     void api.onAppUpdateProgress((st) => {
       setAppUpdateState(st);
       if (st.error) setAppUpdateError(st.error);
     }).then((fn) => {
-      unlistenAppUpdate = fn;
+      if (!active) fn();
+      else unlistenAppUpdate = fn;
     });
     void api.onCoreDownloadProgress((ev) => {
       setCoreDownloadProgress(ev);
     }).then((fn) => {
-      unlistenCoreProg = fn;
+      if (!active) fn();
+      else unlistenCoreProg = fn;
     });
 
     return () => {
+      active = false;
       if (unlistenSync) unlistenSync();
+      if (unlistenConflict) unlistenConflict();
       if (unlistenAppUpdate) unlistenAppUpdate();
       if (unlistenCoreProg) unlistenCoreProg();
     };
-  }, [reloadBootstrap]);
+  }, [pushToast, reloadBootstrap]);
 
   // Listen to incremental latency test progress events.
   useEffect(() => {
@@ -606,7 +631,15 @@ export default function App() {
       setSettings((prev) => ({ ...prev, systemProxyEnabled: next }));
       pushToast(next ? dict.toast.sysProxyOn : dict.toast.sysProxyOff);
     } catch (err) {
-      pushToast(String(err), "err");
+      const msg = String(err);
+      if (msg.includes("NO_NODES_CONFIGURED")) {
+        pushToast(dict.toast.noNodesSysProxy, "warn", 4500);
+        setActiveTab("nodes");
+      } else if (msg.includes("CORE_NOT_INSTALLED")) {
+        pushToast(dict.toast.coreMissingAction, "err");
+      } else {
+        pushToast(msg, "err");
+      }
     }
   };
 
@@ -1580,9 +1613,11 @@ export default function App() {
                 backgroundColor:
                   t.tone === "err"
                     ? "var(--danger-dot)"
-                    : t.tone === "ok"
-                      ? "var(--success-dot)"
-                      : "var(--text-secondary)",
+                    : t.tone === "warn"
+                      ? "var(--warning-dot)"
+                      : t.tone === "ok"
+                        ? "var(--success-dot)"
+                        : "var(--text-secondary)",
               }}
             />
             <span>{t.text}</span>
