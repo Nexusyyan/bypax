@@ -45,6 +45,7 @@ pub struct AppProxyHandle {
     capture: Arc<dyn CaptureEngine>,
     runtime: Arc<RwLock<Arc<RuntimeSnapshot>>>,
     flow_cache: Arc<DashMap<FiveTuple, CachedFlow>>,
+    netstack: Arc<RwLock<Option<Arc<TcpNetstack>>>>,
     origins: Arc<OriginRegistry>,
     telemetry: Arc<AppProxyTelemetry>,
 }
@@ -61,6 +62,16 @@ impl AppProxyHandle {
         self.flow_cache.retain(|_, v| v.intercepted_tcp);
         info!(active_rules, "hot-reloaded bypax-appproxy rules");
         Ok(())
+    }
+
+    /// Actively injects TCP RST to all currently proxied TCP sessions so hijacked clients
+    /// immediately reconnect instead of stalling in half-open limbo when `sing-box` restarts.
+    pub fn reset_proxied_sessions(&self, reason: &'static str) {
+        if let Ok(guard) = self.netstack.read() {
+            if let Some(ref ns) = *guard {
+                ns.reset_proxied_sessions(reason);
+            }
+        }
     }
 
     pub fn lookup_origins(&self, local_ports: &[u16]) -> Vec<FlowOriginDto> {
@@ -103,6 +114,7 @@ pub struct AppProxyEngine {
     tracker: Arc<dyn ProcessTracker>,
     runtime: Arc<RwLock<Arc<RuntimeSnapshot>>>,
     flow_cache: Arc<DashMap<FiveTuple, CachedFlow>>,
+    netstack_slot: Arc<RwLock<Option<Arc<TcpNetstack>>>>,
     origins: Arc<OriginRegistry>,
     telemetry: Arc<AppProxyTelemetry>,
 }
@@ -119,6 +131,7 @@ impl AppProxyEngine {
             tracker,
             runtime: Arc::new(RwLock::new(Arc::new(built))),
             flow_cache: Arc::new(DashMap::new()),
+            netstack_slot: Arc::new(RwLock::new(None)),
             origins: Arc::new(OriginRegistry::new()),
             telemetry: AppProxyTelemetry::new(),
         })
@@ -129,12 +142,21 @@ impl AppProxyEngine {
             capture: Arc::clone(&self.capture),
             runtime: Arc::clone(&self.runtime),
             flow_cache: Arc::clone(&self.flow_cache),
+            netstack: Arc::clone(&self.netstack_slot),
             origins: Arc::clone(&self.origins),
             telemetry: Arc::clone(&self.telemetry),
         }
     }
 
-    pub async fn run(self, mut shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
+    pub async fn run(self, shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
+        self.run_with_ready(shutdown_rx, None).await
+    }
+
+    pub async fn run_with_ready(
+        self,
+        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        mut started_tx: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    ) -> Result<()> {
         let (pkt_tx, mut pkt_rx) = mpsc::channel::<CapturedPacket>(4096);
         let (netstack, netstack_handle) = TcpNetstack::spawn(
             Arc::clone(&self.capture),
@@ -143,6 +165,10 @@ impl AppProxyEngine {
             Arc::clone(&self.origins),
             Arc::clone(&self.telemetry),
         );
+        let netstack = Arc::new(netstack);
+        if let Ok(mut slot) = self.netstack_slot.write() {
+            *slot = Some(Arc::clone(&netstack));
+        }
         let udp_relay = Arc::new(UdpRelay::new(
             Arc::clone(&self.capture),
             Arc::clone(&self.tracker),
@@ -156,14 +182,36 @@ impl AppProxyEngine {
             tracker: Arc::clone(&self.tracker),
             runtime: Arc::clone(&self.runtime),
             flow_cache: Arc::clone(&self.flow_cache),
-            netstack: Arc::new(netstack),
+            netstack: Arc::clone(&netstack),
             udp_relay,
             telemetry: Arc::clone(&self.telemetry),
         };
 
-        self.capture.start(pkt_tx)?;
+        if let Err(err) = self.capture.start(pkt_tx) {
+            if let Some(tx) = started_tx.take() {
+                let _ = tx.send(Err(err.to_string()));
+            }
+            if let Ok(mut slot) = self.netstack_slot.write() {
+                *slot = None;
+            }
+            drop(ctx);
+            drop(netstack);
+            let _ = netstack_handle.await;
+            return Err(err);
+        }
+        if let Some(tx) = started_tx.take() {
+            let _ = tx.send(Ok(()));
+        }
         info!("bypax-appproxy engine started");
 
+        let initial_port = self
+            .runtime
+            .read()
+            .map(|r| r.app_proxy_port)
+            .unwrap_or(10818);
+        let mut last_listener_pid = self.capture.find_local_tcp_listener_pid(initial_port);
+        let mut upstream_watch = tokio::time::interval(Duration::from_secs(1));
+        upstream_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut gc_interval = tokio::time::interval(Duration::from_secs(15));
 
         loop {
@@ -172,14 +220,27 @@ impl AppProxyEngine {
                     info!("bypax-appproxy engine shutting down");
                     break;
                 }
+                _ = upstream_watch.tick() => {
+                    let rt = Arc::clone(&self.runtime.read().expect("runtime lock poisoned"));
+                    let current_pid = self.capture.find_local_tcp_listener_pid(rt.app_proxy_port);
+                    if let Some(pid) = current_pid {
+                        rt.rules.add_exempt_pid(pid);
+                    }
+                    if last_listener_pid.is_some() && current_pid != last_listener_pid {
+                        warn!(
+                            old_pid = ?last_listener_pid,
+                            new_pid = ?current_pid,
+                            port = rt.app_proxy_port,
+                            "upstream app-proxy listener disappeared or restarted; resetting active proxied TCP sessions via RST"
+                        );
+                        ctx.netstack.reset_proxied_sessions("upstream listener changed");
+                    }
+                    last_listener_pid = current_pid;
+                }
                 _ = gc_interval.tick() => {
                     let now = Instant::now();
                     self.flow_cache.retain(|_, v| now.duration_since(v.last_seen) < FLOW_CACHE_TTL);
                     self.origins.gc_expired();
-                    let rt = Arc::clone(&self.runtime.read().expect("runtime lock poisoned"));
-                    if let Some(pid) = self.capture.find_local_tcp_listener_pid(rt.app_proxy_port) {
-                        rt.rules.add_exempt_pid(pid);
-                    }
                 }
                 maybe_pkt = pkt_rx.recv() => {
                     match maybe_pkt {
@@ -193,8 +254,22 @@ impl AppProxyEngine {
             }
         }
 
+        // CRITICAL: Actively inject TCP RST into all hijacked client sockets BEFORE closing
+        // the WinDivert capture handle so long-lived clients never get stranded half-open!
+        if let Ok(mut slot) = self.netstack_slot.write() {
+            *slot = None;
+        }
+        let reset_count = ctx.netstack.shutdown_and_reset_all().await;
+        if reset_count > 0 {
+            info!(
+                reset_count,
+                "injected TCP RST for active sessions prior to WinDivert shutdown"
+            );
+        }
+        self.flow_cache.clear();
         let _ = self.capture.shutdown();
         drop(ctx);
+        drop(netstack);
         let _ = netstack_handle.await;
         Ok(())
     }

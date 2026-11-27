@@ -85,7 +85,10 @@ pub struct ParsedPacketHeader {
     pub ip_header_len: usize,
     pub l4_offset: usize,
     pub l4_payload_offset: usize,
+    pub payload_len: usize,
     pub tcp_flags: u8,
+    pub tcp_seq: u32,
+    pub tcp_ack: u32,
 }
 
 pub fn parse_ip_packet(packet: &[u8]) -> Option<ParsedPacketHeader> {
@@ -168,6 +171,25 @@ fn parse_l4(
     dst_ip: IpAddr,
     is_ipv6: bool,
 ) -> Option<ParsedPacketHeader> {
+    let ip_end = if !is_ipv6 && packet.len() >= 4 {
+        let total = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+        if total >= l4_offset && total <= packet.len() {
+            total
+        } else {
+            packet.len()
+        }
+    } else if is_ipv6 && packet.len() >= 6 {
+        let plen = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+        let total = 40usize.saturating_add(plen);
+        if total >= l4_offset && total <= packet.len() {
+            total
+        } else {
+            packet.len()
+        }
+    } else {
+        packet.len()
+    };
+
     match proto_num {
         6 => {
             if packet.len() < l4_offset + 20 {
@@ -175,11 +197,24 @@ fn parse_l4(
             }
             let src_port = u16::from_be_bytes([packet[l4_offset], packet[l4_offset + 1]]);
             let dst_port = u16::from_be_bytes([packet[l4_offset + 2], packet[l4_offset + 3]]);
+            let tcp_seq = u32::from_be_bytes([
+                packet[l4_offset + 4],
+                packet[l4_offset + 5],
+                packet[l4_offset + 6],
+                packet[l4_offset + 7],
+            ]);
+            let tcp_ack = u32::from_be_bytes([
+                packet[l4_offset + 8],
+                packet[l4_offset + 9],
+                packet[l4_offset + 10],
+                packet[l4_offset + 11],
+            ]);
             let data_offset = ((packet[l4_offset + 12] >> 4) as usize) * 4;
             if data_offset < 20 || packet.len() < l4_offset + data_offset {
                 return None;
             }
             let tcp_flags = packet[l4_offset + 13];
+            let l4_payload_offset = l4_offset + data_offset;
             Some(ParsedPacketHeader {
                 tuple: FiveTuple {
                     protocol: TransportProtocol::Tcp,
@@ -191,8 +226,11 @@ fn parse_l4(
                 is_ipv6,
                 ip_header_len: l4_offset,
                 l4_offset,
-                l4_payload_offset: l4_offset + data_offset,
+                l4_payload_offset,
+                payload_len: ip_end.saturating_sub(l4_payload_offset),
                 tcp_flags,
+                tcp_seq,
+                tcp_ack,
             })
         }
         17 => {
@@ -201,6 +239,7 @@ fn parse_l4(
             }
             let src_port = u16::from_be_bytes([packet[l4_offset], packet[l4_offset + 1]]);
             let dst_port = u16::from_be_bytes([packet[l4_offset + 2], packet[l4_offset + 3]]);
+            let l4_payload_offset = l4_offset + 8;
             Some(ParsedPacketHeader {
                 tuple: FiveTuple {
                     protocol: TransportProtocol::Udp,
@@ -212,12 +251,87 @@ fn parse_l4(
                 is_ipv6,
                 ip_header_len: l4_offset,
                 l4_offset,
-                l4_payload_offset: l4_offset + 8,
+                l4_payload_offset,
+                payload_len: ip_end.saturating_sub(l4_payload_offset),
                 tcp_flags: 0,
+                tcp_seq: 0,
+                tcp_ack: 0,
             })
         }
         _ => None,
     }
+}
+
+/// Builds a complete IPv4 or IPv6 TCP RST (or RST+ACK) packet with valid IP and TCP checksums.
+///
+/// Used to actively tear down hijacked client connections when upstream `app-proxy-in`
+/// disconnects, `sing-box` restarts, or `bypax-service` shuts down/cleans up sessions.
+pub fn build_tcp_rst_ip_packet(
+    src_ip: IpAddr,
+    src_port: u16,
+    dst_ip: IpAddr,
+    dst_port: u16,
+    seq: u32,
+    ack: Option<u32>,
+) -> Option<Vec<u8>> {
+    let tcp_len = 20usize;
+    let flags: u8 = if ack.is_some() { 0x14 } else { 0x04 }; // RST|ACK or RST
+    let ack_num = ack.unwrap_or(0);
+
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            let total_len = 20usize + tcp_len;
+            let mut buf = vec![0u8; total_len];
+            buf[0] = 0x45;
+            buf[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+            buf[6] = 0x40;
+            buf[8] = 64;
+            buf[9] = 6; // TCP
+            buf[12..16].copy_from_slice(&src.octets());
+            buf[16..20].copy_from_slice(&dst.octets());
+
+            let ip_csum = internet_checksum(&buf[0..20]);
+            buf[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+            write_tcp_rst_header(&mut buf[20..40], src_port, dst_port, seq, ack_num, flags);
+            let tcp_csum = ipv4_tcp_checksum(src, dst, &buf[20..40]);
+            buf[36..38].copy_from_slice(&tcp_csum.to_be_bytes());
+            Some(buf)
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            let total_len = 40usize + tcp_len;
+            let mut buf = vec![0u8; total_len];
+            buf[0] = 0x60;
+            buf[4..6].copy_from_slice(&(tcp_len as u16).to_be_bytes());
+            buf[6] = 6; // TCP
+            buf[7] = 64;
+            buf[8..24].copy_from_slice(&src.octets());
+            buf[24..40].copy_from_slice(&dst.octets());
+
+            write_tcp_rst_header(&mut buf[40..60], src_port, dst_port, seq, ack_num, flags);
+            let tcp_csum = ipv6_tcp_checksum(src, dst, &buf[40..60]);
+            buf[56..58].copy_from_slice(&tcp_csum.to_be_bytes());
+            Some(buf)
+        }
+        _ => None,
+    }
+}
+
+fn write_tcp_rst_header(
+    tcp: &mut [u8],
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+) {
+    tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
+    tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+    tcp[12] = 0x50; // data offset = 5 (20 bytes)
+    tcp[13] = flags;
+    // window = 0, checksum = 0 (filled by caller), urgent ptr = 0
 }
 
 /// Builds a complete IPv4 or IPv6 UDP datagram with valid IP and UDP checksums.
@@ -295,7 +409,7 @@ fn checksum_sum(data: &[u8]) -> u32 {
     sum
 }
 
-fn finalize_checksum(mut sum: u32) -> u16 {
+fn finalize_checksum_nonzero(mut sum: u32) -> u16 {
     while (sum >> 16) != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
@@ -307,12 +421,15 @@ fn finalize_checksum(mut sum: u32) -> u16 {
     }
 }
 
-fn internet_checksum(header: &[u8]) -> u16 {
-    let mut sum = checksum_sum(header);
+fn finalize_checksum_raw(mut sum: u32) -> u16 {
     while (sum >> 16) != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+fn internet_checksum(header: &[u8]) -> u16 {
+    finalize_checksum_raw(checksum_sum(header))
 }
 
 fn ipv4_l4_checksum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, l4: &[u8]) -> u16 {
@@ -322,7 +439,7 @@ fn ipv4_l4_checksum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, l4: &[u8]) -> u16 {
     sum += proto as u32;
     sum += l4.len() as u32;
     sum += checksum_sum(l4);
-    finalize_checksum(sum)
+    finalize_checksum_nonzero(sum)
 }
 
 fn ipv6_l4_checksum(src: Ipv6Addr, dst: Ipv6Addr, proto: u8, l4: &[u8]) -> u16 {
@@ -333,7 +450,28 @@ fn ipv6_l4_checksum(src: Ipv6Addr, dst: Ipv6Addr, proto: u8, l4: &[u8]) -> u16 {
     sum += (l4.len() as u32) & 0xFFFF;
     sum += proto as u32;
     sum += checksum_sum(l4);
-    finalize_checksum(sum)
+    finalize_checksum_nonzero(sum)
+}
+
+fn ipv4_tcp_checksum(src: Ipv4Addr, dst: Ipv4Addr, l4: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    sum += checksum_sum(&src.octets());
+    sum += checksum_sum(&dst.octets());
+    sum += 6u32;
+    sum += l4.len() as u32;
+    sum += checksum_sum(l4);
+    finalize_checksum_raw(sum)
+}
+
+fn ipv6_tcp_checksum(src: Ipv6Addr, dst: Ipv6Addr, l4: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    sum += checksum_sum(&src.octets());
+    sum += checksum_sum(&dst.octets());
+    sum += (l4.len() as u32) >> 16;
+    sum += (l4.len() as u32) & 0xFFFF;
+    sum += 6u32;
+    sum += checksum_sum(l4);
+    finalize_checksum_raw(sum)
 }
 
 #[cfg(test)]
@@ -348,6 +486,7 @@ mod tests {
         let parsed4 = parse_ip_packet(&pkt4).unwrap();
         assert!(!parsed4.is_ipv6);
         assert_eq!(parsed4.tuple.protocol, TransportProtocol::Udp);
+        assert_eq!(parsed4.payload_len, 5);
         assert_eq!(&pkt4[parsed4.l4_payload_offset..], b"hello");
 
         let src6 = IpAddr::V6("2001:db8::1".parse().unwrap());
@@ -355,6 +494,40 @@ mod tests {
         let pkt6 = build_udp_ip_packet(src6, 44321, dst6, 443, b"quic").unwrap();
         let parsed6 = parse_ip_packet(&pkt6).unwrap();
         assert!(parsed6.is_ipv6);
+        assert_eq!(parsed6.payload_len, 4);
         assert_eq!(&pkt6[parsed6.l4_payload_offset..], b"quic");
+    }
+
+    #[test]
+    fn build_and_parse_ipv4_and_ipv6_tcp_rst_roundtrip() {
+        let srv4 = IpAddr::V4(Ipv4Addr::new(142, 250, 72, 14));
+        let cli4 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20));
+        let rst4 = build_tcp_rst_ip_packet(srv4, 443, cli4, 55123, 0x1122_3344, Some(0x5566_7788))
+            .unwrap();
+        assert_eq!(rst4.len(), 40);
+        // Valid IPv4 header checksum reduces to 0 over header
+        assert_eq!(internet_checksum(&rst4[0..20]), 0);
+        let p4 = parse_ip_packet(&rst4).unwrap();
+        assert!(!p4.is_ipv6);
+        assert_eq!(p4.tuple.protocol, TransportProtocol::Tcp);
+        assert_eq!(p4.tuple.src_ip, srv4);
+        assert_eq!(p4.tuple.src_port, 443);
+        assert_eq!(p4.tuple.dst_ip, cli4);
+        assert_eq!(p4.tuple.dst_port, 55123);
+        assert_eq!(p4.tcp_seq, 0x1122_3344);
+        assert_eq!(p4.tcp_ack, 0x5566_7788);
+        assert_eq!(p4.tcp_flags, 0x14);
+        assert_eq!(p4.payload_len, 0);
+
+        let srv6 = IpAddr::V6("2606:4700:4700::1111".parse().unwrap());
+        let cli6 = IpAddr::V6("2001:db8::42".parse().unwrap());
+        let rst6 = build_tcp_rst_ip_packet(srv6, 443, cli6, 61000, 987_654, None).unwrap();
+        assert_eq!(rst6.len(), 60);
+        let p6 = parse_ip_packet(&rst6).unwrap();
+        assert!(p6.is_ipv6);
+        assert_eq!(p6.tcp_seq, 987_654);
+        assert_eq!(p6.tcp_ack, 0);
+        assert_eq!(p6.tcp_flags, 0x04);
+        assert_eq!(p6.payload_len, 0);
     }
 }
