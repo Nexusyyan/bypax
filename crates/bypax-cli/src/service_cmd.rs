@@ -120,11 +120,6 @@ pub fn detect_legacy_windows_services() -> Vec<String> {
     found
 }
 
-#[cfg(not(windows))]
-pub fn detect_legacy_windows_services() -> Vec<String> {
-    Vec::new()
-}
-
 #[cfg(windows)]
 pub fn query_os_service_status() -> ServiceStatusReport {
     use windows::core::PCWSTR;
