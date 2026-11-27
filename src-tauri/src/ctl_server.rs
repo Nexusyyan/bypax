@@ -695,6 +695,7 @@ async fn dispatch_ctl_request(
                         "portableMode": state.paths.portable_mode,
                         "dataDir": state.paths.root_dir.to_string_lossy(),
                         "dbPath": state.paths.db_path.to_string_lossy(),
+                        "logsDir": state.paths.logs_dir.to_string_lossy(),
                         "walEnabled": true
                     },
                     "core": core_info,

@@ -906,6 +906,40 @@ pub struct AppSettings {
     pub tun_route_exclude_cidrs: Vec<String>,
 }
 
+impl AppSettings {
+    /// Returns `true` if changing from `self` to `other` alters any field consumed by
+    /// `SingBox114Compiler::compile`. Pure UI/host/WinDivert preferences (theme, locale,
+    /// tray, autostart, update check, handshake strip, system proxy, etc.) return `false`
+    /// so toggling them never needlessly restarts `sing-box` or interrupts active sockets.
+    pub fn affects_core_config(&self, other: &Self) -> bool {
+        fn strip_non_core(mut s: AppSettings) -> AppSettings {
+            s.locale.clear();
+            s.theme.clear();
+            s.system_proxy_enabled = false;
+            s.auto_start_core = false;
+            s.launch_at_login = false;
+            s.minimize_to_tray = false;
+            s.auto_check_updates = false;
+            s.latency_strip_handshake = false;
+            s.app_proxy_bypass_lan = false;
+            s.app_proxy_block_quic_when_needed = false;
+            s.app_proxy_windivert_dir = None;
+            s.service_mode.clear();
+            s
+        }
+        strip_non_core(self.clone()) != strip_non_core(other.clone())
+    }
+
+    /// Returns `true` if changing from `self` to `other` alters WinDivert / `bypax-appproxy`
+    /// engine settings that require `ReloadAppProxy` even when `sing-box` itself did not change.
+    pub fn affects_app_proxy_engine(&self, other: &Self) -> bool {
+        self.app_proxy_port != other.app_proxy_port
+            || self.app_proxy_bypass_lan != other.app_proxy_bypass_lan
+            || self.app_proxy_block_quic_when_needed != other.app_proxy_block_quic_when_needed
+            || self.app_proxy_windivert_dir != other.app_proxy_windivert_dir
+    }
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -1176,4 +1210,38 @@ pub struct RulePresetSpec {
     pub rule_set: Option<String>,
     pub default_target: String,
     pub default_priority: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_diff_separates_ui_preferences_from_core_config() {
+        let base = AppSettings::default();
+
+        // UI / host-only preferences MUST NOT trigger a sing-box restart.
+        let mut ui_only = base.clone();
+        ui_only.theme = "dark".to_string();
+        ui_only.locale = "en".to_string();
+        ui_only.minimize_to_tray = !base.minimize_to_tray;
+        ui_only.launch_at_login = !base.launch_at_login;
+        ui_only.auto_check_updates = !base.auto_check_updates;
+        ui_only.latency_strip_handshake = !base.latency_strip_handshake;
+        ui_only.service_mode = "elevated_worker".to_string();
+        ui_only.system_proxy_enabled = !base.system_proxy_enabled;
+        assert!(!base.affects_core_config(&ui_only));
+        assert!(!base.affects_app_proxy_engine(&ui_only));
+
+        // App-proxy engine toggles affect WinDivert helper only, not sing-box config.
+        let mut ap_only = base.clone();
+        ap_only.app_proxy_bypass_lan = !base.app_proxy_bypass_lan;
+        assert!(!base.affects_core_config(&ap_only));
+        assert!(base.affects_app_proxy_engine(&ap_only));
+
+        // Core port / DNS / log changes MUST trigger core reload.
+        let mut core_change = base.clone();
+        core_change.mixed_port = 20808;
+        assert!(base.affects_core_config(&core_change));
+    }
 }

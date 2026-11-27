@@ -95,6 +95,19 @@ impl AppProxyHandle {
             .map(|r| r.rules.exempt_pids_snapshot())
             .unwrap_or_default()
     }
+
+    /// Registers a PID as exempt from WinDivert interception (e.g., a reloaded `sing-box` core).
+    pub fn add_exempt_pid(&self, pid: u32) {
+        if let Ok(rt) = self.runtime.read() {
+            rt.rules.add_exempt_pid(pid);
+        }
+    }
+
+    /// Queries the live OS TCP listener PID currently bound to the configured `app_proxy_port`.
+    pub fn find_upstream_listener_pid(&self) -> Option<u32> {
+        let port = self.runtime.read().ok().map(|r| r.app_proxy_port)?;
+        self.capture.find_local_tcp_listener_pid(port)
+    }
 }
 
 #[derive(Clone)]

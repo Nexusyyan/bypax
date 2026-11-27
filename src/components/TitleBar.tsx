@@ -178,14 +178,22 @@ export function TitleBar({
     hasRecoveryFault || (captureMode === "apps" && enabledAppCount === 0);
 
   const captureOptions = [
-    { value: "off" as CaptureMode, label: dict.capture.off },
+    {
+      value: "off" as CaptureMode,
+      label: dict.capture.off,
+      title: dict.capture.offHint,
+    },
     {
       value: "apps" as CaptureMode,
       label: dict.capture.apps,
       title: isMac ? dict.apps.engineMac : dict.apps.engineWin,
       dotColor: appsNeedsHint ? "var(--warning-dot)" : undefined,
     },
-    { value: "tun" as CaptureMode, label: dict.capture.tun },
+    {
+      value: "tun" as CaptureMode,
+      label: dict.capture.tun,
+      title: dict.capture.tunHint,
+    },
   ];
 
   const activeTakeoverCount =
@@ -297,6 +305,8 @@ export function TitleBar({
 
         {tier !== "compact" ? (
           <div className="relative flex items-center gap-2">
+            <div className="h-4 w-px bg-[var(--border-hairline)]" />
+
             {/* System Proxy switch pill (30px high, inner 32x18 switch) */}
             <div
               className="inline-flex h-[30px] items-center gap-2 rounded-[9px] border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 shadow-[var(--shadow-sm)]"
@@ -317,11 +327,8 @@ export function TitleBar({
               </button>
             </div>
 
-            {/* Capture 3-way Segmented with 11.5px prefix label */}
-            <div className="relative flex items-center gap-1.5">
-              <span className="text-[11.5px] font-medium text-[var(--text-secondary)]">
-                {dict.capture.label}
-              </span>
+            {/* Transparent takeover 3-way segmented control: Off | App Proxy | TUN */}
+            <div className="relative flex items-center">
               <SegmentedControl
                 value={captureMode}
                 options={captureOptions}

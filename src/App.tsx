@@ -224,6 +224,10 @@ export default function App() {
   const [theme, setTheme] = useState<ThemeMode>(readInitialTheme);
   const [activeTab, setActiveTab] = useState<NavTab>(readInitialTab);
   const [routingTestHost, setRoutingTestHost] = useState<string | null>(null);
+  const [monitorSubTabReq, setMonitorSubTabReq] = useState<{
+    tab: "conns" | "history" | "platforms" | "logs";
+    nonce: number;
+  } | null>(null);
 
   const [appVersion, setAppVersion] = useState<string>("0.1.0");
   const [platform, setPlatform] = useState<PlatformKind | string>(detectInitialPlatform);
@@ -672,32 +676,20 @@ export default function App() {
     }
   };
 
-  const handleServiceModeChange = async (mode: "off" | "onDemand" | "background") => {
+  const handleOpenLogsDir = async () => {
     try {
-      if (mode === "off") {
-        const nextSvc = await api.serviceAction(
-          serviceStatus.mode === "elevated_worker" ? "stop_worker" : "stop",
-        );
-        setServiceStatus(nextSvc);
-        setCaptureMode("off");
-      } else if (mode === "onDemand") {
-        pushToast(dict.service.waitingUac, "neutral");
-        const nextSvc = await api.serviceAction("start_worker");
-        setServiceStatus(nextSvc);
-      } else {
-        pushToast(dict.service.installing, "neutral");
-        const nextSvc = await api.serviceAction("install");
-        setServiceStatus(nextSvc);
+      const path = await api.openLogsDir();
+      if (!api.isDesktop()) {
+        pushToast(path, "neutral");
       }
-      await reloadBootstrap();
     } catch (err) {
-      const msg = String(err);
-      if (msg.includes("UAC_CANCELLED")) {
-        pushToast(dict.service.uacCancelled, "neutral");
-      } else {
-        pushToast(msg, "err");
-      }
+      pushToast(String(err), "err");
     }
+  };
+
+  const handleOpenLiveLogs = () => {
+    setMonitorSubTabReq((prev) => ({ tab: "logs", nonce: (prev?.nonce ?? 0) + 1 }));
+    setActiveTab("monitor");
   };
 
   const handleServiceAction = async (action: ServiceActionKind) => {
@@ -1358,6 +1350,7 @@ export default function App() {
               dict={dict}
               platform={platform}
               captureMode={captureMode}
+              captureSwitching={captureSwitching}
               nodes={nodes}
               mainNodeId={settings.mainNodeId}
               appRules={appRules}
@@ -1367,13 +1360,14 @@ export default function App() {
               appProxyStatus={appProxyStatus}
               missingTargets={compiled.missingAppRuleTargets ?? []}
               externalChildren={externalChildren}
-              onServiceModeChange={handleServiceModeChange}
+              onSelectCapture={handleSelectCapture}
               onServiceAction={handleServiceAction}
               onFallbackToTun={() => handleSelectCapture("tun")}
               onOpenWindowsSecurity={() => api.openWindowsSecurity()}
               onPickWindivertDir={handlePickWindivertDir}
               onProbeDriver={handleProbeDriver}
-              onOpenLogs={() => setActiveTab("monitor")}
+              onOpenLogs={handleOpenLiveLogs}
+              onOpenLogsDir={handleOpenLogsDir}
               onTogglePreset={handleTogglePreset}
               onSaveRule={handleSaveAppRule}
               onDeleteRule={handleDeleteAppRule}
@@ -1455,6 +1449,9 @@ export default function App() {
                 setLogs([]);
                 if (api.isDesktop()) void api.clearLogs().catch(() => {});
               }}
+              onOpenLogsDir={() => void handleOpenLogsDir()}
+              requestedSubTab={monitorSubTabReq?.tab}
+              requestedSubTabNonce={monitorSubTabReq?.nonce}
             />
           )}
 
@@ -1499,6 +1496,7 @@ export default function App() {
               onUpdateSettings={(s) => void handleUpdateSettings(s)}
               onRestoreNetguard={() => void handleRestoreNetguard()}
               onCleanupLegacy={() => handleServiceAction("cleanup_legacy")}
+              onOpenLogsDir={() => void handleOpenLogsDir()}
               onGoToDns={() => setActiveTab("dns")}
               onCopyText={handleCopyText}
               onCheckAppUpdate={() => handleCheckAppUpdate(false)}

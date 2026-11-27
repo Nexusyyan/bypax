@@ -150,7 +150,12 @@ impl ProcessTracker for SnapshotProcessTracker {
                         }
                         probe = next_ppid;
                     } else {
-                        self.ensure_fresh(true);
+                        // Missing/exited ancestor PID: only force-refresh if the cache is stale
+                        // enough to matter, avoiding O(N^2) full-table snapshot storms during
+                        // `list_processes()` when many processes have exited parent PIDs.
+                        if probe == pid {
+                            self.ensure_fresh(false);
+                        }
                         break;
                     }
                 }

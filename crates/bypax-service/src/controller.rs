@@ -38,6 +38,7 @@ struct InnerState {
     tun_active: bool,
     netguard: NetGuard,
     last_heartbeat: Option<Instant>,
+    missed_heartbeat_ticks: u8,
     gui_pid: Option<u32>,
     app_proxy: Option<RunningAppProxy>,
     last_app_proxy_error: Option<String>,
@@ -68,6 +69,7 @@ impl ServiceController {
                 tun_active: false,
                 netguard: NetGuard::new(&runtime_dir),
                 last_heartbeat: None,
+                missed_heartbeat_ticks: 0,
                 gui_pid: None,
                 app_proxy: None,
                 last_app_proxy_error: None,
@@ -83,6 +85,7 @@ impl ServiceController {
         if let Ok(mut st) = self.inner.lock() {
             st.gui_pid = Some(gui_pid);
             st.last_heartbeat = Some(Instant::now());
+            st.missed_heartbeat_ticks = 0;
         }
     }
 
@@ -108,6 +111,7 @@ impl ServiceController {
         if let Ok(mut st) = self.inner.lock() {
             st.gui_pid = Some(pid);
             st.last_heartbeat = Some(Instant::now());
+            st.missed_heartbeat_ticks = 0;
         }
         Ok(pid)
     }
@@ -121,52 +125,108 @@ impl ServiceController {
             st.tun_active = false;
             let _ = st.netguard.recover_if_dirty();
             st.last_heartbeat = None;
+            st.missed_heartbeat_ticks = 0;
         }
     }
 
-    /// Executes one watchdog tick; returns `true` if a dead GUI lease, heartbeat timeout, or
-    /// unexpected local proxy core exit triggered automatic fail-safe teardown.
+    /// Executes one watchdog tick; returns `true` if a dead GUI lease, sustained heartbeat
+    /// timeout, or unexpected local proxy core exit triggered automatic fail-safe teardown.
     pub async fn check_heartbeat_timeout(&self, timeout: Duration) -> bool {
+        const MAX_MISSED_HEARTBEAT_TICKS: u8 = 3;
+        const MAX_DEAD_CORE_TICKS: u8 = 3;
+
         let (should_stop_all, reason, pause_app_proxy_only) = {
             let Ok(mut st) = self.inner.lock() else {
                 return false;
             };
             let active = st.supervisor.is_running() || st.app_proxy.is_some();
             if !active {
+                st.missed_heartbeat_ticks = 0;
                 (false, "", false)
             } else if st
                 .gui_pid
                 .is_some_and(|pid| !platform_svc::is_parent_alive(pid))
             {
                 (true, "bound GUI process exited", false)
-            } else if st
-                .last_heartbeat
-                .is_some_and(|last| last.elapsed() > timeout)
-            {
-                (true, "GUI heartbeat timed out", false)
-            } else if let Some(ref mut running) = st.app_proxy {
-                if let Some(sb_pid) = running.sing_box_pid.filter(|&p| p > 4) {
-                    if !platform_svc::is_parent_alive(sb_pid) {
-                        running.dead_core_ticks = running.dead_core_ticks.saturating_add(1);
-                        if running.dead_core_ticks == 1 {
-                            running
+            } else {
+                let mut stop_all = false;
+                let mut stop_reason = "";
+
+                if st
+                    .last_heartbeat
+                    .is_some_and(|last| last.elapsed() > timeout)
+                {
+                    st.missed_heartbeat_ticks = st.missed_heartbeat_ticks.saturating_add(1);
+                    if st.missed_heartbeat_ticks == 1 {
+                        warn!(
+                            timeout_secs = timeout.as_secs(),
+                            gui_pid = ?st.gui_pid,
+                            "GUI heartbeat delayed (e.g. OS sleep/wake); waiting for recovery before teardown"
+                        );
+                    }
+                    if st.missed_heartbeat_ticks >= MAX_MISSED_HEARTBEAT_TICKS {
+                        stop_all = true;
+                        stop_reason = "GUI heartbeat timed out";
+                    }
+                } else {
+                    st.missed_heartbeat_ticks = 0;
+                }
+
+                if stop_all {
+                    (true, stop_reason, false)
+                } else if let Some(ref mut running) = st.app_proxy {
+                    if running.task.is_finished() {
+                        (false, "App Proxy engine task terminated unexpectedly", true)
+                    } else if let Some(sb_pid) = running.sing_box_pid.filter(|&p| p > 4) {
+                        if !platform_svc::is_parent_alive(sb_pid) {
+                            // Before assuming the proxy core died, check whether a reloaded
+                            // sing-box is already listening on `app_proxy_port` with a new PID.
+                            let adopted_pid = running
                                 .handle
-                                .reset_proxied_sessions("local proxy core process exited");
-                        }
-                        if running.dead_core_ticks >= 2 {
-                            (false, "local proxy core exited unexpectedly", true)
+                                .find_upstream_listener_pid()
+                                .filter(|&p| p > 4 && p != sb_pid && platform_svc::is_parent_alive(p));
+                            if let Some(new_pid) = adopted_pid {
+                                info!(
+                                    old_pid = sb_pid,
+                                    new_pid,
+                                    port = running.last_config.app_proxy_port,
+                                    "adopted reloaded local proxy core listener pid; keeping App Proxy active"
+                                );
+                                running.sing_box_pid = Some(new_pid);
+                                running.dead_core_ticks = 0;
+                                running.handle.add_exempt_pid(new_pid);
+                                running
+                                    .handle
+                                    .reset_proxied_sessions("local proxy core restarted with new pid");
+                                (false, "", false)
+                            } else {
+                                running.dead_core_ticks = running.dead_core_ticks.saturating_add(1);
+                                if running.dead_core_ticks == 1 {
+                                    warn!(
+                                        old_pid = sb_pid,
+                                        port = running.last_config.app_proxy_port,
+                                        "local proxy core pid exited and no listener found yet; resetting proxied sessions"
+                                    );
+                                    running
+                                        .handle
+                                        .reset_proxied_sessions("local proxy core process exited");
+                                }
+                                if running.dead_core_ticks >= MAX_DEAD_CORE_TICKS {
+                                    (false, "local proxy core exited unexpectedly", true)
+                                } else {
+                                    (false, "", false)
+                                }
+                            }
                         } else {
+                            running.dead_core_ticks = 0;
                             (false, "", false)
                         }
                     } else {
-                        running.dead_core_ticks = 0;
                         (false, "", false)
                     }
                 } else {
                     (false, "", false)
                 }
-            } else {
-                (false, "", false)
             }
         };
 
@@ -195,6 +255,7 @@ impl ServiceController {
                 st.last_app_proxy_error_kind = Some("core_exited".to_string());
                 if !st.supervisor.is_running() {
                     st.last_heartbeat = None;
+                    st.missed_heartbeat_ticks = 0;
                 }
             }
             return true;
@@ -329,6 +390,7 @@ impl ServiceController {
                         st.last_app_proxy_error = None;
                         st.last_app_proxy_error_kind = None;
                         st.last_heartbeat = Some(Instant::now());
+                        st.missed_heartbeat_ticks = 0;
                         st.app_proxy = Some(RunningAppProxy {
                             handle,
                             shutdown_tx: Some(shutdown_tx),
@@ -573,11 +635,14 @@ impl ServiceHandler for ServiceController {
                 ServiceCommand::Heartbeat { gui_pid } => {
                     if let Ok(mut st) = self.inner.lock() {
                         st.last_heartbeat = Some(Instant::now());
+                        st.missed_heartbeat_ticks = 0;
                         st.gui_pid = Some(gui_pid);
                     }
                     let mut resp =
                         ServiceResponse::success(env.id, format!("heartbeat ok (pid {gui_pid})"));
                     resp.service_pid = Some(std::process::id());
+                    resp.core_status = Some(self.build_core_status());
+                    resp.app_proxy_status = Some(self.build_app_proxy_status());
                     (resp, false)
                 }
                 ServiceCommand::StartCore {
@@ -616,6 +681,7 @@ impl ServiceHandler for ServiceController {
                         Ok(rep) if rep.ok => {
                             st.tun_active = tun_mode;
                             st.last_heartbeat = Some(Instant::now());
+                            st.missed_heartbeat_ticks = 0;
                             let pid = st.supervisor.require_running_pid().ok();
                             drop(st);
                             let mut resp = ServiceResponse::success(env.id, "Core started");
@@ -670,6 +736,7 @@ impl ServiceHandler for ServiceController {
                     if let Ok(mut st) = self.inner.lock() {
                         if !st.supervisor.is_running() {
                             st.last_heartbeat = None;
+                            st.missed_heartbeat_ticks = 0;
                         }
                     }
                     let mut resp = ServiceResponse::success(env.id, "App Proxy stopped");
@@ -863,5 +930,108 @@ mod tests {
 
         let _ = tx.send(());
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn watchdog_adopts_reloaded_listener_pid_and_tolerates_sleep_wake_jump() {
+        use bypax_appproxy::capture::{CaptureEngine, CapturedPacket, FiveTuple, PacketMeta};
+        use bypax_appproxy::engine::AppProxyEngine;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::sync::mpsc;
+
+        struct MockCapture {
+            listener_pid: Arc<AtomicU32>,
+        }
+
+        impl CaptureEngine for MockCapture {
+            fn start(&self, _tx: mpsc::Sender<CapturedPacket>) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn inject(&self, _packet: &[u8], _meta: &PacketMeta) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn lookup_pid(&self, _tuple: &FiveTuple) -> Option<u32> {
+                None
+            }
+            fn find_local_tcp_listener_pid(&self, _port: u16) -> Option<u32> {
+                let p = self.listener_pid.load(Ordering::Relaxed);
+                (p > 0).then_some(p)
+            }
+            fn shutdown(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = DataPaths::from_root(tmp.path().to_path_buf(), true).unwrap();
+        let ctrl = ServiceController::new(&paths, generate_session_token());
+        ctrl.set_gui_pid(std::process::id());
+
+        let live_pid = std::process::id();
+        let listener_pid = Arc::new(AtomicU32::new(live_pid));
+        let capture = Arc::new(MockCapture {
+            listener_pid: Arc::clone(&listener_pid),
+        });
+        let cfg = AppProxyStartConfig {
+            app_proxy_port: 10818,
+            control_secret: "secret".into(),
+            bypass_lan: true,
+            block_quic_when_needed: true,
+            windivert_dir: None,
+            gui_pid: Some(live_pid),
+            sing_box_pid: Some(999_991), // Deliberately dead/old PID
+            exempt_pids: vec![],
+            rules: vec![],
+            target_bindings: vec![],
+        };
+        let engine = AppProxyEngine::new(
+            &cfg,
+            capture,
+            Arc::clone(&ctrl.tracker) as Arc<dyn ProcessTracker>,
+        )
+        .unwrap();
+        let handle = engine.handle();
+        let (sd_tx, sd_rx) = oneshot::channel();
+        let engine_task = tokio::spawn(async move {
+            let _ = engine.run(sd_rx).await;
+        });
+
+        {
+            let mut st = ctrl.inner.lock().unwrap();
+            st.app_proxy = Some(RunningAppProxy {
+                handle: handle.clone(),
+                shutdown_tx: Some(sd_tx),
+                task: engine_task,
+                last_config: cfg,
+                sing_box_pid: Some(999_991),
+                dead_core_ticks: 0,
+            });
+            st.last_heartbeat = Some(Instant::now());
+        }
+
+        // 1. Old sing-box PID is dead, but a reloaded listener PID (`live_pid`) is listening:
+        //    watchdog MUST adopt `live_pid` and keep App Proxy running instead of stopping it!
+        assert!(!ctrl.check_heartbeat_timeout(Duration::from_secs(15)).await);
+        {
+            let st = ctrl.inner.lock().unwrap();
+            let running = st.app_proxy.as_ref().expect("App Proxy must stay active");
+            assert_eq!(running.sing_box_pid, Some(live_pid));
+            assert_eq!(running.dead_core_ticks, 0);
+            assert!(running.handle.exempt_pids().contains(&live_pid));
+        }
+
+        // 2. Simulate OS sleep/wake where `last_heartbeat.elapsed()` jumps past 15s:
+        //    ticks 1 and 2 must NOT tear down capture while GUI process is still alive.
+        {
+            let mut st = ctrl.inner.lock().unwrap();
+            st.last_heartbeat = Some(Instant::now() - Duration::from_secs(60));
+        }
+        assert!(!ctrl.check_heartbeat_timeout(Duration::from_secs(15)).await);
+        assert!(!ctrl.check_heartbeat_timeout(Duration::from_secs(15)).await);
+        assert!(ctrl.inner.lock().unwrap().app_proxy.is_some());
+
+        // 3. Sustained hang (3rd consecutive missed tick) DOES tear down safely.
+        assert!(ctrl.check_heartbeat_timeout(Duration::from_secs(15)).await);
+        assert!(ctrl.inner.lock().unwrap().app_proxy.is_none());
     }
 }

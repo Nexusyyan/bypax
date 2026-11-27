@@ -243,12 +243,12 @@ Groups are separated by `12px` spacing and a `1px` hairline divider (no uppercas
 Users answer exactly two orthogonal questions:
 1. **Mode (`Rule | Global | Direct`):** How captured traffic is routed.
 2. **Takeover:** Which traffic enters Bypax:
-   - **System Proxy** (independent switch pill): Proxy-aware apps (browsers). Coexists with Capture.
-   - **Capture (`Off | Apps | TUN`)** (mutually exclusive 3-way segmented control): Structural mutual exclusion between `Apps` (App Proxy) and `TUN` (Global TUN).
+   - **System Proxy** (independent switch pill): Proxy-aware apps (browsers). Coexists with transparent takeover.
+   - **App Proxy / TUN (`Off | App Proxy | TUN`)** (mutually exclusive 3-way segmented control, no redundant "Capture" prefix in TitleBar; labeled `App Proxy / TUN` in Tray Popover & Compact popover): Structural mutual exclusion between `App Proxy` and `TUN`.
      - Switching shows `switching` spinner (`12px`) and locks sibling options.
      - Failure snaps the slider **back** to its prior position, shows an inline error link, and emits a danger Toast.
-     - Selecting `Apps` with 0 enabled rules is permitted and displays an amber hint dot linking to the Preset App Wall.
-     - Selecting `Apps` or `TUN` while no session helper is connected opens an anchored `320px` **Inline Auth Popover** (Windows: single GUI-bound `Authorize for this session (UAC)` option with zero background service registration; macOS: `Install background helper` via `launchd`) and resumes the capture toggle after approval.
+     - Selecting `App Proxy` with 0 enabled rules is permitted and displays an amber hint dot linking to the Preset App Wall.
+     - Selecting `App Proxy` or `TUN` while no session helper is connected opens an anchored `320px` **Inline Auth Popover** (Windows: single GUI-bound `Authorize for this session (UAC)` option with zero background service registration; macOS: `Install background helper` via `launchd`) and resumes the toggle after approval.
 
 ### 5.3 Frameless TitleBar (`44px`) Responsive Ladder
 
@@ -256,19 +256,19 @@ Users answer exactly two orthogonal questions:
 
 | Window Width | TitleBar Composition |
 | :--- | :--- |
-| `>= 1280px` | Monochrome tile + `Bypax` + Core pill + Mode segmented + System Proxy switch + `Capture: Off\|Apps\|TUN` + Up/Down throughput + Locale + Theme + Window controls |
+| `>= 1280px` | Monochrome tile + `Bypax` + Core pill + Mode segmented + hairline divider + System Proxy switch + `Off\|App Proxy\|TUN` segmented + Up/Down throughput + Locale + Theme + Window controls |
 | `1100px - 1279px` | Hide wordmark text; throughput shows Down only; Locale + Theme merge into a single Appearance menu button |
-| `940px - 1099px` | System Proxy + Capture collapse into a single `Takeover` summary button (opens anchored panel identical to Tray controls); Core pill collapses to status dot |
+| `940px - 1099px` | System Proxy + `Off\|App Proxy\|TUN` collapse into a single `Takeover` summary button (opens anchored panel identical to Tray controls); Core pill collapses to status dot |
 
 ### 5.4 Custom Tray Popover (`304 x 456`)
 - **Surface Hierarchy (Contrast Guard):** Root container MUST use `--bg-surface` (`#FFFFFF` Light / `#161B22` Dark) and inner cards (Main Exit card, Takeover group) MUST use `--bg-subtle` (`#F8FAFC` Light / `#1C2128` Dark) -- NEVER `--bg-chrome` -- so metadata labels meet WCAG AA contrast.
 - `16px` radius, `var(--shadow-card-lg)`, strictly clamped inside the current monitor work area (including 720p @ 150% DPI).
-- Vertical sections: (1) Header with monochrome mark, `Bypax`, one-line takeover summary (truncated with `title`), and Core toggle; (2) Main Exit card (SVG flag, node name, latency, up/down speed, protocol badge); (3) Mode segmented (`Rule | Global | Direct`); (4) Takeover block (`System Proxy` switch + `Capture` 3-way segmented); (5) Active Apps quick-link row (`N apps proxied >`, shown when `Capture = Apps`); (6) Footer actions (Open Window, Copy Proxy Address `:10808`, Restore Network, Quit with hover-only danger styling).
+- Vertical sections: (1) Header with monochrome mark, `Bypax`, one-line takeover summary (truncated with `title`), and Core toggle; (2) Main Exit card (SVG flag, node name, latency, up/down speed, protocol badge); (3) Mode segmented (`Rule | Global | Direct`); (4) Takeover block (`System Proxy` switch + `App Proxy / TUN` 3-way segmented); (5) Active Apps quick-link row (`N apps proxied >`, shown when `App Proxy` is active); (6) Footer actions (Open Window, Copy Proxy Address `:10808`, Restore Network, Quit with hover-only danger styling).
 - Cross-window theme and locale synchronization via `bypax-state-sync` + `storage` events.
 
 ### 5.5 Core View Specifications
 - **`AppsView`:**
-  1. Single-row `48px` **Engine & Service Strip** (`--bg-surface` card): engine status + platform subtitle (`WinDivert . Zero-TUN` on Windows, `utun . Path Routing` on macOS), Windows 2-way GUI-bound helper mode (`Off | On-Demand`, strictly bound to GUI lifetime; zero background SCM service) or macOS `launchd Daemon` pill + Install CTA, and overflow menu (`...`) with 1-click legacy service/driver cleanup.
+  1. Single-row `48px` **Engine & Status Strip** (`--bg-surface` card): engine status + platform subtitle (`WinDivert . Zero-TUN` on Windows, `utun . Path Routing` on macOS), a direct App Proxy toggle switch synced 1:1 with the TitleBar (or `Switch to App Proxy` CTA while TUN is active; macOS shows `launchd Daemon` Install CTA until installed), and overflow menu (`...`) with stop-helper, 1-click legacy service/driver cleanup, driver diagnostics, live logs shortcut, and native `logs/` folder launcher.
   2. **Quiet Recovery Banner** (rendered ONLY on real faults -- legacy service/driver conflict, HVCI block, missing driver, signature failure, helper timeout; NEVER on healthy standby). Legacy conflicts surface even in standby with 1-click `Clean Up & Repair`; HVCI block MUST provide a one-click `Use all-traffic mode (TUN) instead` fallback. Fault raises amber dots in Sidebar `Apps`, TitleBar `Capture: Apps`, and Tray icon.
   3. **Preset App Wall** (`grid-template-columns: repeat(auto-fill, minmax(208px, 1fr))`, `gap: 10px`): 7 fixed presets (`Antigravity`, `Cursor`, `VS Code`, `Git & SSH`, `Discord`, `Telegram`, `Steam`), `92px` card height, neutral initial tile fallback (zero emojis), live detection status, toggle switch, and unified 6-option **Target Selector** (`Follow Routing` / `Main Exit` / `Auto Region` / `Specific Node` / `Direct` / `Reject`). Deleted target nodes auto-fallback to `Follow Routing` with an amber recovery chip.
   4. **Custom Rules Table** (`52px` rows): drag + `Alt+Up/Down` keyboard reorder, inline expandable L4 process + L7 3-state domain override editor (icon + text + color triple-encoding), macOS external child process 1-click `Include` / `Ignore` inline prompt bar.

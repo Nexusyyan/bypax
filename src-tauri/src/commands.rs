@@ -381,7 +381,7 @@ pub fn delete_subscription(state: State<'_, AppState>, id: String) -> Result<(),
 }
 
 #[tauri::command]
-pub fn save_node(app: AppHandle, state: State<'_, AppState>, node: NodeIR) -> Result<(), String> {
+pub async fn save_node(app: AppHandle, state: State<'_, AppState>, node: NodeIR) -> Result<(), String> {
     {
         let mut store = state
             .store
@@ -389,13 +389,13 @@ pub fn save_node(app: AppHandle, state: State<'_, AppState>, node: NodeIR) -> Re
             .map_err(|_| "store lock poisoned".to_string())?;
         store.upsert_nodes(&[node]).map_err(|e| e.to_string())?;
     }
-    let _ = state.reload_core_if_running();
+    let _ = state.reload_core_if_running_async().await;
     notify_sync(&app);
     Ok(())
 }
 
 #[tauri::command]
-pub fn delete_node(
+pub async fn delete_node(
     app: AppHandle,
     state: State<'_, AppState>,
     id: String,
@@ -416,7 +416,7 @@ pub fn delete_node(
         }
         ok
     };
-    let _ = state.reload_core_if_running();
+    let _ = state.reload_core_if_running_async().await;
     notify_sync(&app);
     Ok(deleted)
 }
@@ -1075,7 +1075,7 @@ pub fn get_cli_integration_info(state: State<'_, AppState>) -> Result<CliIntegra
 }
 
 #[tauri::command]
-pub fn save_rule(
+pub async fn save_rule(
     state: State<'_, AppState>,
     rule: SimpleRoutingRule,
 ) -> Result<CompileOutput, String> {
@@ -1087,12 +1087,12 @@ pub fn save_rule(
         store.upsert_rule(&rule).map_err(|e| e.to_string())?;
     }
     state.push_log("INFO", format!("routing: updated rule [{}]", rule.title_en));
-    let _ = state.reload_core_if_running();
+    let _ = state.reload_core_if_running_async().await;
     state.compile_current()
 }
 
 #[tauri::command]
-pub fn delete_rule(state: State<'_, AppState>, id: String) -> Result<CompileOutput, String> {
+pub async fn delete_rule(state: State<'_, AppState>, id: String) -> Result<CompileOutput, String> {
     {
         let store = state
             .store
@@ -1101,7 +1101,7 @@ pub fn delete_rule(state: State<'_, AppState>, id: String) -> Result<CompileOutp
         store.delete_rule(&id).map_err(|e| e.to_string())?;
     }
     state.push_log("INFO", format!("routing: deleted rule [{}]", id));
-    let _ = state.reload_core_if_running();
+    let _ = state.reload_core_if_running_async().await;
     state.compile_current()
 }
 
@@ -1295,7 +1295,7 @@ pub fn test_route_target(
 }
 
 #[tauri::command]
-pub fn save_inbound_port(
+pub async fn save_inbound_port(
     state: State<'_, AppState>,
     port: InboundPort,
 ) -> Result<CompileOutput, String> {
@@ -1315,12 +1315,12 @@ pub fn save_inbound_port(
             port.port, port.target
         ),
     );
-    let _ = state.reload_core_if_running();
+    let _ = state.reload_core_if_running_async().await;
     state.compile_current()
 }
 
 #[tauri::command]
-pub fn delete_inbound_port(
+pub async fn delete_inbound_port(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<CompileOutput, String> {
@@ -1334,28 +1334,35 @@ pub fn delete_inbound_port(
             .map_err(|e| e.to_string())?;
     }
     state.push_log("INFO", format!("inbound: removed port [{}]", id));
-    let _ = state.reload_core_if_running();
+    let _ = state.reload_core_if_running_async().await;
     state.compile_current()
 }
 
 #[tauri::command]
-pub fn update_settings(
+pub async fn update_settings(
     app: AppHandle,
     state: State<'_, AppState>,
     settings: AppSettings,
 ) -> Result<CompileOutput, String> {
-    let (prev_port, prev_autostart, prev_theme) = {
+    let prev_settings = {
         let store = state
             .store
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
-        let old = store.load_settings().ok();
-        (
-            old.as_ref().map(|s| s.mixed_port),
-            old.as_ref().map(|s| s.launch_at_login),
-            old.as_ref().map(|s| s.theme.clone()),
-        )
+        store.load_settings().ok()
     };
+
+    let prev_port = prev_settings.as_ref().map(|s| s.mixed_port);
+    let prev_autostart = prev_settings.as_ref().map(|s| s.launch_at_login);
+    let prev_theme = prev_settings.as_ref().map(|s| s.theme.clone());
+    let needs_core_reload = prev_settings
+        .as_ref()
+        .map(|old| old.affects_core_config(&settings))
+        .unwrap_or(true);
+    let needs_app_proxy_sync = prev_settings
+        .as_ref()
+        .map(|old| old.affects_app_proxy_engine(&settings))
+        .unwrap_or(false);
 
     if prev_autostart != Some(settings.launch_at_login) {
         bypax_core::autostart::set_autostart_enabled(settings.launch_at_login)
@@ -1392,7 +1399,13 @@ pub fn update_settings(
             }
         }
     }
-    let _ = state.reload_core_if_running();
+
+    if needs_core_reload {
+        let _ = state.reload_core_if_running_async().await;
+    } else if needs_app_proxy_sync && state.app_proxy_active.load(Ordering::Relaxed) {
+        let _ = state.sync_app_proxy_with_helper("settings update").await;
+    }
+
     notify_sync(&app);
     state.compile_current()
 }
@@ -2237,6 +2250,38 @@ pub async fn close_all_connections(state: State<'_, AppState>) -> Result<(), Str
         .close_all_connections()
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn open_logs_dir(state: State<'_, AppState>) -> Result<String, String> {
+    let dir = state.paths.logs_dir.clone();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dir_str = dir.to_string_lossy().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        std::process::Command::new("explorer")
+            .arg(&dir)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(dir_str)
 }
 
 #[tauri::command]

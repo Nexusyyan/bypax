@@ -6,6 +6,7 @@ import {
   Copy,
   Download,
   ExternalLink,
+  FolderOpen,
   Globe,
   HardDrive,
   RefreshCw,
@@ -47,6 +48,7 @@ interface SettingsViewProps {
   onUpdateSettings: (next: AppSettings) => void;
   onRestoreNetguard: () => void;
   onCleanupLegacy: () => Promise<void>;
+  onOpenLogsDir: () => void;
   onGoToDns: () => void;
   onCopyText: (text: string) => void;
   onCheckAppUpdate: () => Promise<void>;
@@ -82,6 +84,7 @@ export function SettingsView({
   onUpdateSettings,
   onRestoreNetguard,
   onCleanupLegacy,
+  onOpenLogsDir,
   onGoToDns,
   onCopyText,
   onCheckAppUpdate,
@@ -547,21 +550,31 @@ export function SettingsView({
             </div>
           </div>
 
-          <div className="space-y-1 px-4 py-3 text-[12px]">
-            <div className="flex items-center gap-2">
-              <HardDrive
-                className="h-4 w-4 shrink-0 text-[var(--text-secondary)]"
-                strokeWidth={1.5}
-              />
-              <span className="font-medium text-[var(--text-primary)]">
-                {coreInfo.portableMode
-                  ? dict.settings.portableActive
-                  : dict.settings.portableStandard}
-              </span>
+          <div className="flex flex-col gap-3 px-4 py-3 text-[12px] sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0 flex-1 space-y-1">
+              <div className="flex items-center gap-2">
+                <HardDrive
+                  className="h-4 w-4 shrink-0 text-[var(--text-secondary)]"
+                  strokeWidth={1.5}
+                />
+                <span className="font-medium text-[var(--text-primary)]">
+                  {coreInfo.portableMode
+                    ? dict.settings.portableActive
+                    : dict.settings.portableStandard}
+                </span>
+              </div>
+              <div className="break-all pl-6 font-mono text-[11px] text-[var(--text-secondary)]">
+                {coreInfo.dataDir}
+              </div>
             </div>
-            <div className="break-all pl-6 font-mono text-[11px] text-[var(--text-secondary)]">
-              {coreInfo.dataDir}
-            </div>
+            <button
+              type="button"
+              onClick={onOpenLogsDir}
+              className="ui-btn-secondary h-8 shrink-0"
+            >
+              <FolderOpen className="h-3.5 w-3.5 text-[var(--text-secondary)]" strokeWidth={1.5} />
+              {dict.settings.openLogsDir}
+            </button>
           </div>
         </div>
 

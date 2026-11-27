@@ -19,6 +19,7 @@ pub struct DataPaths {
     pub core_dir: PathBuf,
     pub rule_sets_dir: PathBuf,
     pub runtime_dir: PathBuf,
+    pub logs_dir: PathBuf,
 }
 
 impl DataPaths {
@@ -52,10 +53,12 @@ impl DataPaths {
         let core_dir = root_dir.join("core");
         let rule_sets_dir = root_dir.join("rule-sets");
         let runtime_dir = root_dir.join("runtime");
+        let logs_dir = root_dir.join("logs");
         std::fs::create_dir_all(&root_dir)?;
         std::fs::create_dir_all(&core_dir)?;
         std::fs::create_dir_all(&rule_sets_dir)?;
         std::fs::create_dir_all(&runtime_dir)?;
+        std::fs::create_dir_all(&logs_dir)?;
         let db_path = root_dir.join("bypax.db");
         Ok(Self {
             portable_mode,
@@ -64,6 +67,7 @@ impl DataPaths {
             core_dir,
             rule_sets_dir,
             runtime_dir,
+            logs_dir,
         })
     }
 }

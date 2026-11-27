@@ -21,9 +21,23 @@ struct CtlServerGuard(Mutex<Option<oneshot::Sender<()>>>);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt::init();
-
     let app_state = AppState::initialize().expect("Failed to initialize Bypax state");
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    if let Some(ref sink) = app_state.app_log_file {
+        let writer_sink = std::sync::Arc::clone(sink);
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_ansi(false)
+            .with_target(true)
+            .with_writer(move || writer_sink.writer())
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .try_init();
+    }
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -583,6 +597,7 @@ pub fn run() {
             commands::clear_connection_history,
             commands::close_connection,
             commands::close_all_connections,
+            commands::open_logs_dir,
             commands::clear_logs,
             commands::restore_netguard_now,
             commands::hide_to_tray,

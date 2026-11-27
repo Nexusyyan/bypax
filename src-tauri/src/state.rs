@@ -4,6 +4,7 @@ use bypax_core::compiler::{
 };
 use bypax_core::control::ControlClient;
 use bypax_core::core_manager::CoreManager;
+use bypax_core::logging::{RotatingLogFile, DEFAULT_MAX_LOG_BYTES};
 use bypax_core::model::{
     AppProxyRule, AppSettings, CaptureMode, CompileOutput, ConnectionHistoryRecord, ConnectionItem,
     CoreInfo, PreflightReport,
@@ -166,6 +167,7 @@ pub struct AppState {
     pub core_manager: CoreManager,
     pub supervisor: Mutex<CoreSupervisor>,
     pub logs: Arc<Mutex<LogRing>>,
+    pub app_log_file: Option<Arc<RotatingLogFile>>,
     pub control_secret: String,
     pub ipc_token: Mutex<String>,
     pub service_endpoint: String,
@@ -195,14 +197,23 @@ impl AppState {
         let recovered_from_crash = netguard.recover_if_dirty().unwrap_or(false);
         let last_update_result = take_last_update_result(&update_result_file);
 
-        let logs = Arc::new(Mutex::new(LogRing::new(MAX_LOG_RING_ENTRIES)));
+        let app_log_file = RotatingLogFile::open(
+            paths.logs_dir.join("bypax-app.log"),
+            DEFAULT_MAX_LOG_BYTES,
+        )
+        .ok();
+        let logs = Arc::new(Mutex::new(match app_log_file.as_ref() {
+            Some(sink) => LogRing::with_file_sink(MAX_LOG_RING_ENTRIES, Arc::clone(sink)),
+            None => LogRing::new(MAX_LOG_RING_ENTRIES),
+        }));
         if let Ok(mut guard) = logs.lock() {
             guard.push(
                 "INFO",
                 format!(
-                    "bypax initialized (portable={}, data_dir={})",
+                    "bypax initialized (portable={}, data_dir={}, logs_dir={})",
                     paths.portable_mode,
-                    paths.root_dir.display()
+                    paths.root_dir.display(),
+                    paths.logs_dir.display()
                 ),
             );
             if recovered_from_crash {
@@ -261,6 +272,7 @@ impl AppState {
             core_manager,
             supervisor: Mutex::new(supervisor),
             logs,
+            app_log_file,
             control_secret,
             ipc_token: Mutex::new(ipc_token),
             service_endpoint,
@@ -603,7 +615,7 @@ impl AppState {
     }
 
     /// Sends a heartbeat to the active privileged helper and returns `true` if the helper
-    /// disconnected unexpectedly so callers can sync UI state immediately.
+    /// disconnected or reported an unexpected capture pause so callers can sync UI state.
     pub async fn send_service_heartbeat(&self) -> bool {
         let active = self.core_via_service.load(Ordering::Relaxed)
             || self.app_proxy_active.load(Ordering::Relaxed)
@@ -611,42 +623,72 @@ impl AppState {
         if !active {
             return false;
         }
-        let ok = matches!(
-            self.service_request(
-                ServiceCommand::Heartbeat {
-                    gui_pid: std::process::id(),
-                },
-                Duration::from_millis(800),
-            )
-            .await,
-            Ok(resp) if resp.ok
-        );
-        if ok {
-            return false;
+        let mut last_resp: Option<ServiceResponse> = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            if let Ok(resp) = self
+                .service_request(
+                    ServiceCommand::Heartbeat {
+                        gui_pid: std::process::id(),
+                    },
+                    Duration::from_millis(1500),
+                )
+                .await
+            {
+                if resp.ok {
+                    last_resp = Some(resp);
+                    break;
+                }
+            }
         }
-        // Single quick retry before declaring helper lost.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let retry_ok = matches!(
-            self.service_request(
-                ServiceCommand::Heartbeat {
-                    gui_pid: std::process::id(),
-                },
-                Duration::from_millis(800),
-            )
-            .await,
-            Ok(resp) if resp.ok
-        );
-        if !retry_ok {
+
+        let Some(resp) = last_resp else {
             self.core_via_service.store(false, Ordering::Relaxed);
             self.app_proxy_active.store(false, Ordering::Relaxed);
             self.tun_active.store(false, Ordering::Relaxed);
             self.push_log(
                 "WARN",
-                "helper: privileged helper disconnected; reset active capture state to off",
+                "helper: privileged helper disconnected after 3 heartbeat attempts; reset capture state to off",
             );
             return true;
+        };
+
+        let mut changed = false;
+        if cfg!(target_os = "windows") && self.app_proxy_active.load(Ordering::Relaxed) {
+            if let Some(ref st) = resp.app_proxy_status {
+                if !st.running {
+                    self.app_proxy_active.store(false, Ordering::Relaxed);
+                    let detail = st
+                        .last_error
+                        .as_deref()
+                        .unwrap_or("App Proxy engine is no longer running");
+                    self.push_log(
+                        "WARN",
+                        format!("app-proxy: helper reported App Proxy stopped ({detail})"),
+                    );
+                    changed = true;
+                }
+            }
         }
-        false
+        if self.core_via_service.load(Ordering::Relaxed) {
+            if let Some(ref cs) = resp.core_status {
+                if !cs.running {
+                    self.core_via_service.store(false, Ordering::Relaxed);
+                    self.tun_active.store(false, Ordering::Relaxed);
+                    if !cfg!(target_os = "windows") {
+                        self.app_proxy_active.store(false, Ordering::Relaxed);
+                    }
+                    self.push_log(
+                        "WARN",
+                        "helper: privileged proxy core reported stopped; synced capture state",
+                    );
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// Inspects Windows SCM (read-only) for legacy persistent services (`BypaxService`,
@@ -1495,38 +1537,128 @@ impl AppState {
         })
     }
 
+    /// Synchronizes the running Windows `bypax-service` App Proxy engine with the current
+    /// rules, settings, and live local `sing-box` PID (so core reloads never trigger a
+    /// watchdog false-positive or leave the new `sing-box` PID unexempted).
+    pub async fn sync_app_proxy_with_helper(&self, reason: &str) -> bool {
+        if !cfg!(target_os = "windows") || !self.app_proxy_active.load(Ordering::Relaxed) {
+            return false;
+        }
+        let (settings, app_rules) = match self.store.lock() {
+            Ok(store) => match (store.load_settings(), store.list_app_proxy_rules()) {
+                (Ok(s), Ok(r)) => (s, r),
+                _ => return false,
+            },
+            Err(_) => return false,
+        };
+        let sing_box_pid = self
+            .supervisor
+            .lock()
+            .ok()
+            .and_then(|mut s| s.require_running_pid().ok())
+            .unwrap_or(0);
+        let Ok(cfg) = self.build_app_proxy_start_config(&settings, &app_rules, sing_box_pid)
+        else {
+            return false;
+        };
+
+        match self
+            .service_request(
+                ServiceCommand::ReloadAppProxy {
+                    config: cfg.clone(),
+                },
+                Duration::from_secs(4),
+            )
+            .await
+        {
+            Ok(resp)
+                if resp.ok
+                    && resp
+                        .app_proxy_status
+                        .as_ref()
+                        .is_some_and(|st| st.running) =>
+            {
+                self.push_log(
+                    "INFO",
+                    format!(
+                        "app-proxy: synced helper ({reason}, core_pid={sing_box_pid}, rules={})",
+                        app_rules.iter().filter(|r| r.enabled).count()
+                    ),
+                );
+                true
+            }
+            Ok(resp) if resp.message.to_ascii_lowercase().contains("not running") => {
+                // Recover seamlessly if the helper paused App Proxy during a slow core restart.
+                match self
+                    .service_request(
+                        ServiceCommand::StartAppProxy { config: cfg },
+                        Duration::from_secs(8),
+                    )
+                    .await
+                {
+                    Ok(start_resp)
+                        if start_resp.ok
+                            && start_resp
+                                .app_proxy_status
+                                .as_ref()
+                                .is_some_and(|st| st.running) =>
+                    {
+                        self.push_log(
+                            "INFO",
+                            format!(
+                                "app-proxy: resumed helper after {reason} (core_pid={sing_box_pid})"
+                            ),
+                        );
+                        true
+                    }
+                    Ok(start_resp) => {
+                        self.push_log(
+                            "WARN",
+                            format!(
+                                "app-proxy: failed to resume helper after {reason}: {}",
+                                start_resp.message
+                            ),
+                        );
+                        false
+                    }
+                    Err(err) => {
+                        self.push_log(
+                            "WARN",
+                            format!("app-proxy: IPC error resuming helper after {reason}: {err}"),
+                        );
+                        false
+                    }
+                }
+            }
+            Ok(resp) => {
+                self.push_log(
+                    "WARN",
+                    format!("app-proxy: reload sync failed ({reason}): {}", resp.message),
+                );
+                false
+            }
+            Err(err) => {
+                self.push_log(
+                    "WARN",
+                    format!("app-proxy: reload IPC error ({reason}): {err}"),
+                );
+                false
+            }
+        }
+    }
+
     pub async fn sync_app_proxy_if_running(&self) -> bool {
         if !self.app_proxy_active.load(Ordering::Relaxed) {
             return false;
         }
         if cfg!(target_os = "windows") {
-            let (settings, app_rules) = match self.store.lock() {
-                Ok(store) => match (store.load_settings(), store.list_app_proxy_rules()) {
-                    (Ok(s), Ok(r)) => (s, r),
-                    _ => return false,
-                },
-                Err(_) => return false,
-            };
             // Reload local sing-box first so any new auth_user bindings exist before WinDivert dials them.
             let _ = self.reload_core_if_running();
-            let sing_box_pid = self
-                .supervisor
-                .lock()
-                .ok()
-                .and_then(|mut s| s.require_running_pid().ok())
-                .unwrap_or(0);
-            let Ok(cfg) = self.build_app_proxy_start_config(&settings, &app_rules, sing_box_pid)
-            else {
-                return false;
-            };
-            matches!(
-                self.service_request(
-                    ServiceCommand::ReloadAppProxy { config: cfg },
-                    Duration::from_secs(4),
-                )
-                .await,
-                Ok(resp) if resp.ok && resp.app_proxy_status.as_ref().is_some_and(|st| st.running)
-            )
+            let settings_opt = self.store.lock().ok().and_then(|s| s.load_settings().ok());
+            if let Some(settings) = settings_opt {
+                self.sync_clash_control(&settings).await;
+            }
+            self.sync_app_proxy_with_helper("rule update").await
         } else {
             self.reload_core_if_running_async().await.is_ok()
         }
@@ -1600,7 +1732,17 @@ impl AppState {
             .await?;
             return Ok(Some(preflight));
         }
-        self.reload_core_if_running()
+        let report = self.reload_core_if_running()?;
+        if report.as_ref().is_some_and(|r| r.ok) {
+            let settings_opt = self.store.lock().ok().and_then(|s| s.load_settings().ok());
+            if let Some(settings) = settings_opt {
+                self.sync_clash_control(&settings).await;
+            }
+            if cfg!(target_os = "windows") && self.app_proxy_active.load(Ordering::Relaxed) {
+                self.sync_app_proxy_with_helper("core reload").await;
+            }
+        }
+        Ok(report)
     }
 
     /// Queries Plane 1 `LookupAppProxyOrigins` and `AppProxyStatus` to attribute

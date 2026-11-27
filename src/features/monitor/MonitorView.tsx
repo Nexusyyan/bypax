@@ -4,6 +4,7 @@ import {
   ArrowUp,
   ChevronLeft,
   ChevronRight,
+  FolderOpen,
   Info,
   Play,
   Search,
@@ -56,6 +57,9 @@ interface MonitorViewProps {
   onCloseConnection: (id: string) => void;
   onCloseAllConnections: () => void;
   onClearLogs: () => void;
+  onOpenLogsDir: () => void;
+  requestedSubTab?: "conns" | "history" | "platforms" | "logs";
+  requestedSubTabNonce?: number;
 }
 
 type SubTab = "conns" | "history" | "platforms" | "logs";
@@ -104,8 +108,17 @@ export function MonitorView({
   onCloseConnection,
   onCloseAllConnections,
   onClearLogs,
+  onOpenLogsDir,
+  requestedSubTab,
+  requestedSubTabNonce,
 }: MonitorViewProps) {
-  const [subTab, setSubTab] = useState<SubTab>("conns");
+  const [subTab, setSubTab] = useState<SubTab>(requestedSubTab ?? "conns");
+
+  useEffect(() => {
+    if (requestedSubTab) {
+      setSubTab(requestedSubTab);
+    }
+  }, [requestedSubTab, requestedSubTabNonce]);
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>("all");
   const [logFilter, setLogFilter] = useState<LogLevelFilter>("ALL");
   const [platformRange, setPlatformRange] = useState<RangeFilter>("today");
@@ -525,7 +538,7 @@ export function MonitorView({
                 )}
               </div>
               <div className="mt-0.5 font-mono text-[15px] font-semibold num-tabular text-[var(--text-primary)]">
-                {logs.length}/500
+                {logs.length}/1000
               </div>
             </div>
           </div>
@@ -682,14 +695,24 @@ export function MonitorView({
             </button>
           )}
           {subTab === "logs" && (
-            <button
-              type="button"
-              onClick={onClearLogs}
-              className="ui-btn-danger-subtle h-7"
-            >
-              <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
-              {dict.monitor.clearLogs}
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={onOpenLogsDir}
+                className="ui-btn-secondary h-7"
+              >
+                <FolderOpen className="h-3.5 w-3.5 text-[var(--text-secondary)]" strokeWidth={1.5} />
+                {dict.monitor.openLogsDir}
+              </button>
+              <button
+                type="button"
+                onClick={onClearLogs}
+                className="ui-btn-danger-subtle h-7"
+              >
+                <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
+                {dict.monitor.clearLogs}
+              </button>
+            </>
           )}
         </div>
       </div>

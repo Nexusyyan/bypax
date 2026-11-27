@@ -500,6 +500,11 @@ export const api = {
     return invoke("close_all_connections");
   },
 
+  async openLogsDir(): Promise<string> {
+    if (!isTauriEnv()) return "C:\\Tools\\Bypax\\bypax-data\\logs";
+    return invoke<string>("open_logs_dir");
+  },
+
   async clearLogs(): Promise<void> {
     if (!isTauriEnv()) return;
     return invoke("clear_logs");

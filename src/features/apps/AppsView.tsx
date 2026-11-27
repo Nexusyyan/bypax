@@ -12,6 +12,7 @@ import {
   Globe,
   GripVertical,
   ListPlus,
+  Loader2,
   MoreHorizontal,
   Pencil,
   Plus,
@@ -21,7 +22,6 @@ import {
 } from "lucide-react";
 import { CustomSelect, type SelectGroup } from "../../components/CustomSelect";
 import { RegionFlag, parseFlagText } from "../../components/RegionFlag";
-import { SegmentedControl } from "../../components/SegmentedControl";
 import type { Dict } from "../../i18n";
 import type {
   AppPresetStatus,
@@ -50,6 +50,7 @@ interface AppsViewProps {
   dict: Dict;
   platform: PlatformKind | string;
   captureMode: CaptureMode;
+  captureSwitching: boolean;
   nodes: NodeIR[];
   mainNodeId?: string | null;
   appRules: AppProxyRule[];
@@ -59,13 +60,14 @@ interface AppsViewProps {
   appProxyStatus: AppProxyStatusDto | null;
   missingTargets: MissingAppTargetWarning[];
   externalChildren: ExternalChildAlert[];
-  onServiceModeChange: (mode: "off" | "onDemand" | "background") => Promise<void>;
+  onSelectCapture: (mode: CaptureMode) => Promise<void>;
   onServiceAction: (action: ServiceActionKind) => Promise<void>;
   onFallbackToTun: () => Promise<void>;
   onOpenWindowsSecurity: () => Promise<void>;
   onPickWindivertDir: () => Promise<void>;
   onProbeDriver: () => Promise<void>;
   onOpenLogs: () => void;
+  onOpenLogsDir: () => Promise<void>;
   onTogglePreset: (presetId: string, enabled: boolean, target?: string) => Promise<void>;
   onSaveRule: (rule: AppProxyRule) => Promise<void>;
   onDeleteRule: (id: string) => Promise<void>;
@@ -138,6 +140,7 @@ export function AppsView({
   dict,
   platform,
   captureMode,
+  captureSwitching,
   nodes,
   mainNodeId,
   appRules,
@@ -147,13 +150,14 @@ export function AppsView({
   appProxyStatus,
   missingTargets,
   externalChildren,
-  onServiceModeChange,
+  onSelectCapture,
   onServiceAction,
   onFallbackToTun,
   onOpenWindowsSecurity,
   onPickWindivertDir,
   onProbeDriver,
   onOpenLogs,
+  onOpenLogsDir,
   onTogglePreset,
   onSaveRule,
   onDeleteRule,
@@ -359,9 +363,6 @@ export function AppsView({
       setDismissedFaultKey(null);
     }
   }, [activeFaultKind]);
-
-  const winServiceSegValue: "off" | "onDemand" =
-    serviceStatus.connected && serviceStatus.mode !== "off" ? "onDemand" : "off";
 
   const enabledCount = sortedRules.filter((r) => r.enabled).length;
   const engineStatusLabel =
@@ -882,46 +883,61 @@ export function AppsView({
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
-              {!isMac ? (
-                <SegmentedControl
-                  value={winServiceSegValue}
-                  options={[
-                    {
-                      value: "off",
-                      label: dict.service.off,
-                      title: dict.service.captionOff,
-                    },
-                    {
-                      value: "onDemand",
-                      label: dict.service.onDemand,
-                      title: dict.service.captionOnDemand,
-                    },
-                  ]}
-                  onChange={(m) => void onServiceModeChange(m)}
-                  ariaLabel={dict.service.onDemand}
-                />
-              ) : (
+              {isMac && !serviceStatus.installed ? (
                 <div className="flex items-center gap-2">
                   <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-2.5 py-1 text-[11.5px] text-[var(--text-secondary)]">
                     <span className="font-mono">{dict.service.macLabel}:</span>
                     <span className="font-medium text-[var(--text-primary)]">
-                      {serviceStatus.running
-                        ? dict.service.macRunning
-                        : serviceStatus.installed
-                          ? dict.service.macStopped
-                          : dict.service.macNotInstalled}
+                      {dict.service.macNotInstalled}
                     </span>
                   </span>
-                  {!serviceStatus.installed && (
-                    <button
-                      type="button"
-                      title={dict.service.macInstallHint}
-                      onClick={() => void onServiceAction("install")}
-                      className="ui-btn-primary h-7 text-[11.5px]"
-                    >
-                      {dict.service.macInstall}
-                    </button>
+                  <button
+                    type="button"
+                    title={dict.service.macInstallHint}
+                    onClick={() => void onServiceAction("install")}
+                    className="ui-btn-primary h-7 text-[11.5px]"
+                  >
+                    {dict.service.macInstall}
+                  </button>
+                </div>
+              ) : captureMode === "tun" ? (
+                <button
+                  type="button"
+                  disabled={captureSwitching}
+                  onClick={() => void onSelectCapture("apps")}
+                  className="ui-btn-secondary h-7 text-[11.5px]"
+                >
+                  {captureSwitching && (
+                    <Loader2 className="h-3 w-3 animate-spin" strokeWidth={1.7} />
                   )}
+                  {dict.apps.switchToApps}
+                </button>
+              ) : (
+                <div className="flex items-center gap-2">
+                  {captureSwitching && (
+                    <Loader2
+                      className="h-3.5 w-3.5 animate-spin text-[var(--text-secondary)]"
+                      strokeWidth={1.7}
+                    />
+                  )}
+                  <button
+                    type="button"
+                    role="switch"
+                    disabled={captureSwitching}
+                    aria-checked={captureMode === "apps"}
+                    aria-label={
+                      captureMode === "apps" ? dict.apps.toggleDisable : dict.apps.toggleEnable
+                    }
+                    title={
+                      captureMode === "apps" ? dict.apps.toggleDisable : dict.apps.toggleEnable
+                    }
+                    onClick={() =>
+                      void onSelectCapture(captureMode === "apps" ? "off" : "apps")
+                    }
+                    className="ui-switch"
+                  >
+                    <span className="ui-switch-knob" />
+                  </button>
                 </div>
               )}
 
@@ -940,16 +956,18 @@ export function AppsView({
                   <div className="ui-popover absolute top-full right-0 z-40 mt-1.5 min-w-[216px] w-max space-y-0.5 p-1.5 text-[12px]">
                     {!isMac ? (
                       <>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setMenuOpen(false);
-                            void onServiceAction("stop_worker");
-                          }}
-                          className="flex w-full items-center whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
-                        >
-                          {dict.service.menuStopWorker}
-                        </button>
+                        {serviceStatus.connected && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setMenuOpen(false);
+                              void onServiceAction("stop_worker");
+                            }}
+                            className="flex w-full items-center whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                          >
+                            {dict.service.menuStopWorker}
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={() => {
@@ -995,6 +1013,7 @@ export function AppsView({
                         </button>
                       </>
                     )}
+                    <div className="my-1 border-t border-[var(--border-hairline)]" />
                     <button
                       type="button"
                       onClick={() => {
@@ -1004,6 +1023,16 @@ export function AppsView({
                       className="flex w-full items-center whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
                     >
                       {dict.service.menuLogs}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        void onOpenLogsDir();
+                      }}
+                      className="flex w-full items-center whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                    >
+                      {dict.service.menuOpenLogsDir}
                     </button>
                   </div>
                 )}

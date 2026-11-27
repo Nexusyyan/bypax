@@ -1,4 +1,5 @@
 use crate::compiler::SingBox114Compiler;
+use crate::logging::RotatingLogFile;
 use crate::model::{LogEntry, PreflightReport};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
@@ -8,13 +9,25 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-pub const MAX_LOG_RING_ENTRIES: usize = 500;
+pub const MAX_LOG_RING_ENTRIES: usize = 1000;
 
-/// Bounded ring buffer keeping long-running desktop memory strictly flat.
-#[derive(Debug, Default)]
+/// Bounded ring buffer keeping long-running desktop memory strictly flat, with optional
+/// persistent rotating file sink for lifecycle events and warnings/errors.
+#[derive(Default)]
 pub struct LogRing {
     entries: VecDeque<LogEntry>,
     cap: usize,
+    file_sink: Option<Arc<RotatingLogFile>>,
+}
+
+impl std::fmt::Debug for LogRing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogRing")
+            .field("len", &self.entries.len())
+            .field("cap", &self.cap)
+            .field("has_file_sink", &self.file_sink.is_some())
+            .finish()
+    }
 }
 
 impl LogRing {
@@ -22,17 +35,50 @@ impl LogRing {
         Self {
             entries: VecDeque::with_capacity(cap.max(1)),
             cap: cap.max(1),
+            file_sink: None,
         }
     }
 
+    pub fn with_file_sink(cap: usize, file_sink: Arc<RotatingLogFile>) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(cap.max(1)),
+            cap: cap.max(1),
+            file_sink: Some(file_sink),
+        }
+    }
+
+    /// Pushes an application or supervisor lifecycle entry to the memory ring AND persists it
+    /// to the rotating application log file when attached.
     pub fn push(&mut self, level: impl Into<String>, message: impl Into<String>) {
+        let lvl = level.into();
+        let msg = message.into();
+        if let Some(ref sink) = self.file_sink {
+            sink.append_entry(&lvl, &msg);
+        }
+        self.push_memory_only(lvl, msg);
+    }
+
+    /// Pushes a raw proxy core output line to the memory ring, persisting only WARN/ERROR
+    /// and non-per-connection lifecycle lines to disk so `bypax-app.log` remains high-signal.
+    pub fn push_core_line(&mut self, level: impl Into<String>, message: impl Into<String>) {
+        let lvl = level.into();
+        let msg = message.into();
+        if let Some(ref sink) = self.file_sink {
+            if should_persist_core_line(&lvl, &msg) {
+                sink.append_entry(&lvl, &format!("core: {msg}"));
+            }
+        }
+        self.push_memory_only(lvl, msg);
+    }
+
+    fn push_memory_only(&mut self, level: String, message: String) {
         if self.entries.len() >= self.cap {
             self.entries.pop_back();
         }
         self.entries.push_front(LogEntry {
             timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
-            level: level.into(),
-            message: message.into(),
+            level,
+            message,
         });
     }
 
@@ -51,6 +97,21 @@ impl LogRing {
     pub fn clear(&mut self) {
         self.entries.clear();
     }
+}
+
+fn should_persist_core_line(level: &str, message: &str) -> bool {
+    let upper = level.to_ascii_uppercase();
+    if upper == "WARN" || upper == "ERROR" {
+        return true;
+    }
+    // Skip high-frequency per-connection INFO lines (`[<conn_id> <dur>] ...`) on disk while
+    // keeping startup/interface/listener lifecycle milestones.
+    let is_per_conn = message.starts_with('[')
+        && message
+            .as_bytes()
+            .get(1)
+            .is_some_and(|b| b.is_ascii_digit());
+    !is_per_conn
 }
 
 /// Owns a spawned `sing-box` child process and ensures clean termination on drop.
@@ -358,7 +419,7 @@ fn spawn_log_reader<R: std::io::Read + Send + 'static>(
                 continue;
             }
             if let Ok(mut guard) = logs.lock() {
-                guard.push(level, message);
+                guard.push_core_line(level, message);
             }
         }
     });

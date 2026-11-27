@@ -1,4 +1,5 @@
 use anyhow::Result;
+use bypax_core::logging::{logs_dir_from_runtime_dir, RotatingLogFile, DEFAULT_MAX_LOG_BYTES};
 use bypax_core::netguard::NetGuard;
 use bypax_core::storage::DataPaths;
 use bypax_ipc::{
@@ -7,9 +8,10 @@ use bypax_ipc::{
 use bypax_service::controller::ServiceController;
 use bypax_service::platform_svc;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::oneshot;
 use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(name = "bypax-service", about = "Bypax privileged proxy & app-routing helper")]
@@ -78,9 +80,47 @@ enum Commands {
     },
 }
 
+fn init_service_logging(runtime_dir_hint: Option<&Path>) -> Option<PathBuf> {
+    let logs_dir = runtime_dir_hint
+        .map(logs_dir_from_runtime_dir)
+        .or_else(|| DataPaths::resolve().ok().map(|p| p.logs_dir));
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    if let Some(dir) = logs_dir {
+        let log_path = dir.join("bypax-service.log");
+        if let Ok(log_file) = RotatingLogFile::open(log_path.clone(), DEFAULT_MAX_LOG_BYTES) {
+            let writer_file = log_file.clone();
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_target(true)
+                .with_writer(move || writer_file.writer())
+                .try_init();
+            return Some(log_path);
+        }
+    }
+
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    None
+}
+
 fn main() -> Result<()> {
-    let _ = tracing_subscriber::fmt::try_init();
     let cli = Cli::parse();
+
+    let runtime_hint = match &cli.command {
+        Some(Commands::WorkerRun { runtime_dir, .. })
+        | Some(Commands::DaemonRun { runtime_dir, .. })
+        | Some(Commands::CleanupLegacy { runtime_dir }) => runtime_dir.as_deref(),
+        _ => None,
+    };
+    let log_path = init_service_logging(runtime_hint);
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        pid = std::process::id(),
+        log_file = ?log_path,
+        "bypax-service starting"
+    );
 
     match cli.command.unwrap_or(Commands::DaemonRun {
         parent_pid: None,

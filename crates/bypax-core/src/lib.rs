@@ -2,6 +2,7 @@ pub mod autostart;
 pub mod compiler;
 pub mod control;
 pub mod core_manager;
+pub mod logging;
 pub mod model;
 pub mod netguard;
 pub mod parser;
