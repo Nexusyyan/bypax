@@ -13,6 +13,81 @@ import type {
 
 export type NodeSortMode = "default" | "delay" | "name";
 
+export const CHAINS_GROUP_ID = "__CHAINS__";
+
+export type NodesListEntry =
+  | { kind: "chain"; chain: ProxyChain }
+  | { kind: "node"; node: NodeIR };
+
+export interface ChainHopSummary {
+  entryRegion: string | null;
+  exitRegion: string | null;
+  compactPath: string;
+  shortPath: string;
+  fullPath: string;
+  missingCount: number;
+}
+
+const FLAG_PAIR_RE = /[\u{1F1E6}-\u{1F1FF}]{2}/gu;
+
+function cleanHopRemark(remark: string): string {
+  const cleaned = remark.replace(FLAG_PAIR_RE, "").replace(/\s{2,}/g, " ").trim();
+  return cleaned || remark.trim();
+}
+
+function shortHopToken(label: string, region?: string | null): string {
+  let text = label;
+  if (region && region.length === 2) {
+    const prefixRe = new RegExp(`^${region}[\\s_-]+`, "i");
+    const stripped = text.replace(prefixRe, "").trim();
+    if (stripped) text = stripped;
+  }
+  const firstWord = text.split(/\s+/)[0] ?? text;
+  if (firstWord.length >= 2 && firstWord.length <= 12) {
+    return firstWord;
+  }
+  return text.length > 10 ? `${text.slice(0, 9)}..` : text;
+}
+
+export function summarizeChainHops(
+  chain: ProxyChain,
+  nodeById: Map<string, NodeIR>,
+): ChainHopSummary {
+  const hops = chain.hops;
+  const resolved = hops.map((id) => nodeById.get(id) ?? null);
+  const missingCount = resolved.filter((n) => n === null).length;
+  const labels = hops.map((id, idx) => {
+    const node = resolved[idx];
+    return node ? cleanHopRemark(node.remark) : id;
+  });
+  const fullPath = labels.join(" -> ");
+
+  let compactPath = fullPath;
+  if (labels.length === 2) {
+    compactPath = `${labels[0]} -> ${labels[1]}`;
+  } else if (labels.length > 2) {
+    compactPath = `${labels[0]} -> +${labels.length - 2} -> ${labels[labels.length - 1]}`;
+  }
+
+  const firstNode = resolved[0] ?? null;
+  const lastNode = resolved.length > 0 ? resolved[resolved.length - 1] : null;
+  let shortPath = compactPath;
+  if (labels.length === 2) {
+    shortPath = `${shortHopToken(labels[0], firstNode?.region)} -> ${shortHopToken(labels[1], lastNode?.region)}`;
+  } else if (labels.length > 2) {
+    shortPath = `${shortHopToken(labels[0], firstNode?.region)} -> +${labels.length - 2} -> ${shortHopToken(labels[labels.length - 1], lastNode?.region)}`;
+  }
+
+  return {
+    entryRegion: firstNode?.region ?? null,
+    exitRegion: lastNode?.region ?? null,
+    compactPath,
+    shortPath,
+    fullPath,
+    missingCount,
+  };
+}
+
 /**
  * Canonical latency sort key: positive RTT sorts ascending first,
  * untested (`null`/`undefined`) sorts next (`999998`), and failed (`<= 0`, e.g. `-1ms`)
@@ -159,6 +234,79 @@ export function filterAndSortNodes(
     return filtered.slice().sort((a, b) => a.remark.localeCompare(b.remark));
   }
   return filtered;
+}
+
+export function filterAndSortNodesAndChains(
+  nodes: NodeIR[],
+  chains: ProxyChain[],
+  group: string,
+  query: string,
+  sortMode: NodeSortMode,
+): NodesListEntry[] {
+  const q = query.trim().toLowerCase();
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
+
+  const includeChains = group === "ALL" || group === CHAINS_GROUP_ID;
+  const includeNodes = group !== CHAINS_GROUP_ID;
+
+  const matchedChains: NodesListEntry[] = includeChains
+    ? chains
+        .filter((c) => {
+          if (!q) return true;
+          if (
+            c.name.toLowerCase().includes(q) ||
+            c.id.toLowerCase().includes(q) ||
+            "chain".includes(q) ||
+            `${c.hops.length}h`.includes(q)
+          ) {
+            return true;
+          }
+          return c.hops.some((hid) => {
+            const hop = nodeById.get(hid);
+            if (!hop) return hid.toLowerCase().includes(q);
+            return (
+              hop.remark.toLowerCase().includes(q) ||
+              hop.server.toLowerCase().includes(q) ||
+              hop.protocol.toLowerCase().includes(q) ||
+              PROTO_BADGES[hop.protocol].toLowerCase().includes(q) ||
+              hop.region.toLowerCase().includes(q)
+            );
+          });
+        })
+        .map((chain) => ({ kind: "chain", chain }))
+    : [];
+
+  const matchedNodes: NodesListEntry[] = includeNodes
+    ? filterAndSortNodes(nodes, group, query, "default").map((node) => ({
+        kind: "node",
+        node,
+      }))
+    : [];
+
+  const combined = [...matchedChains, ...matchedNodes];
+
+  if (sortMode === "delay") {
+    return combined.slice().sort((a, b) => {
+      const aDelay = a.kind === "chain" ? a.chain.realDelayMs : a.node.realDelayMs;
+      const bDelay = b.kind === "chain" ? b.chain.realDelayMs : b.node.realDelayMs;
+      const diff = latencySortKey(aDelay) - latencySortKey(bDelay);
+      if (diff !== 0) return diff;
+      if (a.kind !== b.kind) return a.kind === "chain" ? -1 : 1;
+      const aName = a.kind === "chain" ? a.chain.name : a.node.remark;
+      const bName = b.kind === "chain" ? b.chain.name : b.node.remark;
+      return aName.localeCompare(bName);
+    });
+  }
+
+  if (sortMode === "name") {
+    return combined.slice().sort((a, b) => {
+      const aName = a.kind === "chain" ? a.chain.name : a.node.remark;
+      const bName = b.kind === "chain" ? b.chain.name : b.node.remark;
+      return aName.localeCompare(bName);
+    });
+  }
+
+  return combined;
 }
 
 export interface TargetResolution {

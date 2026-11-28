@@ -4,10 +4,12 @@ import zhCN from "../locales/zh-CN.json";
 import type { NodeIR, ProxyChain, SimpleRoutingRule } from "../types";
 import {
   buildTakeoverSummary,
+  CHAINS_GROUP_ID,
   computeAvailableRegions,
   delayColorVar,
   evaluateRouteSimulation,
   filterAndSortNodes,
+  filterAndSortNodesAndChains,
   formatBytes,
   formatConnectionExit,
   formatConnectionRule,
@@ -20,6 +22,7 @@ import {
   pushRingBuffer,
   resolveActiveRecoveryFault,
   resolveTargetExit,
+  summarizeChainHops,
   validateChainHops,
 } from "./nodes";
 import { latencyTier } from "../components/SignalBars";
@@ -211,6 +214,83 @@ describe("Bypax frontend utilities, brand hygiene & i18n parity", () => {
 
     const byName = filterAndSortNodes(SAMPLE_NODES, "ALL", "", "name");
     expect(byName.map((n) => n.id)).toEqual(["n-hk-1", "n-jp-1", "n-us-1"]);
+  });
+
+  it("merges proxy chains into All view, isolates Chains group, and summarizes hop paths", () => {
+    const chains: ProxyChain[] = [
+      {
+        id: "c-hk-us",
+        name: "HK -> US AI",
+        hops: ["n-hk-1", "n-us-1"],
+        enabled: true,
+        realDelayMs: 90,
+        createdAt: "2026-11-28T00:00:00Z",
+      },
+      {
+        id: "c-triple",
+        name: "Triple Relay",
+        hops: ["n-hk-1", "n-jp-1", "n-us-1"],
+        enabled: true,
+        realDelayMs: -1,
+        createdAt: "2026-11-28T00:00:00Z",
+      },
+    ];
+
+    // Default sort in ALL pins chains at top followed by regular nodes
+    const allDefault = filterAndSortNodesAndChains(SAMPLE_NODES, chains, "ALL", "", "default");
+    expect(allDefault.map((e) => (e.kind === "chain" ? `chain:${e.chain.id}` : e.node.id))).toEqual(
+      ["chain:c-hk-us", "chain:c-triple", "n-jp-1", "n-us-1", "n-hk-1"],
+    );
+
+    // Chains group shows only chains
+    const chainsOnly = filterAndSortNodesAndChains(
+      SAMPLE_NODES,
+      chains,
+      CHAINS_GROUP_ID,
+      "",
+      "default",
+    );
+    expect(chainsOnly.map((e) => (e.kind === "chain" ? e.chain.id : e.node.id))).toEqual([
+      "c-hk-us",
+      "c-triple",
+    ]);
+
+    // Specific node group excludes chains
+    const vpsOnly = filterAndSortNodesAndChains(SAMPLE_NODES, chains, "VPS", "", "default");
+    expect(vpsOnly.map((e) => (e.kind === "chain" ? e.chain.id : e.node.id))).toEqual(["n-jp-1"]);
+
+    // Delay sort ranks positive latencies ascending across nodes + chains, failed -1ms last
+    const byDelay = filterAndSortNodesAndChains(SAMPLE_NODES, chains, "ALL", "", "delay");
+    expect(byDelay.map((e) => (e.kind === "chain" ? `chain:${e.chain.id}` : e.node.id))).toEqual([
+      "n-hk-1",
+      "n-jp-1",
+      "chain:c-hk-us",
+      "n-us-1",
+      "chain:c-triple",
+    ]);
+
+    // Search matches chain hop metadata (e.g. "3h" or hop server/protocol)
+    const search3h = filterAndSortNodesAndChains(SAMPLE_NODES, chains, "ALL", "3h", "default");
+    expect(search3h).toHaveLength(1);
+    expect(search3h[0].kind).toBe("chain");
+
+    const nodeMap = new Map(SAMPLE_NODES.map((n) => [n.id, n]));
+    const summary2 = summarizeChainHops(chains[0], nodeMap);
+    expect(summary2.entryRegion).toBe("HK");
+    expect(summary2.exitRegion).toBe("US");
+    expect(summary2.compactPath).toBe("HK-IPLC-01 -> US-LA-Residential");
+    expect(summary2.shortPath).toBe("IPLC-01 -> LA-Reside..");
+    expect(summary2.missingCount).toBe(0);
+
+    const summary3 = summarizeChainHops(chains[1], nodeMap);
+    expect(summary3.compactPath).toBe("HK-IPLC-01 -> +1 -> US-LA-Residential");
+    expect(summary3.fullPath).toBe("HK-IPLC-01 -> JP-Tokyo-01 -> US-LA-Residential");
+
+    const missingSummary = summarizeChainHops(
+      { ...chains[0], hops: ["n-hk-1", "n-deleted"] },
+      nodeMap,
+    );
+    expect(missingSummary.missingCount).toBe(1);
   });
 
   it("caps log ring buffer strictly at configured maximum", () => {

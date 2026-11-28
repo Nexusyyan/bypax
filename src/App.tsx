@@ -876,30 +876,51 @@ export default function App() {
     }
   };
 
-  const handleRunRealDelayTest = async (nodeIds: string[]) => {
-    batchTestingRef.current = true;
-    setTestingLatency(true);
-    setTestDelayStats({ sum: 0, count: 0 });
-    setTestProgress({
-      kind: "real",
-      phase: "starting",
-      completed: 0,
-      total: nodeIds.length,
-      passed: 0,
-      failed: 0,
-      stripHandshake: settings.latencyStripHandshake,
-    });
-    try {
-      await api.runBatchRealDelay(nodeIds);
-      await reloadBootstrap();
-    } catch (err) {
-      const msg = String(err);
-      pushToast(msg.includes("CORE_NOT_INSTALLED") ? dict.toast.coreMissingAction : msg, "err");
-    } finally {
-      batchTestingRef.current = false;
-      setTestingLatency(false);
-      setTestProgress(null);
+  const handleRunRealDelayTest = async (nodeIds: string[], chainIds: string[] = []) => {
+    if (nodeIds.length > 0) {
+      batchTestingRef.current = true;
+      setTestingLatency(true);
       setTestDelayStats({ sum: 0, count: 0 });
+      setTestProgress({
+        kind: "real",
+        phase: "starting",
+        completed: 0,
+        total: nodeIds.length,
+        passed: 0,
+        failed: 0,
+        stripHandshake: settings.latencyStripHandshake,
+      });
+      try {
+        await api.runBatchRealDelay(nodeIds);
+        await reloadBootstrap();
+      } catch (err) {
+        const msg = String(err);
+        pushToast(msg.includes("CORE_NOT_INSTALLED") ? dict.toast.coreMissingAction : msg, "err");
+        return;
+      } finally {
+        batchTestingRef.current = false;
+        setTestingLatency(false);
+        setTestProgress(null);
+        setTestDelayStats({ sum: 0, count: 0 });
+      }
+    }
+
+    for (const cid of chainIds) {
+      setTestingChainId(cid);
+      try {
+        const res = await api.testProxyChainDelay(cid);
+        setChains((prev) =>
+          prev.map((c) => (c.id === cid ? { ...c, realDelayMs: res.delayMs ?? -1 } : c)),
+        );
+      } catch (err) {
+        const msg = String(err);
+        pushToast(msg.includes("CORE_NOT_INSTALLED") ? dict.toast.coreMissingAction : msg, "err");
+        if (msg.includes("CORE_NOT_INSTALLED")) {
+          break;
+        }
+      } finally {
+        setTestingChainId(null);
+      }
     }
   };
 
@@ -1465,10 +1486,12 @@ export default function App() {
               dict={dict}
               coreInfo={coreInfo}
               nodes={nodes}
+              chains={chains}
               subscriptions={subscriptions}
               rules={rules}
               mainNodeId={settings.mainNodeId}
               testingLatency={testingLatency}
+              testingChainId={testingChainId}
               testProgress={testProgress}
               testAvgMs={
                 testDelayStats.count > 0
@@ -1481,8 +1504,14 @@ export default function App() {
               onImportCoreBinary={handleImportCoreBinary}
               onSelectMainNode={(id) => void handleSelectMainNode(id)}
               onDeleteNode={(id) => void handleDeleteNode(id)}
+              onDeleteChain={(id) => void handleDeleteChain(id)}
+              onEditChain={(id) => {
+                setSelectedChainEditId(id);
+                setActiveTab("chains");
+              }}
+              onTestChainDelay={(id) => void handleTestChainDelay(id)}
               onCopyText={handleCopyText}
-              onRunRealDelayTest={(ids) => void handleRunRealDelayTest(ids)}
+              onRunRealDelayTest={(ids, cids) => void handleRunRealDelayTest(ids, cids)}
               onImportPayload={handleImportPayload}
               onImportSubscription={handleImportSubscription}
               onRefreshSubscription={handleRefreshSubscription}

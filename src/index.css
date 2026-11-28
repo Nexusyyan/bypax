@@ -546,7 +546,13 @@
     width: 100%;
     align-items: center;
     gap: 8px;
-    grid-template-columns: minmax(0, 1fr) 72px 160px 120px 104px 88px;
+    grid-template-columns: minmax(0, 1fr) 72px 160px 120px 104px 112px;
+  }
+  .nodes-col-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 4px;
   }
   .nodes-subline-meta {
     display: none;
@@ -560,7 +566,7 @@
 
   @container nodes-table (max-width: 959px) {
     .nodes-grid {
-      grid-template-columns: minmax(0, 1fr) 72px 104px 88px;
+      grid-template-columns: minmax(0, 1fr) 72px 104px 112px;
     }
     .nodes-col-server,
     .nodes-col-rules {

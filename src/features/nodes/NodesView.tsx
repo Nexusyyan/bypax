@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
+  AlertTriangle,
+  ArrowRight,
   ArrowUpDown,
   Check,
   Copy,
@@ -8,42 +10,50 @@ import {
   FolderOpen,
   Gauge,
   Link2,
+  Pencil,
   Plus,
   RefreshCw,
   Search,
   Trash2,
+  Waypoints,
   X,
 } from "lucide-react";
 import { BrandLogo } from "../../components/BrandLogo";
-import { NodeLabel } from "../../components/RegionFlag";
+import { NodeLabel, RegionFlag } from "../../components/RegionFlag";
 import { SignalBars } from "../../components/SignalBars";
 import type { Dict } from "../../i18n";
 import type {
   CoreInfo,
   LatencyProgressEvent,
   NodeIR,
+  ProxyChain,
   SimpleRoutingRule,
   SubscriptionGroup,
 } from "../../types";
 import {
+  CHAINS_GROUP_ID,
   delayColorVar,
-  filterAndSortNodes,
+  filterAndSortNodesAndChains,
   formatLatency,
   middleTruncate,
   PROTO_BADGES,
   resolveTargetExit,
   SAMPLE_SHARE_URIS,
+  summarizeChainHops,
   type NodeSortMode,
+  type NodesListEntry,
 } from "../../utils/nodes";
 
 interface NodesViewProps {
   dict: Dict;
   coreInfo: CoreInfo;
   nodes: NodeIR[];
+  chains: ProxyChain[];
   subscriptions: SubscriptionGroup[];
   rules: SimpleRoutingRule[];
   mainNodeId?: string | null;
   testingLatency: boolean;
+  testingChainId: string | null;
   testProgress: LatencyProgressEvent | null;
   testAvgMs?: number | null;
   downloadingCore: boolean;
@@ -52,8 +62,11 @@ interface NodesViewProps {
   onImportCoreBinary: () => Promise<void>;
   onSelectMainNode: (id: string) => void;
   onDeleteNode: (id: string) => void;
+  onDeleteChain: (id: string) => void;
+  onEditChain: (id: string) => void;
+  onTestChainDelay: (id: string) => void;
   onCopyText: (text: string) => void;
-  onRunRealDelayTest: (nodeIds: string[]) => void;
+  onRunRealDelayTest: (nodeIds: string[], chainIds?: string[]) => void;
   onImportPayload: (payload: string, groupName: string) => Promise<void>;
   onImportSubscription: (name: string, url: string) => Promise<void>;
   onRefreshSubscription: (id: string) => Promise<void>;
@@ -68,10 +81,12 @@ export function NodesView({
   dict,
   coreInfo,
   nodes,
+  chains,
   subscriptions,
   rules,
   mainNodeId,
   testingLatency,
+  testingChainId,
   testProgress,
   testAvgMs,
   downloadingCore,
@@ -80,6 +95,9 @@ export function NodesView({
   onImportCoreBinary,
   onSelectMainNode,
   onDeleteNode,
+  onDeleteChain,
+  onEditChain,
+  onTestChainDelay,
   onCopyText,
   onRunRealDelayTest,
   onImportPayload,
@@ -107,7 +125,7 @@ export function NodesView({
     placeBelow: boolean;
   } | null>(null);
   const [contextMenu, setContextMenu] = useState<{
-    node: NodeIR;
+    entry: NodesListEntry;
     x: number;
     y: number;
   } | null>(null);
@@ -143,30 +161,62 @@ export function NodesView({
     };
   }, [contextMenu]);
 
-  const openNodeContextMenu = (e: React.MouseEvent, node: NodeIR) => {
+  const openEntryContextMenu = (e: React.MouseEvent, entry: NodesListEntry) => {
     e.preventDefault();
     e.stopPropagation();
     const menuWidth = 224;
-    const menuHeight = node.rawUri ? 268 : 236;
+    const menuHeight =
+      entry.kind === "chain" ? 268 : entry.node.rawUri ? 268 : 236;
     const pad = 10;
     const x = Math.max(pad, Math.min(e.clientX, window.innerWidth - menuWidth - pad));
     const y = Math.max(pad, Math.min(e.clientY, window.innerHeight - menuHeight - pad));
     setHoveredTags(null);
-    setContextMenu({ node, x, y });
+    setContextMenu({ entry, x, y });
   };
+
+  const nodeById = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
 
   const groups = useMemo(() => {
     const names = Array.from(new Set(nodes.map((n) => n.group)));
-    return ["ALL", ...names];
-  }, [nodes]);
+    return chains.length > 0 ? ["ALL", CHAINS_GROUP_ID, ...names] : ["ALL", ...names];
+  }, [nodes, chains.length]);
 
-  const visibleNodes = useMemo(
-    () => filterAndSortNodes(nodes, activeGroup, query, sortMode),
-    [nodes, activeGroup, query, sortMode],
+  useEffect(() => {
+    if (activeGroup !== "ALL" && !groups.includes(activeGroup)) {
+      setActiveGroup("ALL");
+    }
+  }, [activeGroup, groups]);
+
+  const visibleEntries = useMemo(
+    () => filterAndSortNodesAndChains(nodes, chains, activeGroup, query, sortMode),
+    [nodes, chains, activeGroup, query, sortMode],
+  );
+
+  const visibleNodeIds = useMemo(
+    () =>
+      visibleEntries
+        .filter((e): e is { kind: "node"; node: NodeIR } => e.kind === "node")
+        .map((e) => e.node.id),
+    [visibleEntries],
+  );
+
+  const visibleChainIds = useMemo(
+    () =>
+      visibleEntries
+        .filter((e): e is { kind: "chain"; chain: ProxyChain } => e.kind === "chain")
+        .map((e) => e.chain.id),
+    [visibleEntries],
   );
 
   const ruleUsageMap = useMemo(() => {
     const map = new Map<string, string[]>();
+    const pushTag = (key: string, label: string) => {
+      const arr = map.get(key) ?? [];
+      if (!arr.includes(label)) {
+        arr.push(label);
+        map.set(key, arr);
+      }
+    };
     const labels = {
       direct: dict.routing.optDirect,
       reject: dict.routing.optReject,
@@ -177,20 +227,26 @@ export function NodesView({
       if (!r.enabled || r.target === "direct" || r.target === "reject" || r.target === "main") {
         continue;
       }
-      const res = resolveTargetExit(r.target, nodes, mainNodeId, labels);
-      if (res.node) {
-        const title = presets[r.id] ?? r.title;
-        const arr = map.get(res.node.id) ?? [];
-        arr.push(title);
-        map.set(res.node.id, arr);
+      const res = resolveTargetExit(r.target, nodes, mainNodeId, labels, chains);
+      const title = presets[r.id] ?? r.title;
+      if (res.kind === "chain" && res.chain) {
+        pushTag(`chain:${res.chain.id}`, title);
+      } else if (res.node) {
+        pushTag(res.node.id, title);
+      }
+    }
+    for (const c of chains) {
+      const refLabel = `${dict.nodes.chainRefPrefix}: ${c.name}`;
+      for (const hopId of c.hops) {
+        pushTag(hopId, refLabel);
       }
     }
     return map;
-  }, [rules, nodes, mainNodeId, dict]);
+  }, [rules, nodes, chains, mainNodeId, dict]);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const virtualizer = useVirtualizer({
-    count: visibleNodes.length,
+    count: visibleEntries.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => 44,
     overscan: 12,
@@ -252,7 +308,7 @@ export function NodesView({
     }
   };
 
-  const progressTotal = testProgress?.total ?? visibleNodes.length;
+  const progressTotal = testProgress?.total ?? visibleNodeIds.length;
   const progressDone = testProgress?.completed ?? 0;
   const progressPct =
     progressTotal > 0 ? Math.min(100, Math.round((progressDone / progressTotal) * 100)) : 0;
@@ -267,6 +323,8 @@ export function NodesView({
     return nodes.find((n) => n.id === id) ?? null;
   }, [testProgress?.latest?.nodeId, nodes]);
   const latestDelayMs = testProgress?.latest?.delayMs ?? null;
+  const isAnyTesting = testingLatency || testingChainId !== null;
+  const hasAnyItems = nodes.length > 0 || chains.length > 0;
 
   return (
     <section className="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -279,12 +337,12 @@ export function NodesView({
         <div className="flex flex-wrap items-center gap-1.5">
           <button
             type="button"
-            disabled={testingLatency || visibleNodes.length === 0}
-            onClick={() => onRunRealDelayTest(visibleNodes.map((n) => n.id))}
-            className={nodes.length === 0 ? "ui-btn-secondary h-8" : "ui-btn-primary h-8"}
+            disabled={isAnyTesting || visibleEntries.length === 0}
+            onClick={() => onRunRealDelayTest(visibleNodeIds, visibleChainIds)}
+            className={!hasAnyItems ? "ui-btn-secondary h-8" : "ui-btn-primary h-8"}
           >
             <Gauge
-              className={`h-3.5 w-3.5 ${nodes.length === 0 ? "text-[var(--text-secondary)]" : ""}`}
+              className={`h-3.5 w-3.5 ${!hasAnyItems ? "text-[var(--text-secondary)]" : ""}`}
               strokeWidth={1.5}
             />
             {dict.nodes.realDelay}
@@ -307,10 +365,10 @@ export function NodesView({
           <button
             type="button"
             onClick={() => setShowImport(true)}
-            className={nodes.length === 0 ? "ui-btn-primary h-8" : "ui-btn-secondary h-8"}
+            className={!hasAnyItems ? "ui-btn-primary h-8" : "ui-btn-secondary h-8"}
           >
             <Plus
-              className={`h-3.5 w-3.5 ${nodes.length === 0 ? "" : "text-[var(--text-secondary)]"}`}
+              className={`h-3.5 w-3.5 ${!hasAnyItems ? "" : "text-[var(--text-secondary)]"}`}
               strokeWidth={1.5}
             />
             {dict.nodes.importBtn}
@@ -318,27 +376,45 @@ export function NodesView({
         </div>
       </div>
 
-      {/* Group Tabs + Search Bar (hidden when 0 nodes) */}
-      {nodes.length > 0 && (
+      {/* Group Tabs + Search Bar (hidden when 0 nodes and 0 chains) */}
+      {hasAnyItems && (
         <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-[var(--border-hairline)] px-4 py-2 lg:px-5">
           <div className="flex min-w-0 flex-wrap items-center gap-1.5">
             {groups.map((g) => {
               const active = activeGroup === g;
+              const isChainsGroup = g === CHAINS_GROUP_ID;
               const count =
-                g === "ALL" ? nodes.length : nodes.filter((n) => n.group === g).length;
+                g === "ALL"
+                  ? nodes.length + chains.length
+                  : isChainsGroup
+                    ? chains.length
+                    : nodes.filter((n) => n.group === g).length;
+              const label =
+                g === "ALL"
+                  ? dict.nodes.groupAll
+                  : isChainsGroup
+                    ? dict.nodes.groupChains
+                    : g;
               return (
                 <button
                   key={g}
                   type="button"
                   onClick={() => setActiveGroup(g)}
-                  className={`rounded-[9px] px-2.5 py-1 text-[12px] font-medium transition-colors cursor-pointer ${
+                  className={`inline-flex items-center gap-1.5 rounded-[9px] px-2.5 py-1 text-[12px] font-medium transition-colors cursor-pointer ${
                     active
                       ? "bg-[var(--accent-primary)] text-[var(--accent-primary-fg)]"
                       : "border border-[var(--border-hairline)] bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
                   }`}
                 >
-                  <span>{g === "ALL" ? dict.nodes.groupAll : g}</span>
-                  <span className="ml-1.5 font-mono text-[11.5px] opacity-75 num-tabular">
+                  {isChainsGroup && (
+                    <Waypoints
+                      className="h-3 w-3 shrink-0"
+                      style={{ color: active ? "currentColor" : "var(--accent-focus)" }}
+                      strokeWidth={1.6}
+                    />
+                  )}
+                  <span>{label}</span>
+                  <span className="font-mono text-[11.5px] opacity-75 num-tabular">
                     {count}
                   </span>
                 </button>
@@ -485,38 +561,58 @@ export function NodesView({
       )}
 
       {/* Empty State (>= 48px Full-Color Rainbow Overpass X Squircle) OR @container Virtualized Table */}
-      {visibleNodes.length === 0 ? (
-        <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
-          <BrandLogo variant="color" className="h-14 w-14" />
-          <div className="text-[15px] font-semibold text-[var(--text-primary)]">
-            {dict.nodes.emptyTitle}
-          </div>
-          <p className="max-w-md text-[12.5px] text-[var(--text-secondary)]">
-            {dict.nodes.emptyDesc}
-          </p>
-          <div className="mt-2 flex flex-col items-center gap-2">
-            <button
-              type="button"
-              onClick={() => setShowImport(true)}
-              className="ui-btn-primary h-9 px-4"
-            >
-              <Plus className="h-3.5 w-3.5" strokeWidth={1.6} />
-              {dict.nodes.emptyImportBtn}
-            </button>
-            {nodes.length === 0 && (
+      {visibleEntries.length === 0 ? (
+        hasAnyItems ? (
+          <div className="flex flex-1 flex-col items-center justify-center gap-2.5 p-8 text-center">
+            <div className="flex h-11 w-11 items-center justify-center rounded-[14px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] text-[var(--text-secondary)]">
+              <Search className="h-5 w-5" strokeWidth={1.5} />
+            </div>
+            <div className="text-[14px] font-semibold text-[var(--text-primary)]">
+              {dict.nodes.noMatchTitle}
+            </div>
+            {query.trim() && (
               <button
                 type="button"
-                title={dict.nodes.sampleTooltip}
-                onClick={() =>
-                  void onImportPayload(SAMPLE_SHARE_URIS, dict.nodes.demoGroupName)
-                }
-                className="ui-btn-ghost h-8 text-[12px] text-[var(--text-secondary)]"
+                onClick={() => setQuery("")}
+                className="ui-btn-secondary mt-1 h-8 px-3 text-[12px]"
               >
-                {dict.nodes.importSample}
+                {dict.nodes.clearSearch}
               </button>
             )}
           </div>
-        </div>
+        ) : (
+          <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
+            <BrandLogo variant="color" className="h-14 w-14" />
+            <div className="text-[15px] font-semibold text-[var(--text-primary)]">
+              {dict.nodes.emptyTitle}
+            </div>
+            <p className="max-w-md text-[12.5px] text-[var(--text-secondary)]">
+              {dict.nodes.emptyDesc}
+            </p>
+            <div className="mt-2 flex flex-col items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowImport(true)}
+                className="ui-btn-primary h-9 px-4"
+              >
+                <Plus className="h-3.5 w-3.5" strokeWidth={1.6} />
+                {dict.nodes.emptyImportBtn}
+              </button>
+              {nodes.length === 0 && (
+                <button
+                  type="button"
+                  title={dict.nodes.sampleTooltip}
+                  onClick={() =>
+                    void onImportPayload(SAMPLE_SHARE_URIS, dict.nodes.demoGroupName)
+                  }
+                  className="ui-btn-ghost h-8 text-[12px] text-[var(--text-secondary)]"
+                >
+                  {dict.nodes.importSample}
+                </button>
+              )}
+            </div>
+          </div>
+        )
       ) : (
         <div className="nodes-table-container flex min-h-0 flex-1 flex-col overflow-hidden">
           {/* Header */}
@@ -532,11 +628,14 @@ export function NodesView({
           {/* Virtualized Rows */}
           <div
             ref={scrollRef}
+            tabIndex={0}
+            role="region"
+            aria-label={dict.nodes.tableAriaLabel}
             onScroll={() => {
               if (hoveredTags) setHoveredTags(null);
               if (contextMenu) setContextMenu(null);
             }}
-            className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
+            className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden outline-none"
           >
             <div
               style={{
@@ -546,9 +645,296 @@ export function NodesView({
               }}
             >
               {virtualizer.getVirtualItems().map((vRow) => {
-                const n = visibleNodes[vRow.index];
+                const entry = visibleEntries[vRow.index];
+
+                if (entry.kind === "chain") {
+                  const chain = entry.chain;
+                  const targetId = `chain:${chain.id}`;
+                  const isMain = targetId === mainNodeId;
+                  const isContextTarget =
+                    contextMenu?.entry.kind === "chain" &&
+                    contextMenu.entry.chain.id === chain.id;
+                  const tags = ruleUsageMap.get(targetId) ?? [];
+                  const displayMs = chain.realDelayMs ?? null;
+                  const isTestingThisChain = testingChainId === chain.id;
+                  const summary = summarizeChainHops(chain, nodeById);
+                  const hopBadge = `${chain.hops.length}H`;
+
+                  return (
+                    <div
+                      key={targetId}
+                      tabIndex={0}
+                      onDoubleClick={() => onSelectMainNode(targetId)}
+                      onContextMenu={(e) => openEntryContextMenu(e, entry)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") onSelectMainNode(targetId);
+                      }}
+                      style={{
+                        position: "absolute",
+                        top: 0,
+                        left: 0,
+                        width: "100%",
+                        height: `${vRow.size}px`,
+                        transform: `translateY(${vRow.start}px)`,
+                        backgroundColor: isMain
+                          ? "var(--accent-soft)"
+                          : isContextTarget
+                            ? "var(--bg-hover)"
+                            : undefined,
+                      }}
+                      className={`group nodes-grid relative border-b border-[var(--border-hairline)] px-4 text-[12.5px] transition-colors cursor-pointer lg:px-5 ${
+                        isMain || isContextTarget ? "" : "hover:bg-[var(--bg-hover)]"
+                      }`}
+                    >
+                      {/* P1: Chain Name + Missing Guard + Group Pill + Folded Narrow Subline */}
+                      <div className="flex min-w-0 flex-col justify-center overflow-hidden">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span
+                            className="h-1.5 w-1.5 shrink-0 rounded-full"
+                            style={{
+                              backgroundColor: isMain
+                                ? "var(--accent-focus)"
+                                : "var(--border-strong)",
+                            }}
+                          />
+                          <Waypoints
+                            className="h-3.5 w-3.5 shrink-0 text-[var(--accent-focus)]"
+                            strokeWidth={1.6}
+                          />
+                          <span
+                            className="min-w-0 flex-1 truncate font-medium text-[var(--text-primary)]"
+                            title={chain.name}
+                          >
+                            {chain.name}
+                          </span>
+                          {summary.missingCount > 0 && (
+                            <span
+                              title={dict.chains.warnMissingHop}
+                              className="inline-flex shrink-0 items-center gap-1 rounded-[6px] border px-1.5 py-0.5 text-[11px] font-medium"
+                              style={{
+                                borderColor: "var(--danger-border)",
+                                backgroundColor: "var(--danger-bg)",
+                                color: "var(--danger-text-on-bg)",
+                              }}
+                            >
+                              <AlertTriangle className="h-3 w-3 shrink-0" strokeWidth={1.6} />
+                              <span className="hidden sm:inline">{dict.nodes.chainMissingHop}</span>
+                            </span>
+                          )}
+                          <span
+                            title={dict.nodes.groupChains}
+                            className="hidden shrink-0 max-w-[96px] truncate rounded-[6px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-1.5 py-0.5 text-[11.5px] text-[var(--text-secondary)] xl:inline-block"
+                          >
+                            {dict.nodes.groupChains}
+                          </span>
+                        </div>
+
+                        {/* Folded subline when container < 960px */}
+                        <div className="nodes-subline-meta items-center gap-1.5 pl-3.5 text-[11.5px] text-[var(--text-secondary)]">
+                          <span className="nodes-subline-proto rounded-[4px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-1 font-mono text-[11.5px] text-[var(--text-secondary)]">
+                            {hopBadge}
+                          </span>
+                          <span className="truncate font-mono" title={summary.fullPath}>
+                            {summary.compactPath}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* P2: Hop Badge */}
+                      <div className="nodes-col-proto">
+                        <span className="inline-flex items-center gap-1 rounded-[6px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-1.5 py-0.5 font-mono text-[11.5px] font-medium text-[var(--text-primary)] num-tabular">
+                          <Waypoints
+                            className="h-2.5 w-2.5 shrink-0 text-[var(--accent-focus)]"
+                            strokeWidth={1.7}
+                          />
+                          {hopBadge}
+                        </span>
+                      </div>
+
+                      {/* P3: Hop Path Summary */}
+                      <div className="nodes-col-server min-w-0" title={summary.fullPath}>
+                        <div className="flex min-w-0 items-center gap-1 text-[11.5px] text-[var(--text-secondary)]">
+                          {summary.entryRegion && (
+                            <RegionFlag code={summary.entryRegion} size="xs" />
+                          )}
+                          {summary.entryRegion && summary.exitRegion && (
+                            <ArrowRight
+                              className="h-2.5 w-2.5 shrink-0 text-[var(--text-tertiary)]"
+                              strokeWidth={1.7}
+                            />
+                          )}
+                          {summary.exitRegion && (
+                            <RegionFlag code={summary.exitRegion} size="xs" />
+                          )}
+                          <span className="min-w-0 truncate font-mono">
+                            {summary.shortPath}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* P4: Rule Usage Tags */}
+                      <div className="nodes-col-rules min-w-0">
+                        {tags.length > 0 ? (
+                          <div
+                            className="flex items-center gap-1"
+                            onMouseEnter={(e) => {
+                              const r = e.currentTarget.getBoundingClientRect();
+                              const placeBelow = r.top < 150;
+                              setHoveredTags({
+                                tags,
+                                x: Math.max(
+                                  140,
+                                  Math.min(r.left + r.width / 2, window.innerWidth - 140),
+                                ),
+                                y: placeBelow ? r.bottom + 6 : r.top - 6,
+                                placeBelow,
+                              });
+                            }}
+                            onMouseLeave={() => setHoveredTags(null)}
+                          >
+                            <span
+                              title={tags.join(", ")}
+                              className="max-w-[82px] truncate rounded-[6px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-1.5 py-0.5 text-[11.5px] text-[var(--text-secondary)]"
+                            >
+                              {compactRuleTag(tags[0])}
+                            </span>
+                            {tags.length > 1 && (
+                              <span className="shrink-0 rounded-[6px] border border-[var(--border-strong)] bg-[var(--bg-surface)] px-1.5 py-0.5 font-mono text-[11.5px] font-medium num-tabular text-[var(--text-primary)]">
+                                +{tags.length - 1}
+                              </span>
+                            )}
+                          </div>
+                        ) : (
+                          <span
+                            className={`text-[11.5px] ${
+                              isMain
+                                ? "text-[var(--text-secondary)]"
+                                : "text-[var(--text-tertiary)]"
+                            }`}
+                          >
+                            --
+                          </span>
+                        )}
+                      </div>
+
+                      {/* P1: Dual-Encoded Chain Latency */}
+                      <div
+                        className="relative flex items-center justify-end gap-1.5 font-mono text-[12px] font-medium num-tabular"
+                        title={
+                          displayMs != null
+                            ? `${dict.nodes.colReal}: ${formatLatency(displayMs)}`
+                            : undefined
+                        }
+                      >
+                        {isTestingThisChain ? (
+                          <span className="inline-flex items-center gap-1.5 text-[11.5px] text-[var(--accent-focus)]">
+                            <span
+                              className="h-1.5 w-1.5 rounded-full animate-pulse"
+                              style={{ backgroundColor: "var(--accent-focus)" }}
+                            />
+                            <span>{dict.chains.testing}</span>
+                          </span>
+                        ) : (
+                          <>
+                            <SignalBars ms={displayMs} />
+                            <span style={{ color: delayColorVar(displayMs) }}>
+                              {formatLatency(displayMs)}
+                            </span>
+                          </>
+                        )}
+
+                        {/* Narrow < 760px Hover-Overlay Actions over Latency cell */}
+                        <div className="nodes-col-actions-overlay row-actions absolute inset-y-0 right-0 items-center gap-1 bg-[var(--bg-surface)] pl-2">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onSelectMainNode(targetId);
+                            }}
+                            className={`rounded-[7px] px-2 py-0.5 text-[11px] font-medium cursor-pointer ${
+                              isMain
+                                ? "bg-[var(--accent-primary)] text-[var(--accent-primary-fg)]"
+                                : "border border-[var(--border-strong)] bg-[var(--bg-surface)] text-[var(--text-primary)]"
+                            }`}
+                          >
+                            {isMain ? dict.nodes.actActive : dict.nodes.actUse}
+                          </button>
+                          <button
+                            type="button"
+                            aria-label={dict.nodes.actEditChain}
+                            title={dict.nodes.actEditChain}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onEditChain(chain.id);
+                            }}
+                            className="ui-btn-ghost h-6 w-6 p-0 text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                          >
+                            <Pencil className="h-3 w-3" strokeWidth={1.6} />
+                          </button>
+                          <button
+                            type="button"
+                            aria-label={dict.nodes.actDelete}
+                            title={dict.nodes.actDelete}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onDeleteChain(chain.id);
+                            }}
+                            className="ui-btn-danger-ghost h-6 w-6 p-0"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* P2: Actions (>= 760px) */}
+                      <div className="nodes-col-actions">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onSelectMainNode(targetId);
+                          }}
+                          className={`rounded-[7px] px-2 py-1 text-[11.5px] font-medium transition-opacity cursor-pointer ${
+                            isMain
+                              ? "bg-[var(--accent-primary)] text-[var(--accent-primary-fg)]"
+                              : "row-actions border border-[var(--border-strong)] bg-[var(--bg-surface)] text-[var(--text-primary)] hover:bg-[var(--bg-subtle)]"
+                          }`}
+                        >
+                          {isMain ? dict.nodes.actActive : dict.nodes.actUse}
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={dict.nodes.actEditChain}
+                          title={dict.nodes.actEditChain}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onEditChain(chain.id);
+                          }}
+                          className="row-actions ui-btn-ghost h-7 w-7 p-0 text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                        >
+                          <Pencil className="h-3.5 w-3.5" strokeWidth={1.5} />
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={dict.nodes.actDelete}
+                          title={dict.nodes.actDelete}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onDeleteChain(chain.id);
+                          }}
+                          className="row-actions ui-btn-danger-ghost h-7 w-7 p-0"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
+                        </button>
+                      </div>
+                    </div>
+                  );
+                }
+
+                const n = entry.node;
                 const isMain = n.id === mainNodeId;
-                const isContextTarget = contextMenu?.node.id === n.id;
+                const isContextTarget =
+                  contextMenu?.entry.kind === "node" && contextMenu.entry.node.id === n.id;
                 const tags = ruleUsageMap.get(n.id) ?? [];
                 const displayMs = n.realDelayMs ?? null;
                 const addrText = `${n.server}:${n.port}`;
@@ -558,7 +944,7 @@ export function NodesView({
                     key={n.id}
                     tabIndex={0}
                     onDoubleClick={() => onSelectMainNode(n.id)}
-                    onContextMenu={(e) => openNodeContextMenu(e, n)}
+                    onContextMenu={(e) => openEntryContextMenu(e, entry)}
                     onKeyDown={(e) => {
                       if (e.key === "Enter") onSelectMainNode(n.id);
                     }}
@@ -720,14 +1106,14 @@ export function NodesView({
                     </div>
 
                     {/* P2: Actions (>= 760px, hover-reveal on inactive rows) */}
-                    <div className="nodes-col-actions flex items-center justify-end gap-1">
+                    <div className="nodes-col-actions">
                       <button
                         type="button"
                         onClick={(e) => {
                           e.stopPropagation();
                           onSelectMainNode(n.id);
                         }}
-                        className={`rounded-[7px] px-2.5 py-1 text-[11.5px] font-medium transition-opacity cursor-pointer ${
+                        className={`rounded-[7px] px-2 py-1 text-[11.5px] font-medium transition-opacity cursor-pointer ${
                           isMain
                             ? "bg-[var(--accent-primary)] text-[var(--accent-primary-fg)]"
                             : "row-actions border border-[var(--border-strong)] bg-[var(--bg-surface)] text-[var(--text-primary)] hover:bg-[var(--bg-subtle)]"
@@ -786,7 +1172,7 @@ export function NodesView({
         </div>
       )}
 
-      {/* Desktop Node Row Context Menu */}
+      {/* Desktop Row Context Menu (Unified for Nodes & Proxy Chains) */}
       {contextMenu && (
         <div
           ref={contextMenuRef}
@@ -795,101 +1181,223 @@ export function NodesView({
           style={{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }}
           onContextMenu={(e) => e.preventDefault()}
         >
-          <div className="mb-1 flex items-center justify-between gap-2 border-b border-[var(--border-hairline)] px-2 pb-1.5">
-            <span
-              className="truncate font-medium text-[var(--text-primary)]"
-              title={contextMenu.node.remark}
-            >
-              {contextMenu.node.remark}
-            </span>
-            <span className="shrink-0 rounded-[5px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-1.5 py-0.5 font-mono text-[10.5px] text-[var(--text-secondary)]">
-              {PROTO_BADGES[contextMenu.node.protocol]}
-            </span>
-          </div>
+          {contextMenu.entry.kind === "chain" ? (
+            (() => {
+              const chain = contextMenu.entry.chain;
+              const targetId = `chain:${chain.id}`;
+              const isMain = targetId === mainNodeId;
+              const summary = summarizeChainHops(chain, nodeById);
+              return (
+                <>
+                  <div className="mb-1 flex items-center justify-between gap-2 border-b border-[var(--border-hairline)] px-2 pb-1.5">
+                    <span
+                      className="truncate font-medium text-[var(--text-primary)]"
+                      title={chain.name}
+                    >
+                      {chain.name}
+                    </span>
+                    <span className="shrink-0 rounded-[5px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-1.5 py-0.5 font-mono text-[10.5px] text-[var(--text-secondary)] num-tabular">
+                      {chain.hops.length}H
+                    </span>
+                  </div>
 
-          <button
-            type="button"
-            role="menuitem"
-            disabled={contextMenu.node.id === mainNodeId}
-            onClick={() => {
-              onSelectMainNode(contextMenu.node.id);
-              setContextMenu(null);
-            }}
-            className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-55 cursor-pointer disabled:cursor-default"
-          >
-            <Check
-              className="h-3.5 w-3.5 shrink-0"
-              style={{
-                color:
-                  contextMenu.node.id === mainNodeId
-                    ? "var(--accent-focus)"
-                    : "var(--text-secondary)",
-              }}
-              strokeWidth={1.6}
-            />
-            <span>
-              {contextMenu.node.id === mainNodeId ? dict.nodes.ctxIsMain : dict.nodes.ctxUseMain}
-            </span>
-          </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={isMain}
+                    onClick={() => {
+                      onSelectMainNode(targetId);
+                      setContextMenu(null);
+                    }}
+                    className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-55 cursor-pointer disabled:cursor-default"
+                  >
+                    <Check
+                      className="h-3.5 w-3.5 shrink-0"
+                      style={{
+                        color: isMain ? "var(--accent-focus)" : "var(--text-secondary)",
+                      }}
+                      strokeWidth={1.6}
+                    />
+                    <span>{isMain ? dict.nodes.ctxIsMain : dict.nodes.ctxUseMain}</span>
+                  </button>
 
-          <button
-            type="button"
-            role="menuitem"
-            disabled={testingLatency}
-            onClick={() => {
-              onRunRealDelayTest([contextMenu.node.id]);
-              setContextMenu(null);
-            }}
-            className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed"
-          >
-            <Gauge className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]" strokeWidth={1.5} />
-            <span>{dict.nodes.ctxRealDelay}</span>
-          </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={isAnyTesting}
+                    onClick={() => {
+                      onTestChainDelay(chain.id);
+                      setContextMenu(null);
+                    }}
+                    className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed"
+                  >
+                    <Gauge
+                      className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]"
+                      strokeWidth={1.5}
+                    />
+                    <span>{dict.nodes.ctxRealDelay}</span>
+                  </button>
 
-          <div className="my-1 border-t border-[var(--border-hairline)]" />
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      onEditChain(chain.id);
+                      setContextMenu(null);
+                    }}
+                    className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] cursor-pointer"
+                  >
+                    <Pencil
+                      className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]"
+                      strokeWidth={1.5}
+                    />
+                    <span>{dict.nodes.ctxEditChain}</span>
+                  </button>
 
-          {contextMenu.node.rawUri && (
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => {
-                if (contextMenu.node.rawUri) onCopyText(contextMenu.node.rawUri);
-                setContextMenu(null);
-              }}
-              className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] cursor-pointer"
-            >
-              <Link2 className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]" strokeWidth={1.5} />
-              <span>{dict.nodes.ctxCopyUri}</span>
-            </button>
+                  <div className="my-1 border-t border-[var(--border-hairline)]" />
+
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      onCopyText(summary.fullPath);
+                      setContextMenu(null);
+                    }}
+                    className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] cursor-pointer"
+                  >
+                    <Copy
+                      className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]"
+                      strokeWidth={1.5}
+                    />
+                    <span>{dict.nodes.ctxCopyPath}</span>
+                  </button>
+
+                  <div className="my-1 border-t border-[var(--border-hairline)]" />
+
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      onDeleteChain(chain.id);
+                      setContextMenu(null);
+                    }}
+                    className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--danger-bg-hover)] hover:text-[var(--danger-text-on-bg)] cursor-pointer"
+                  >
+                    <Trash2 className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
+                    <span>{dict.nodes.ctxDeleteChain}</span>
+                  </button>
+                </>
+              );
+            })()
+          ) : (
+            (() => {
+              const node = contextMenu.entry.node;
+              const isMain = node.id === mainNodeId;
+              return (
+                <>
+                  <div className="mb-1 flex items-center justify-between gap-2 border-b border-[var(--border-hairline)] px-2 pb-1.5">
+                    <span
+                      className="truncate font-medium text-[var(--text-primary)]"
+                      title={node.remark}
+                    >
+                      {node.remark}
+                    </span>
+                    <span className="shrink-0 rounded-[5px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-1.5 py-0.5 font-mono text-[10.5px] text-[var(--text-secondary)]">
+                      {PROTO_BADGES[node.protocol]}
+                    </span>
+                  </div>
+
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={isMain}
+                    onClick={() => {
+                      onSelectMainNode(node.id);
+                      setContextMenu(null);
+                    }}
+                    className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-55 cursor-pointer disabled:cursor-default"
+                  >
+                    <Check
+                      className="h-3.5 w-3.5 shrink-0"
+                      style={{
+                        color: isMain ? "var(--accent-focus)" : "var(--text-secondary)",
+                      }}
+                      strokeWidth={1.6}
+                    />
+                    <span>{isMain ? dict.nodes.ctxIsMain : dict.nodes.ctxUseMain}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={isAnyTesting}
+                    onClick={() => {
+                      onRunRealDelayTest([node.id], []);
+                      setContextMenu(null);
+                    }}
+                    className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed"
+                  >
+                    <Gauge
+                      className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]"
+                      strokeWidth={1.5}
+                    />
+                    <span>{dict.nodes.ctxRealDelay}</span>
+                  </button>
+
+                  <div className="my-1 border-t border-[var(--border-hairline)]" />
+
+                  {node.rawUri && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        if (node.rawUri) onCopyText(node.rawUri);
+                        setContextMenu(null);
+                      }}
+                      className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] cursor-pointer"
+                    >
+                      <Link2
+                        className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]"
+                        strokeWidth={1.5}
+                      />
+                      <span>{dict.nodes.ctxCopyUri}</span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      onCopyText(`${node.server}:${node.port}`);
+                      setContextMenu(null);
+                    }}
+                    className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] cursor-pointer"
+                  >
+                    <Copy
+                      className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]"
+                      strokeWidth={1.5}
+                    />
+                    <span>{dict.nodes.ctxCopyAddr}</span>
+                  </button>
+
+                  <div className="my-1 border-t border-[var(--border-hairline)]" />
+
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      onDeleteNode(node.id);
+                      setContextMenu(null);
+                    }}
+                    className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--danger-bg-hover)] hover:text-[var(--danger-text-on-bg)] cursor-pointer"
+                  >
+                    <Trash2 className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
+                    <span>{dict.nodes.ctxDelete}</span>
+                  </button>
+                </>
+              );
+            })()
           )}
-
-          <button
-            type="button"
-            role="menuitem"
-            onClick={() => {
-              onCopyText(`${contextMenu.node.server}:${contextMenu.node.port}`);
-              setContextMenu(null);
-            }}
-            className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] cursor-pointer"
-          >
-            <Copy className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]" strokeWidth={1.5} />
-            <span>{dict.nodes.ctxCopyAddr}</span>
-          </button>
-
-          <div className="my-1 border-t border-[var(--border-hairline)]" />
-
-          <button
-            type="button"
-            role="menuitem"
-            onClick={() => {
-              onDeleteNode(contextMenu.node.id);
-              setContextMenu(null);
-            }}
-            className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--danger-bg-hover)] hover:text-[var(--danger-text-on-bg)] cursor-pointer"
-          >
-            <Trash2 className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
-            <span>{dict.nodes.ctxDelete}</span>
-          </button>
         </div>
       )}
 
