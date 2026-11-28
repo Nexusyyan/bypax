@@ -1996,10 +1996,10 @@ fn sha256_file_bytes(path: &Path) -> Result<[u8; 32]> {
 /// and SHA-256 digest. Used to avoid needlessly touching unchanged kernel drivers or
 /// companion binaries during multi-binary upgrades.
 pub fn files_are_identical(a: &Path, b: &Path) -> bool {
-    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::symlink_metadata(b)) else {
         return false;
     };
-    if !ma.is_file() || !mb.is_file() || ma.len() != mb.len() {
+    if !ma.is_file() || !mb.file_type().is_file() || ma.len() != mb.len() {
         return false;
     }
     match (sha256_file_bytes(a), sha256_file_bytes(b)) {
@@ -2270,7 +2270,12 @@ fn rollback_completed_swaps(completed: Vec<CompletedSwap>) {
 
 /// Atomically swaps `target` with `staged` using a same-volume temporary copy and `.prev` backup
 /// with automatic rollback if finalization fails.
+/// Skips staging and swapping cleanly when `target` already matches `staged` by SHA-256.
 pub fn replace_binary_atomically(staged: &Path, target: &Path) -> Result<()> {
+    if files_are_identical(staged, target) {
+        return Ok(());
+    }
+
     let parent = target
         .parent()
         .ok_or_else(|| anyhow!("Target path has no parent: {}", target.display()))?;
@@ -2912,8 +2917,9 @@ fn relaunch_target(plan: &UpdatePlan, helper_exe: Option<&Path>) {
     let _ = cmd.spawn();
 }
 
-/// Collects the full ordered list of `(staged_src, target_dst)` pairs for an `UpdatePlan`,
-/// plus a flag indicating whether `BypaxService` must be stopped before replacing locked files.
+/// Collects the ordered list of changed `(staged_src, target_dst)` pairs for an `UpdatePlan`
+/// (skipping targets whose installed content already matches the staged SHA-256 digest), plus a
+/// flag indicating whether `BypaxService` must be stopped before replacing locked files.
 pub fn build_swap_manifest(plan: &UpdatePlan) -> (Vec<(PathBuf, PathBuf)>, bool) {
     let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut seen_targets: Vec<PathBuf> = Vec::new();
@@ -2932,6 +2938,9 @@ pub fn build_swap_manifest(plan: &UpdatePlan) -> (Vec<(PathBuf, PathBuf)>, bool)
             return;
         }
         seen_targets.push(target.clone());
+        if files_are_identical(&staged, &target) {
+            return;
+        }
         pairs.push((staged, target));
         if stops_service {
             needs_service_stop = true;
@@ -4203,6 +4212,192 @@ mod tests {
             .filter_map(|e| e.file_name().into_string().ok())
             .collect();
         assert_eq!(remaining, vec!["WinDivert64.sys".to_string()]);
+    }
+
+    #[test]
+    fn skips_identical_sha256_files_including_locked_windivert_driver_without_touching_target() {
+        let dir = tempdir().unwrap();
+        let install_dir = dir.path().join("install");
+        let payload_dir = dir.path().join("payload");
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::create_dir_all(&payload_dir).unwrap();
+
+        // Changed binaries that must be swapped.
+        write_fake_pe(&install_dir.join("bypax.exe"), 70_000, b"OLD_GUI");
+        write_fake_pe(&install_dir.join("bypax-cli.exe"), 70_000, b"OLD_CLI");
+        write_fake_pe(&install_dir.join("bypax-service.exe"), 70_000, b"OLD_SVC");
+        write_fake_pe(&payload_dir.join("bypax.exe"), 70_000, b"NEW_GUI");
+        write_fake_pe(&payload_dir.join("bypax-cli.exe"), 70_000, b"NEW_CLI");
+        write_fake_pe(&payload_dir.join("bypax-service.exe"), 70_000, b"NEW_SVC");
+
+        // Unchanged binaries and kernel driver with byte-for-byte identical contents.
+        write_fake_pe(
+            &install_dir.join("core/sing-box.exe"),
+            70_000,
+            b"SAME_CORE_1144",
+        );
+        write_fake_pe(
+            &payload_dir.join("core/sing-box.exe"),
+            70_000,
+            b"SAME_CORE_1144",
+        );
+        write_fake_pe(
+            &install_dir.join("runtime/windivert/WinDivert.dll"),
+            20_000,
+            b"SAME_WD_DLL",
+        );
+        write_fake_pe(
+            &payload_dir.join("runtime/windivert/WinDivert.dll"),
+            20_000,
+            b"SAME_WD_DLL",
+        );
+        write_fake_pe(
+            &install_dir.join("runtime/windivert/WinDivert64.sys"),
+            20_000,
+            b"SAME_WD_SYS",
+        );
+        write_fake_pe(
+            &payload_dir.join("runtime/windivert/WinDivert64.sys"),
+            20_000,
+            b"SAME_WD_SYS",
+        );
+
+        // One identical doc (must be skipped) and one changed doc (must be swapped).
+        std::fs::write(install_dir.join("LICENSE"), b"same-license-text").unwrap();
+        std::fs::write(payload_dir.join("LICENSE"), b"same-license-text").unwrap();
+        std::fs::write(install_dir.join("README.md"), b"old-readme").unwrap();
+        std::fs::write(payload_dir.join("README.md"), b"new-readme-v2").unwrap();
+
+        let bundle = discover_staged_bundle_files(&payload_dir, true).unwrap();
+        let plan = UpdatePlan {
+            parent_pid: 0,
+            helper_pid: None,
+            target_exe: install_dir.join("bypax.exe"),
+            target_dir: install_dir.clone(),
+            target_app_bundle: None,
+            portable_mode: true,
+            staged_dir: dir.path().join("stage"),
+            staged_exe: payload_dir.join("bypax.exe"),
+            staged_app_bundle: None,
+            staged_core_exe: bundle.core_exe,
+            staged_cli_exe: bundle.cli_exe,
+            staged_service_exe: bundle.service_exe,
+            extra_swaps: bundle.extra_swaps,
+            docs_to_copy: vec!["LICENSE".to_string(), "README.md".to_string()],
+            resume_core: true,
+            resume_sys_proxy: false,
+            resume_app_proxy: true,
+            resume_tun: false,
+            service_name: Some(BYPAX_SERVICE_NAME.to_string()),
+            runtime_dir: None,
+            from_version: "0.1.4".to_string(),
+            to_version: "0.1.5".to_string(),
+            to_tag: "v0.1.5".to_string(),
+            result_file: install_dir.join("result.json"),
+        };
+
+        let mock_svc = MockServiceController::new(true);
+        let mut swapped_targets: Vec<PathBuf> = Vec::new();
+        apply_update_transaction(&plan, &mock_svc, 2, Duration::from_millis(5), |_, dst| {
+            let name = dst.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name.eq_ignore_ascii_case("WinDivert64.sys")
+                || name.eq_ignore_ascii_case("WinDivert.dll")
+                || name.eq_ignore_ascii_case("sing-box.exe")
+                || name.eq_ignore_ascii_case("LICENSE")
+            {
+                bail!("unexpected swap attempt on identical file {}", dst.display());
+            }
+            swapped_targets.push(dst.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+
+        // Service was still coordinated because bypax-service.exe changed.
+        assert_eq!(mock_svc.recorded_events(), vec!["stop", "start"]);
+        assert!(mock_svc.is_service_running());
+
+        // All changed files swapped cleanly.
+        assert_eq!(
+            &std::fs::read(install_dir.join("bypax.exe")).unwrap()[160..167],
+            b"NEW_GUI"
+        );
+        assert_eq!(
+            &std::fs::read(install_dir.join("bypax-cli.exe")).unwrap()[160..167],
+            b"NEW_CLI"
+        );
+        assert_eq!(
+            &std::fs::read(install_dir.join("bypax-service.exe")).unwrap()[160..167],
+            b"NEW_SVC"
+        );
+        assert_eq!(
+            std::fs::read(install_dir.join("README.md")).unwrap(),
+            b"new-readme-v2"
+        );
+        assert_eq!(swapped_targets.len(), 4);
+
+        // Unchanged kernel driver, DLL, core, and doc remained untouched with zero .prev/.tmp leftovers.
+        let wd_sys = install_dir.join("runtime/windivert/WinDivert64.sys");
+        let wd_dll = install_dir.join("runtime/windivert/WinDivert.dll");
+        let core_exe = install_dir.join("core/sing-box.exe");
+        let license = install_dir.join("LICENSE");
+        assert_eq!(&std::fs::read(&wd_sys).unwrap()[160..171], b"SAME_WD_SYS");
+        assert_eq!(&std::fs::read(&wd_dll).unwrap()[160..171], b"SAME_WD_DLL");
+        assert_eq!(
+            &std::fs::read(&core_exe).unwrap()[160..174],
+            b"SAME_CORE_1144"
+        );
+        assert_eq!(std::fs::read(&license).unwrap(), b"same-license-text");
+        for skipped in [&wd_sys, &wd_dll, &core_exe, &license] {
+            assert!(
+                !backup_path_for(skipped).exists(),
+                "unexpected .prev backup created for identical file {}",
+                skipped.display()
+            );
+            assert!(
+                !sibling_tmp_path_for(skipped).exists(),
+                "unexpected .tmp file created for identical file {}",
+                skipped.display()
+            );
+        }
+
+        // Direct replace_batch_atomically_internal also skips identical files cleanly.
+        let direct_pairs = vec![
+            (payload_dir.join("runtime/windivert/WinDivert64.sys"), wd_sys.clone()),
+            (payload_dir.join("LICENSE"), license.clone()),
+        ];
+        replace_batch_atomically_internal(&direct_pairs, 2, Duration::from_millis(5), |_, dst| {
+            bail!("hook must not be called for identical file {}", dst.display());
+        })
+        .unwrap();
+
+        // Direct replace_binary_atomically on an identical target leaves zero backup/tmp artifacts.
+        replace_binary_atomically(&payload_dir.join("runtime/windivert/WinDivert64.sys"), &wd_sys)
+            .unwrap();
+        assert!(!backup_path_for(&wd_sys).exists());
+        assert!(!sibling_tmp_path_for(&wd_sys).exists());
+
+        // When only non-service files differ, service stop/start is skipped as well.
+        write_fake_pe(&payload_dir.join("bypax.exe"), 70_000, b"NEW_GUI_V2");
+        let mock_svc_idle = MockServiceController::new(true);
+        apply_update_transaction(
+            &plan,
+            &mock_svc_idle,
+            2,
+            Duration::from_millis(5),
+            |_, dst| {
+                let name = dst.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if name.eq_ignore_ascii_case("WinDivert64.sys") {
+                    bail!("unexpected swap attempt on identical WinDivert64.sys");
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(mock_svc_idle.recorded_events().is_empty());
+        assert_eq!(
+            &std::fs::read(install_dir.join("bypax.exe")).unwrap()[160..170],
+            b"NEW_GUI_V2"
+        );
     }
 
     #[cfg(target_os = "macos")]
