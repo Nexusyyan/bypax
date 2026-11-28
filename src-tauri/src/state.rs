@@ -26,7 +26,7 @@ use bypax_windivert::probe_windivert;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -175,6 +175,7 @@ pub struct AppState {
     pub core_via_service: AtomicBool,
     pub app_proxy_active: AtomicBool,
     pub tun_active: AtomicBool,
+    pub service_pid: AtomicU32,
     pub recovered_from_crash: bool,
     pub traffic_cursor: Mutex<TrafficCursor>,
     pub conn_tracker: Mutex<ConnectionTracker>,
@@ -280,6 +281,7 @@ impl AppState {
             core_via_service: AtomicBool::new(false),
             app_proxy_active: AtomicBool::new(false),
             tun_active: AtomicBool::new(false),
+            service_pid: AtomicU32::new(0),
             recovered_from_crash,
             traffic_cursor: Mutex::new(TrafficCursor::default()),
             conn_tracker: Mutex::new(ConnectionTracker::default()),
@@ -324,6 +326,20 @@ impl AppState {
         } else {
             CaptureMode::Off
         }
+    }
+
+    pub fn current_service_pid(&self) -> Option<u32> {
+        let pid = self.service_pid.load(Ordering::Relaxed);
+        if pid > 0 {
+            Some(pid)
+        } else {
+            None
+        }
+    }
+
+    pub fn set_service_pid(&self, pid: Option<u32>) {
+        self.service_pid
+            .store(pid.unwrap_or(0), Ordering::Relaxed);
     }
 
     pub fn active_local_proxy_port(&self) -> Option<u16> {
@@ -650,12 +666,17 @@ impl AppState {
             self.core_via_service.store(false, Ordering::Relaxed);
             self.app_proxy_active.store(false, Ordering::Relaxed);
             self.tun_active.store(false, Ordering::Relaxed);
+            self.set_service_pid(None);
             self.push_log(
                 "WARN",
                 "helper: privileged helper disconnected after 3 heartbeat attempts; reset capture state to off",
             );
             return true;
         };
+
+        if let Some(pid) = resp.service_pid {
+            self.set_service_pid(Some(pid));
+        }
 
         let mut changed = false;
         if cfg!(target_os = "windows") && self.app_proxy_active.load(Ordering::Relaxed) {
@@ -833,6 +854,7 @@ impl AppState {
         match ping {
             Ok(resp) if resp.ok => {
                 let service_pid = resp.service_pid;
+                self.set_service_pid(service_pid);
                 let elevated = resp.elevated.unwrap_or(false);
                 let core_st = self
                     .service_request(ServiceCommand::CoreStatus, Duration::from_millis(450))
@@ -954,6 +976,7 @@ impl AppState {
                 self.core_via_service.store(false, Ordering::Relaxed);
                 self.app_proxy_active.store(false, Ordering::Relaxed);
                 self.tun_active.store(false, Ordering::Relaxed);
+                self.set_service_pid(None);
 
                 let (legacy_services, conflict_detail) = self.detect_windows_conflicts(false);
                 if !legacy_services.is_empty() || conflict_detail.is_some() {
@@ -1108,12 +1131,16 @@ impl AppState {
     }
 
     async fn ensure_service_connected(&self) -> Result<(), String> {
-        if matches!(
-            self.service_request(ServiceCommand::Ping, Duration::from_millis(400))
-                .await,
-            Ok(r) if r.ok
-        ) {
-            return Ok(());
+        if let Ok(r) = self
+            .service_request(ServiceCommand::Ping, Duration::from_millis(400))
+            .await
+        {
+            if r.ok {
+                if let Some(pid) = r.service_pid {
+                    self.set_service_pid(Some(pid));
+                }
+                return Ok(());
+            }
         }
 
         if cfg!(target_os = "windows") {
@@ -2177,6 +2204,7 @@ impl AppState {
         let stop_app = self.app_proxy_active.swap(false, Ordering::Relaxed);
         let stop_svc_core = self.core_via_service.swap(false, Ordering::Relaxed);
         self.tun_active.store(false, Ordering::Relaxed);
+        self.set_service_pid(None);
 
         if cfg!(target_os = "windows") || stop_app || stop_svc_core {
             let endpoint = self.service_endpoint.clone();
@@ -2546,6 +2574,7 @@ mod tests {
             core_via_service: AtomicBool::new(false),
             app_proxy_active: AtomicBool::new(false),
             tun_active: AtomicBool::new(false),
+            service_pid: AtomicU32::new(0),
             recovered_from_crash: false,
             traffic_cursor: Mutex::new(TrafficCursor::default()),
             conn_tracker: Mutex::new(ConnectionTracker::default()),

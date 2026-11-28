@@ -1991,7 +1991,8 @@ pub fn restart_to_update(app: AppHandle, state: State<'_, AppState>) -> Result<(
         resume_app_proxy,
         resume_tun,
         state.update_result_file.clone(),
-    );
+    )
+    .with_helper_pid(state.current_service_pid());
 
     spawn_detached_update_helper(&plan).map_err(|e| e.to_string())?;
 

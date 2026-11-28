@@ -357,6 +357,8 @@ impl Default for AppUpdateState {
 #[serde(rename_all = "camelCase")]
 pub struct UpdatePlan {
     pub parent_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub helper_pid: Option<u32>,
     pub target_exe: PathBuf,
     pub target_dir: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -414,6 +416,7 @@ impl UpdatePlan {
         let runtime_dir = result_file.parent().map(|p| p.to_path_buf());
         Self {
             parent_pid,
+            helper_pid: None,
             target_exe,
             target_dir,
             target_app_bundle,
@@ -443,6 +446,13 @@ impl UpdatePlan {
                 .unwrap_or_else(|| format!("v{}", CURRENT_APP_VERSION)),
             result_file,
         }
+    }
+
+    /// Attaches the PID of the running elevated helper (`bypax-service`) so the detached
+    /// updater waits for both GUI and helper processes to exit before swapping files.
+    pub fn with_helper_pid(mut self, helper_pid: Option<u32>) -> Self {
+        self.helper_pid = helper_pid.filter(|&p| p > 0);
+        self
     }
 }
 
@@ -1947,6 +1957,57 @@ pub fn backup_path_for(target: &Path) -> PathBuf {
     }
 }
 
+/// Computes a non-colliding sibling `.prev-<nonce>` backup path used when the canonical
+/// `.prev` backup already exists and is locked by the OS (for example, a kernel-mapped
+/// `WinDivert64.prev.sys` left over from a prior upgrade before reboot).
+pub fn unique_backup_path_for(target: &Path) -> PathBuf {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let nonce = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let file_name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bypax.exe");
+    if let Some(stem) = target.file_stem().and_then(|s| s.to_str()) {
+        if let Some(ext) = target.extension().and_then(|s| s.to_str()) {
+            parent.join(format!("{}.prev-{}.{}", stem, nonce, ext))
+        } else {
+            parent.join(format!("{}.prev-{}", stem, nonce))
+        }
+    } else {
+        parent.join(format!("{}.prev-{}", file_name, nonce))
+    }
+}
+
+fn sha256_file_bytes(path: &Path) -> Result<[u8; 32]> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// Returns `true` when both paths are existing regular files with identical byte length
+/// and SHA-256 digest. Used to avoid needlessly touching unchanged kernel drivers or
+/// companion binaries during multi-binary upgrades.
+pub fn files_are_identical(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    if !ma.is_file() || !mb.is_file() || ma.len() != mb.len() {
+        return false;
+    }
+    match (sha256_file_bytes(a), sha256_file_bytes(b)) {
+        (Ok(ha), Ok(hb)) => ha == hb,
+        _ => false,
+    }
+}
+
 fn sibling_tmp_path_for(target: &Path) -> PathBuf {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     let file_name = target
@@ -2121,23 +2182,43 @@ fn swap_pre_staged_file(
     max_attempts: usize,
     retry_delay: Duration,
 ) -> Result<CompletedSwap> {
-    let backup = backup_path_for(target);
+    let default_backup = backup_path_for(target);
     let mut last_err = String::new();
     let attempts = max_attempts.max(1);
 
     for attempt in 0..attempts {
+        let mut backup = default_backup.clone();
         if backup.exists() {
             let _ = std::fs::remove_file(&backup);
+            if backup.exists() {
+                // Canonical `.prev` backup is still locked (e.g. a kernel-mapped `.sys` driver
+                // image from a prior upgrade). Use a fresh sibling backup name instead of failing
+                // with ACCESS_DENIED trying to overwrite the locked destination.
+                backup = unique_backup_path_for(target);
+            }
         }
 
         let existed_before = target.exists();
         if existed_before {
             if let Err(e) = std::fs::rename(target, &backup) {
-                last_err = format!("rename old to backup: {}", e);
-                if attempt + 1 < attempts {
-                    std::thread::sleep(retry_delay);
+                if backup.exists() {
+                    let fallback = unique_backup_path_for(target);
+                    if std::fs::rename(target, &fallback).is_ok() {
+                        backup = fallback;
+                    } else {
+                        last_err = format!("rename old to backup: {}", e);
+                        if attempt + 1 < attempts {
+                            std::thread::sleep(retry_delay);
+                        }
+                        continue;
+                    }
+                } else {
+                    last_err = format!("rename old to backup: {}", e);
+                    if attempt + 1 < attempts {
+                        std::thread::sleep(retry_delay);
+                    }
+                    continue;
                 }
-                continue;
             }
         }
 
@@ -2237,8 +2318,10 @@ where
         return Ok(());
     }
 
-    // Phase 1: pre-copy every staged file into its same-volume sibling `.new.tmp`
-    // so read/disk errors abort cleanly before any live file is touched.
+    // Phase 1: pre-copy every changed staged file into its same-volume sibling `.new.tmp`
+    // so read/disk errors abort cleanly before any live file is touched. Skip files that are
+    // already byte-for-byte identical (e.g. unchanged WinDivert64.sys or sing-box.exe) so we
+    // never provoke unnecessary kernel/AV file locks.
     let mut prepared: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(pairs.len());
     for (staged, target) in pairs {
         if !staged.is_file() {
@@ -2246,6 +2329,9 @@ where
                 let _ = std::fs::remove_file(tmp);
             }
             bail!("Staged file missing: {}", staged.display());
+        }
+        if target.is_file() && files_are_identical(staged, target) {
+            continue;
         }
         let parent = target
             .parent()
@@ -2271,6 +2357,9 @@ where
             return Err(e);
         }
         prepared.push((sibling_tmp, target.clone()));
+    }
+    if prepared.is_empty() {
+        return Ok(());
     }
 
     // Phase 2: swap all targets sequentially; on any error, roll back every completed target.
@@ -2961,6 +3050,9 @@ pub fn apply_update_plan(plan_path: &Path) -> Result<()> {
     let self_exe = std::env::current_exe().ok();
 
     wait_for_pid_exit(plan.parent_pid, 20_000);
+    if let Some(helper_pid) = plan.helper_pid.filter(|&p| p > 0 && p != plan.parent_pid) {
+        wait_for_pid_exit(helper_pid, 10_000);
+    }
 
     let svc_name = plan
         .service_name
@@ -3019,7 +3111,12 @@ fn cleanup_prev_backups_in_dir(dir: &Path) {
             continue;
         }
         if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-            if name.contains(".prev.") || name.ends_with(".prev") || name.ends_with(".new.tmp") {
+            if name.contains(".prev.")
+                || name.contains(".prev-")
+                || name.ends_with(".prev")
+                || name.ends_with(".new.tmp")
+                || name.ends_with(".rollback.tmp")
+            {
                 let _ = std::fs::remove_file(&p);
             }
         }
@@ -3551,6 +3648,7 @@ mod tests {
 
         let plan = UpdatePlan {
             parent_pid: 0,
+            helper_pid: None,
             target_exe: install_dir.join("bypax.exe"),
             target_dir: install_dir.clone(),
             target_app_bundle: None,
@@ -3658,6 +3756,7 @@ mod tests {
         let bundle = discover_staged_bundle_files(&payload_dir, true).unwrap();
         let plan = UpdatePlan {
             parent_pid: 0,
+            helper_pid: None,
             target_exe: install_dir.join("bypax.exe"),
             target_dir: install_dir.clone(),
             target_app_bundle: None,
@@ -3925,6 +4024,185 @@ mod tests {
             &std::fs::read(backup.join("Contents/MacOS/bypax")).unwrap()[64..74],
             b"OLD_MAC_V1"
         );
+    }
+
+    #[test]
+    fn batch_swap_skips_byte_identical_driver_files_even_with_locked_prev_backup() {
+        let dir = tempdir().unwrap();
+        let install_dir = dir.path().join("install");
+        let payload_dir = dir.path().join("payload");
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::create_dir_all(&payload_dir).unwrap();
+
+        write_fake_pe(&install_dir.join("bypax.exe"), 70_000, b"OLD_GUI");
+        write_fake_pe(&payload_dir.join("bypax.exe"), 70_000, b"NEW_GUI");
+
+        // Identical WinDivert driver files across versions (same bytes as installed).
+        write_fake_pe(
+            &install_dir.join("runtime/windivert/WinDivert64.sys"),
+            20_000,
+            b"SAME_WD_SYS",
+        );
+        write_fake_pe(
+            &payload_dir.join("runtime/windivert/WinDivert64.sys"),
+            20_000,
+            b"SAME_WD_SYS",
+        );
+
+        // Simulate a stale kernel-locked WinDivert64.prev.sys left from an earlier upgrade.
+        let locked_prev = install_dir.join("runtime/windivert/WinDivert64.prev.sys");
+        write_fake_pe(&locked_prev, 20_000, b"STALE_LOCKED_PREV");
+        #[cfg(windows)]
+        let _lock_guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&locked_prev)
+                .unwrap()
+        };
+
+        let bundle = discover_staged_bundle_files(&payload_dir, true).unwrap();
+        let plan = UpdatePlan {
+            parent_pid: 0,
+            helper_pid: None,
+            target_exe: install_dir.join("bypax.exe"),
+            target_dir: install_dir.clone(),
+            target_app_bundle: None,
+            portable_mode: true,
+            staged_dir: dir.path().join("stage"),
+            staged_exe: payload_dir.join("bypax.exe"),
+            staged_app_bundle: None,
+            staged_core_exe: bundle.core_exe,
+            staged_cli_exe: bundle.cli_exe,
+            staged_service_exe: bundle.service_exe,
+            extra_swaps: bundle.extra_swaps,
+            docs_to_copy: vec![],
+            resume_core: true,
+            resume_sys_proxy: true,
+            resume_app_proxy: true,
+            resume_tun: false,
+            service_name: Some(BYPAX_SERVICE_NAME.to_string()),
+            runtime_dir: None,
+            from_version: "0.1.4".to_string(),
+            to_version: "0.1.5".to_string(),
+            to_tag: "v0.1.5".to_string(),
+            result_file: install_dir.join("result.json"),
+        };
+
+        let mock_svc = MockServiceController::new(false);
+        let mut swapped_names: Vec<String> = Vec::new();
+        apply_update_transaction(&plan, &mock_svc, 3, Duration::from_millis(5), |_, dst| {
+            if let Some(name) = dst.file_name().and_then(|s| s.to_str()) {
+                swapped_names.push(name.to_string());
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(swapped_names, vec!["bypax.exe".to_string()]);
+        assert_eq!(
+            &std::fs::read(install_dir.join("bypax.exe")).unwrap()[160..167],
+            b"NEW_GUI"
+        );
+        assert_eq!(
+            &std::fs::read(install_dir.join("runtime/windivert/WinDivert64.sys")).unwrap()
+                [160..171],
+            b"SAME_WD_SYS"
+        );
+    }
+
+    #[test]
+    fn swap_falls_back_to_unique_backup_when_prev_is_locked_and_supports_rollback_and_cleanup() {
+        let dir = tempdir().unwrap();
+        let windivert_dir = dir.path().join("install/runtime/windivert");
+        let payload_dir = dir.path().join("payload");
+        std::fs::create_dir_all(&windivert_dir).unwrap();
+        std::fs::create_dir_all(&payload_dir).unwrap();
+
+        let target_sys = windivert_dir.join("WinDivert64.sys");
+        let locked_prev = windivert_dir.join("WinDivert64.prev.sys");
+        let staged_sys = payload_dir.join("WinDivert64.sys");
+        let target_extra = dir.path().join("install/bypax.exe");
+        let staged_extra = payload_dir.join("bypax.exe");
+
+        write_fake_pe(&target_sys, 20_000, b"OLD_WD_SYS");
+        write_fake_pe(&locked_prev, 20_000, b"KERNEL_LOCKED_PREV");
+        write_fake_pe(&staged_sys, 20_000, b"NEW_WD_SYS");
+        write_fake_pe(&target_extra, 70_000, b"OLD_GUI");
+        write_fake_pe(&staged_extra, 70_000, b"NEW_GUI");
+
+        // Lock `WinDivert64.prev.sys` so deleting or overwriting it fails with sharing/access error.
+        #[cfg(windows)]
+        let lock_guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&locked_prev)
+                .unwrap()
+        };
+
+        // Case 1: Rollback restores OLD_WD_SYS even when a unique fallback backup was used.
+        let rollback_err = replace_batch_atomically_internal(
+            &[
+                (staged_sys.clone(), target_sys.clone()),
+                (staged_extra.clone(), target_extra.clone()),
+            ],
+            2,
+            Duration::from_millis(5),
+            |_, dst| {
+                if dst.file_name().and_then(|s| s.to_str()) == Some("bypax.exe") {
+                    bail!("injected failure after WinDivert64.sys swapped");
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(rollback_err.to_string().contains("injected failure"));
+        assert_eq!(&std::fs::read(&target_sys).unwrap()[160..170], b"OLD_WD_SYS");
+        assert_eq!(&std::fs::read(&target_extra).unwrap()[160..167], b"OLD_GUI");
+
+        // Case 2: Successful swap when WinDivert64.sys actually changed while `.prev.sys` is locked.
+        replace_batch_atomically_internal(
+            &[
+                (staged_sys.clone(), target_sys.clone()),
+                (staged_extra.clone(), target_extra.clone()),
+            ],
+            2,
+            Duration::from_millis(5),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(&std::fs::read(&target_sys).unwrap()[160..170], b"NEW_WD_SYS");
+        assert_eq!(&std::fs::read(&target_extra).unwrap()[160..167], b"NEW_GUI");
+
+        #[cfg(windows)]
+        {
+            // Verify fallback `.prev-<nonce>.sys` was created alongside the still-locked `.prev.sys`.
+            let has_unique_backup = std::fs::read_dir(&windivert_dir)
+                .unwrap()
+                .flatten()
+                .any(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|n| n.starts_with("WinDivert64.prev-") && n.ends_with(".sys"))
+                        .unwrap_or(false)
+                });
+            assert!(has_unique_backup);
+            drop(lock_guard);
+        }
+
+        // Once unlocked, cleanup removes both `.prev.` and `.prev-` artifacts cleanly.
+        cleanup_prev_backups_in_dir(&windivert_dir);
+        let remaining: Vec<String> = std::fs::read_dir(&windivert_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        assert_eq!(remaining, vec!["WinDivert64.sys".to_string()]);
     }
 
     #[cfg(target_os = "macos")]
