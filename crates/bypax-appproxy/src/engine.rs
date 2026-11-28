@@ -280,6 +280,9 @@ impl AppProxyEngine {
             );
         }
         self.flow_cache.clear();
+        // Drop the packet receiver before shutting down WinDivert so capture threads blocked on
+        // `blocking_send` wake immediately and can be joined without deadlocking.
+        drop(pkt_rx);
         let _ = self.capture.shutdown();
         drop(ctx);
         drop(netstack);

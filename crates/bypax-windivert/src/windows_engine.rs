@@ -192,6 +192,7 @@ pub struct WinDivertCaptureEngine {
     net_handle: Arc<Mutex<Option<Arc<WinDivertHandle>>>>,
     sock_handle: Arc<Mutex<Option<Arc<WinDivertHandle>>>>,
     flow_handle: Arc<Mutex<Option<Arc<WinDivertHandle>>>>,
+    worker_threads: Mutex<Vec<thread::JoinHandle<()>>>,
     running: Arc<AtomicBool>,
 }
 
@@ -214,6 +215,7 @@ impl WinDivertCaptureEngine {
             net_handle: Arc::new(Mutex::new(None)),
             sock_handle: Arc::new(Mutex::new(None)),
             flow_handle: Arc::new(Mutex::new(None)),
+            worker_threads: Mutex::new(Vec::new()),
             running: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -273,12 +275,13 @@ impl CaptureEngine for WinDivertCaptureEngine {
                 tx
             });
 
+            let mut spawned_threads = Vec::with_capacity(3);
             {
                 let running = Arc::clone(&self.running);
                 let tuple_pids = Arc::clone(&self.tuple_pids);
                 let port_pids = Arc::clone(&self.port_pids);
                 let warm_tx = warm_tx.clone();
-                thread::Builder::new()
+                let handle = thread::Builder::new()
                     .name("bypax-wd-socket".into())
                     .spawn(move || {
                         let mut empty = [];
@@ -301,6 +304,7 @@ impl CaptureEngine for WinDivertCaptureEngine {
                             }
                         }
                     })?;
+                spawned_threads.push(handle);
             }
 
             {
@@ -308,7 +312,7 @@ impl CaptureEngine for WinDivertCaptureEngine {
                 let tuple_pids = Arc::clone(&self.tuple_pids);
                 let port_pids = Arc::clone(&self.port_pids);
                 let warm_tx = warm_tx.clone();
-                thread::Builder::new()
+                let handle = thread::Builder::new()
                     .name("bypax-wd-flow".into())
                     .spawn(move || {
                         let mut empty = [];
@@ -331,11 +335,12 @@ impl CaptureEngine for WinDivertCaptureEngine {
                             }
                         }
                     })?;
+                spawned_threads.push(handle);
             }
 
             {
                 let running = Arc::clone(&self.running);
-                thread::Builder::new()
+                let handle = thread::Builder::new()
                     .name("bypax-wd-network".into())
                     .spawn(move || {
                         let mut buf = vec![0u8; 65_535];
@@ -366,6 +371,11 @@ impl CaptureEngine for WinDivertCaptureEngine {
                             }
                         }
                     })?;
+                spawned_threads.push(handle);
+            }
+
+            if let Ok(mut guard) = self.worker_threads.lock() {
+                guard.extend(spawned_threads);
             }
 
             Ok(())
@@ -426,6 +436,17 @@ impl CaptureEngine for WinDivertCaptureEngine {
         }
         if let Some(h) = self.flow_handle.lock().unwrap().take() {
             h.shutdown();
+        }
+        let threads: Vec<thread::JoinHandle<()>> = self
+            .worker_threads
+            .lock()
+            .map(|mut g| g.drain(..).collect())
+            .unwrap_or_default();
+        let current_id = thread::current().id();
+        for handle in threads {
+            if handle.thread().id() != current_id {
+                let _ = handle.join();
+            }
         }
         Ok(())
     }
