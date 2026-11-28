@@ -139,9 +139,7 @@ pub struct NodeIR {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detour: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tcping_ms: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub real_delay_ms: Option<u32>,
+    pub real_delay_ms: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_uri: Option<String>,
     pub created_at: String,
@@ -191,12 +189,35 @@ impl NodeIR {
             tls: None,
             transport: None,
             detour: None,
-            tcping_ms: None,
             real_delay_ms: None,
             raw_uri: None,
             created_at: chrono::Utc::now().to_rfc3339(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyChain {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub hops: Vec<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_delay_ms: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissingChainWarning {
+    pub chain_id: String,
+    pub chain_name: String,
+    pub missing_hop_ids: Vec<String>,
 }
 
 fn has_code_token(text: &str, code: &str) -> bool {
@@ -1037,7 +1058,7 @@ pub struct NetworkSnapshot {
 pub struct LatencyResult {
     pub node_id: String,
     pub kind: String,
-    pub delay_ms: Option<u32>,
+    pub delay_ms: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -1124,6 +1145,8 @@ pub struct CompileOutput {
     pub control_secret: String,
     #[serde(default)]
     pub missing_app_rule_targets: Vec<MissingAppTargetWarning>,
+    #[serde(default)]
+    pub missing_chain_warnings: Vec<MissingChainWarning>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

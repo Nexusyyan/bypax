@@ -52,7 +52,7 @@ pub enum CtlRequest {
         #[serde(default)]
         node_ids: Vec<String>,
         #[serde(default = "default_latency_kind")]
-        kind: String, // "tcping" | "real"
+        kind: String, // "real"
     },
     RefreshSubscriptions {
         #[serde(default)]
@@ -112,7 +112,7 @@ pub enum CtlRequest {
 }
 
 fn default_latency_kind() -> String {
-    "tcping".to_string()
+    "real".to_string()
 }
 
 /// Plane 2 response envelope carrying structured JSON output for CLI `--json` and MCP tools.

@@ -20,6 +20,7 @@ import type {
   LogEntry,
   NodeIR,
   PlatformTrafficPayload,
+  ProxyChain,
   SimpleRoutingRule,
   TrafficSample,
 } from "../../types";
@@ -36,6 +37,7 @@ interface MonitorViewProps {
   locale: Locale;
   coreRunning: boolean;
   nodes: NodeIR[];
+  chains: ProxyChain[];
   rules: SimpleRoutingRule[];
   extraPorts: InboundPort[];
   connections: ConnectionItem[];
@@ -91,6 +93,7 @@ export function MonitorView({
   locale,
   coreRunning,
   nodes,
+  chains,
   rules,
   extraPorts,
   connections,
@@ -294,7 +297,7 @@ export function MonitorView({
           presetTitles,
           useEnglish,
         );
-        const exitInfo = formatConnectionExit(c.chain, nodeById, exitLabels);
+        const exitInfo = formatConnectionExit(c.chain, nodeById, exitLabels, chains);
         const totalBytes = c.uploadBytes + c.downloadBytes;
         return {
           conn: c,
@@ -324,6 +327,7 @@ export function MonitorView({
     useEnglish,
     nodeById,
     exitLabels,
+    chains,
   ]);
 
   const filteredConns = useMemo(() => {
@@ -379,7 +383,7 @@ export function MonitorView({
       })
       .map((entry) => ({
         entry,
-        displayMessage: humanizeLogMessage(entry.message, nodeById, exitLabels),
+        displayMessage: humanizeLogMessage(entry.message, nodeById, exitLabels, chains),
       }))
       .filter(({ entry, displayMessage }) => {
         if (!q) return true;
@@ -389,7 +393,7 @@ export function MonitorView({
           entry.level.toLowerCase().includes(q)
         );
       });
-  }, [logs, logFilter, query, nodeById, exitLabels]);
+  }, [logs, logFilter, query, nodeById, exitLabels, chains]);
 
   const totalItemsForTab =
     subTab === "conns"
@@ -902,7 +906,7 @@ export function MonitorView({
               </div>
               <div className="divide-y divide-[var(--border-hairline)] text-[12px]">
                 {historyData.items.map((rec) => {
-                  const exitInfo = formatConnectionExit(rec.chain, nodeById, exitLabels);
+                  const exitInfo = formatConnectionExit(rec.chain, nodeById, exitLabels, chains);
                   const total = rec.uploadBytes + rec.downloadBytes;
                   const proc = rec.process === "Local App" ? dict.monitor.localApp : rec.process;
                   return (

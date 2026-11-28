@@ -4,6 +4,7 @@ import { BootstrapScreen } from "./components/BootstrapScreen";
 import { Sidebar } from "./components/Sidebar";
 import { TitleBar } from "./components/TitleBar";
 import { AppsView } from "./features/apps/AppsView";
+import { ChainsView } from "./features/chains/ChainsView";
 import { CoreView } from "./features/core/CoreView";
 import { DnsView } from "./features/dns/DnsView";
 import { MonitorView } from "./features/monitor/MonitorView";
@@ -44,6 +45,7 @@ import type {
   PlatformKind,
   PreflightReport,
   PrivilegedServiceStatus,
+  ProxyChain,
   RouteMode,
   RulePresetSpec,
   RuleSetStatus,
@@ -189,6 +191,7 @@ function readInitialTab(): NavTab {
     const raw = new URLSearchParams(window.location.search).get("tab");
     if (
       raw === "nodes" ||
+      raw === "chains" ||
       raw === "apps" ||
       raw === "routing" ||
       raw === "dns" ||
@@ -222,6 +225,7 @@ export default function App() {
   const [locale, setLocale] = useState<Locale>(detectInitialLocale);
   const [theme, setTheme] = useState<ThemeMode>(readInitialTheme);
   const [activeTab, setActiveTab] = useState<NavTab>(readInitialTab);
+  const [selectedChainEditId, setSelectedChainEditId] = useState<string | null>(null);
   const [routingTestHost, setRoutingTestHost] = useState<string | null>(null);
   const [monitorSubTabReq, setMonitorSubTabReq] = useState<{
     tab: "conns" | "history" | "platforms" | "logs";
@@ -240,6 +244,7 @@ export default function App() {
   const [coreInfo, setCoreInfo] = useState<CoreInfo>(DEFAULT_CORE_INFO);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [nodes, setNodes] = useState<NodeIR[]>([]);
+  const [chains, setChains] = useState<ProxyChain[]>([]);
   const [subscriptions, setSubscriptions] = useState<SubscriptionGroup[]>([]);
   const [rules, setRules] = useState<SimpleRoutingRule[]>([]);
   const [rulePresets, setRulePresets] = useState<RulePresetSpec[]>([]);
@@ -265,7 +270,8 @@ export default function App() {
   const [downHistory, setDownHistory] = useState<number[]>(() => Array(40).fill(0));
   const [upHistory, setUpHistory] = useState<number[]>(() => Array(40).fill(0));
 
-  const [testingKind, setTestingKind] = useState<"tcping" | "real" | null>(null);
+  const [testingLatency, setTestingLatency] = useState(false);
+  const [testingChainId, setTestingChainId] = useState<string | null>(null);
   const [mainNodeTesting, setMainNodeTesting] = useState(false);
   const [testProgress, setTestProgress] = useState<LatencyProgressEvent | null>(null);
   const [testDelayStats, setTestDelayStats] = useState<{ sum: number; count: number }>({
@@ -360,6 +366,7 @@ export default function App() {
       setCoreInfo(data.coreInfo);
       setSettings({ ...DEFAULT_SETTINGS, ...data.settings });
       setNodes(data.nodes);
+      setChains(data.chains ?? []);
       setSubscriptions(data.subscriptions);
       setRules(data.rules);
       setRuleSets(data.ruleSets);
@@ -487,17 +494,14 @@ export default function App() {
         }
         const latest = ev.latest;
         if (latest) {
-          if (batchTestingRef.current && latest.delayMs != null) {
+          if (batchTestingRef.current && latest.delayMs != null && latest.delayMs > 0) {
             const ms = latest.delayMs;
             setTestDelayStats((prev) => ({ sum: prev.sum + ms, count: prev.count + 1 }));
           }
           setNodes((prev) =>
             prev.map((n) => {
               if (n.id !== latest.nodeId) return n;
-              if (latest.kind === "tcping") {
-                return { ...n, tcpingMs: latest.delayMs ?? null };
-              }
-              return { ...n, realDelayMs: latest.delayMs ?? null };
+              return { ...n, realDelayMs: latest.delayMs ?? -1 };
             }),
           );
         }
@@ -538,10 +542,16 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [bootstrapped]);
 
-  const mainNode = useMemo(
-    () => nodes.find((n) => n.id === settings.mainNodeId) ?? nodes[0] ?? null,
-    [nodes, settings.mainNodeId],
-  );
+  const mainChain = useMemo(() => {
+    const id = settings.mainNodeId;
+    if (!id || !id.startsWith("chain:")) return null;
+    return chains.find((c) => c.id === id.slice("chain:".length)) ?? null;
+  }, [chains, settings.mainNodeId]);
+
+  const mainNode = useMemo(() => {
+    if (mainChain) return null;
+    return nodes.find((n) => n.id === settings.mainNodeId) ?? nodes[0] ?? null;
+  }, [mainChain, nodes, settings.mainNodeId]);
 
   const enabledAppCount = useMemo(
     () => appRules.filter((r) => r.enabled).length,
@@ -776,24 +786,27 @@ export default function App() {
     async (explicitNodeId?: string) => {
       const targetId = explicitNodeId ?? settings.mainNodeId ?? nodes[0]?.id ?? null;
       if (!targetId) return;
+      if (!coreInfo.installed) return;
       const seq = ++mainProbeSeqRef.current;
       setMainNodeTesting(true);
       try {
-        const useReal = coreInfo.installed;
-        const results = useReal
-          ? await api.runBatchRealDelay([targetId])
-          : await api.runBatchTcping([targetId]);
-        const hit = results.find((r) => r.nodeId === targetId) ?? results[0];
-        if (hit) {
-          setNodes((prev) =>
-            prev.map((n) => {
-              if (n.id !== targetId) return n;
-              if (hit.kind === "tcping") {
-                return { ...n, tcpingMs: hit.delayMs ?? null };
-              }
-              return { ...n, realDelayMs: hit.delayMs ?? null };
-            }),
+        if (targetId.startsWith("chain:")) {
+          const cid = targetId.slice("chain:".length);
+          const res = await api.testProxyChainDelay(cid);
+          setChains((prev) =>
+            prev.map((c) => (c.id === cid ? { ...c, realDelayMs: res.delayMs ?? -1 } : c)),
           );
+        } else {
+          const results = await api.runBatchRealDelay([targetId]);
+          const hit = results.find((r) => r.nodeId === targetId) ?? results[0];
+          if (hit) {
+            setNodes((prev) =>
+              prev.map((n) => {
+                if (n.id !== targetId) return n;
+                return { ...n, realDelayMs: hit.delayMs ?? -1 };
+              }),
+            );
+          }
         }
       } catch (err) {
         const msg = String(err);
@@ -863,34 +876,77 @@ export default function App() {
     }
   };
 
-  const handleRunBatchTest = async (kind: "tcping" | "real", nodeIds: string[]) => {
+  const handleRunRealDelayTest = async (nodeIds: string[]) => {
     batchTestingRef.current = true;
-    setTestingKind(kind);
+    setTestingLatency(true);
     setTestDelayStats({ sum: 0, count: 0 });
     setTestProgress({
-      kind,
-      phase: kind === "real" ? "starting" : "testing",
+      kind: "real",
+      phase: "starting",
       completed: 0,
       total: nodeIds.length,
       passed: 0,
       failed: 0,
-      stripHandshake: kind === "real" ? settings.latencyStripHandshake : undefined,
+      stripHandshake: settings.latencyStripHandshake,
     });
     try {
-      if (kind === "tcping") {
-        await api.runBatchTcping(nodeIds);
-      } else {
-        await api.runBatchRealDelay(nodeIds);
-      }
+      await api.runBatchRealDelay(nodeIds);
       await reloadBootstrap();
     } catch (err) {
       const msg = String(err);
       pushToast(msg.includes("CORE_NOT_INSTALLED") ? dict.toast.coreMissingAction : msg, "err");
     } finally {
       batchTestingRef.current = false;
-      setTestingKind(null);
+      setTestingLatency(false);
       setTestProgress(null);
       setTestDelayStats({ sum: 0, count: 0 });
+    }
+  };
+
+  const handleSaveChain = async (chain: ProxyChain): Promise<ProxyChain | null> => {
+    try {
+      const res = await api.saveProxyChain(chain);
+      setChains(res.chains);
+      setCompiled(res.compiled);
+      pushToast(dict.toast.chainSaved);
+      const saved =
+        res.chains.find((c) => c.id === chain.id) ??
+        res.chains.find((c) => c.name === chain.name) ??
+        res.chains[res.chains.length - 1] ??
+        null;
+      return saved;
+    } catch (err) {
+      pushToast(String(err), "err");
+      return null;
+    }
+  };
+
+  const handleDeleteChain = async (id: string) => {
+    try {
+      const res = await api.deleteProxyChain(id);
+      setChains(res.chains);
+      setCompiled(res.compiled);
+      if (settings.mainNodeId === `chain:${id}`) {
+        await reloadBootstrap();
+      }
+      pushToast(dict.toast.chainDeleted, "neutral");
+    } catch (err) {
+      pushToast(String(err), "err");
+    }
+  };
+
+  const handleTestChainDelay = async (chainId: string) => {
+    setTestingChainId(chainId);
+    try {
+      const res = await api.testProxyChainDelay(chainId);
+      setChains((prev) =>
+        prev.map((c) => (c.id === chainId ? { ...c, realDelayMs: res.delayMs ?? -1 } : c)),
+      );
+    } catch (err) {
+      const msg = String(err);
+      pushToast(msg.includes("CORE_NOT_INSTALLED") ? dict.toast.coreMissingAction : msg, "err");
+    } finally {
+      setTestingChainId(null);
     }
   };
 
@@ -1381,6 +1437,7 @@ export default function App() {
           activeTab={activeTab}
           onSelectTab={setActiveTab}
           nodeCount={nodes.length}
+          chainCount={chains.length}
           enabledAppCount={enabledAppCount}
           hasRecoveryFault={hasRecoveryFault}
           activeRuleCount={rules.filter((r) => r.enabled).length}
@@ -1392,6 +1449,7 @@ export default function App() {
           }
           takeoverSummary={takeoverSummary}
           mainNode={mainNode}
+          mainChain={mainChain}
           mainNodeTesting={mainNodeTesting}
           onRetestMainNode={() => void handleProbeMainNode()}
           mixedPort={settings.mixedPort}
@@ -1410,7 +1468,7 @@ export default function App() {
               subscriptions={subscriptions}
               rules={rules}
               mainNodeId={settings.mainNodeId}
-              testingKind={testingKind}
+              testingLatency={testingLatency}
               testProgress={testProgress}
               testAvgMs={
                 testDelayStats.count > 0
@@ -1424,11 +1482,27 @@ export default function App() {
               onSelectMainNode={(id) => void handleSelectMainNode(id)}
               onDeleteNode={(id) => void handleDeleteNode(id)}
               onCopyText={handleCopyText}
-              onRunBatchTest={(k, ids) => void handleRunBatchTest(k, ids)}
+              onRunRealDelayTest={(ids) => void handleRunRealDelayTest(ids)}
               onImportPayload={handleImportPayload}
               onImportSubscription={handleImportSubscription}
               onRefreshSubscription={handleRefreshSubscription}
               onDeleteSubscription={handleDeleteSubscription}
+            />
+          )}
+
+          {activeTab === "chains" && (
+            <ChainsView
+              dict={dict}
+              nodes={nodes}
+              chains={chains}
+              mainNodeId={settings.mainNodeId}
+              initialChainId={selectedChainEditId}
+              testingChainId={testingChainId}
+              onSaveChain={handleSaveChain}
+              onDeleteChain={handleDeleteChain}
+              onTestChainDelay={handleTestChainDelay}
+              onSelectMainChain={(cid) => handleSelectMainNode(`chain:${cid}`)}
+              onGoToNodes={() => setActiveTab("nodes")}
             />
           )}
 
@@ -1439,6 +1513,7 @@ export default function App() {
               captureMode={captureMode}
               captureSwitching={captureSwitching}
               nodes={nodes}
+              chains={chains}
               mainNodeId={settings.mainNodeId}
               appRules={appRules}
               appPresets={appPresets}
@@ -1476,6 +1551,7 @@ export default function App() {
               locale={locale}
               routeMode={settings.routeMode}
               nodes={nodes}
+              chains={chains}
               rules={rules}
               rulePresets={rulePresets}
               ruleSets={ruleSets}
@@ -1493,6 +1569,10 @@ export default function App() {
               onSavePort={(p) => void handleSavePort(p)}
               onDeletePort={(id) => void handleDeletePort(id)}
               onGoToNodes={() => setActiveTab("nodes")}
+              onOpenChains={(cid) => {
+                if (cid) setSelectedChainEditId(cid);
+                setActiveTab("chains");
+              }}
               onCopyText={handleCopyText}
               onInvalidPort={() => pushToast(dict.toast.invalidPort, "err")}
             />
@@ -1503,6 +1583,7 @@ export default function App() {
               dict={dict}
               settings={settings}
               nodes={nodes}
+              chains={chains}
               onUpdateSettings={(s) => void handleUpdateSettings(s)}
             />
           )}
@@ -1513,6 +1594,7 @@ export default function App() {
               locale={locale}
               coreRunning={coreInfo.running}
               nodes={nodes}
+              chains={chains}
               rules={rules}
               extraPorts={extraPorts}
               connections={connections}

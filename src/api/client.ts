@@ -14,6 +14,7 @@ import type {
   ApplyStrategyResult,
   BootstrapPayload,
   CaptureMode,
+  ChainMutationResult,
   CliIntegrationInfo,
   CompileOutput,
   ConnectionHistoryPage,
@@ -34,6 +35,7 @@ import type {
   PreflightReport,
   PrivilegedServiceStatus,
   ProcessInfoDto,
+  ProxyChain,
   RouteMode,
   RouteTestResult,
   RulePresetSpec,
@@ -265,12 +267,12 @@ export const api = {
   // --- Routing, DNS, Core & Updates ---
 
   async saveRule(rule: SimpleRoutingRule): Promise<CompileOutput> {
-    if (!isTauriEnv()) return mockBackend.getBootstrapState().compiled;
+    if (!isTauriEnv()) return mockBackend.saveRule(rule);
     return invoke<CompileOutput>("save_rule", { rule });
   },
 
   async deleteRule(id: string): Promise<CompileOutput> {
-    if (!isTauriEnv()) return mockBackend.getBootstrapState().compiled;
+    if (!isTauriEnv()) return mockBackend.deleteRule(id);
     return invoke<CompileOutput>("delete_rule", { id });
   },
 
@@ -303,12 +305,12 @@ export const api = {
   },
 
   async saveInboundPort(port: InboundPort): Promise<CompileOutput> {
-    if (!isTauriEnv()) return mockBackend.getBootstrapState().compiled;
+    if (!isTauriEnv()) return mockBackend.saveInboundPort(port);
     return invoke<CompileOutput>("save_inbound_port", { port });
   },
 
   async deleteInboundPort(id: string): Promise<CompileOutput> {
-    if (!isTauriEnv()) return mockBackend.getBootstrapState().compiled;
+    if (!isTauriEnv()) return mockBackend.deleteInboundPort(id);
     return invoke<CompileOutput>("delete_inbound_port", { id });
   },
 
@@ -419,18 +421,28 @@ export const api = {
     return typeof selected === "string" ? selected : null;
   },
 
-  async runBatchTcping(nodeIds: string[]): Promise<LatencyResult[]> {
+  async saveProxyChain(chain: ProxyChain): Promise<ChainMutationResult> {
+    if (!isTauriEnv()) return mockBackend.saveProxyChain(chain);
+    return invoke<ChainMutationResult>("save_proxy_chain", { chain });
+  },
+
+  async deleteProxyChain(id: string): Promise<ChainMutationResult> {
+    if (!isTauriEnv()) return mockBackend.deleteProxyChain(id);
+    return invoke<ChainMutationResult>("delete_proxy_chain", { id });
+  },
+
+  async testProxyChainDelay(chainId: string): Promise<LatencyResult> {
     if (!isTauriEnv()) {
-      await new Promise((r) => setTimeout(r, 180));
-      return mockBackend.runBatchLatency("tcping", nodeIds);
+      await new Promise((r) => setTimeout(r, 220));
+      return mockBackend.testProxyChainDelay(chainId);
     }
-    return invoke<LatencyResult[]>("run_batch_tcping", { nodeIds });
+    return invoke<LatencyResult>("test_proxy_chain_delay", { chainId });
   },
 
   async runBatchRealDelay(nodeIds: string[]): Promise<LatencyResult[]> {
     if (!isTauriEnv()) {
       await new Promise((r) => setTimeout(r, 240));
-      return mockBackend.runBatchLatency("real", nodeIds);
+      return mockBackend.runBatchRealDelay(nodeIds);
     }
     return invoke<LatencyResult[]>("run_batch_real_delay", { nodeIds });
   },

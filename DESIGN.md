@@ -27,7 +27,8 @@
     - Upper: `M 318 678 C 390 678 446 578 512 512 C 578 446 634 346 706 346`
   - **24x24 Monochrome Tray Glyph (`bypax-tray.svg`):** De Casteljau cubic Bezier physical split on the lower ribbon (`trayCutT = 0.60`), `stroke="currentColor"`, `stroke-linecap="round"`, lower `stroke-width="2.65"`, upper `stroke-width="2.75"`, ZERO `<mask>`, ZERO `<filter>`.
 - **Mandatory Placement Rule (`< 48px` vs `>= 48px`):**
-  - **`< 48px` (TitleBar, Tray Popover header, OS System Tray):** MUST use monochrome `bypax-tray.svg` geometry (`<BrandLogo variant="monochrome" />`). In TitleBar, render an `18px` monochrome Overpass X inside a `26x26px` neutral tile (`border-radius: 8px`, `--bg-surface`, `1px solid var(--border-hairline)`, subtle `--shadow-sm`). Never render the blurred rainbow squircle at `< 48px` inside the app chrome.
+  - **In-app `< 48px` (TitleBar, Tray Popover header):** MUST use monochrome `bypax-tray.svg` geometry (`<BrandLogo variant="monochrome" />`). In TitleBar, render an `18px` monochrome Overpass X inside a `26x26px` neutral tile (`border-radius: 8px`, `--bg-surface`, `1px solid var(--border-hairline)`, subtle `--shadow-sm`). Never render the blurred rainbow squircle at `< 48px` inside the app chrome.
+  - **OS System Tray (`tray-color*.png`):** Uses the transparent-background **Full-Rainbow Overpass X** (`44x44 @2x` on macOS with `icon_as_template = false`; `32x32` on Windows/Linux) with transparent-knockout emerald (`active`) and amber (`warn`) corner dots so it remains vibrant and crisp on both dark and light OS menu bars/taskbars.
   - **`>= 48px` (Settings About card, Nodes empty state, Onboarding) & OS Icons:** Render the full-color Overpass X squircle (`<BrandLogo variant="color" />`, pure-vector 0-filter mode in-app).
 - **Hybrid Icon Rasterization Rule:**
   - `16px`, `24px`, `32px` layers and `public/favicon.svg` use a **small-size pure-vector optical master** (`0` filters, ~92% squircle fill `40..984`, ~1.3x bolder ribbon stroke `142` spanning `244..780`, crisp `#CBD5E1` rim) so the Overpass X stays unmistakable on Windows 11 Light/Dark taskbars and browser tabs.
@@ -45,7 +46,7 @@
 | `src-tauri/icons/icon.ico` | Hybrid 16/24/32/48/64 (vector BMP) + 128/256 (mesh PNG) | Windows executable & taskbar icon |
 | `src-tauri/icons/icon.icns` | Hybrid `icp4..ic12` (vector) + `ic07..ic10` (mesh) | macOS `.app` & `.dmg` bundle icon |
 | `src-tauri/icons/{32x32,64x64,128x128,128x128@2x,icon}.png` | 32/64 vector, 128/256/1024 mesh | Tauri window & bundle PNG set |
-| `src-tauri/icons/tray-{template,light,dark}{,-active,-warn}.png` | 44px template @2x; 32px light/dark + green/amber dot | Cross-platform tray icon states |
+| `src-tauri/icons/tray-color{,-2x}{,-active,-warn}.png` | 44px @2x macOS / 32px Win & Linux transparent rainbow X + knockout status dot | Cross-platform full-color tray icon states |
 | `public/favicon.svg` | Pure-vector shadow-free squircle | WebView / browser preview favicon |
 | `assets/bypax-banner-{light,dark}.svg` | `1200x300` transparent bg + 5 badges | GitHub README `<picture>` adaptive banners |
 | `assets/bypax-social-preview.{svg,png}` | `1280x640` dark aurora + 48px grid + `github.com/nexusyyan/bypax` | GitHub repository social share card |
@@ -219,7 +220,7 @@ Marketing `rounded-3xl` (`24px`) radii from the brand studio are **BANNED** insi
 
 ---
 
-## 5. Information Architecture (7 Views + Custom Tray Popover)
+## 5. Information Architecture (8 Views + Custom Tray Popover)
 
 ### 5.1 Three-Group Navigation Sidebar
 Groups are separated by `12px` spacing and a `1px` hairline divider (no uppercase group labels). All icons are monochrome `lucide-react` at `16px`, `strokeWidth={1.5}` (active: `--text-primary`, inactive: `--text-secondary`).
@@ -227,6 +228,7 @@ Groups are separated by `12px` spacing and a `1px` hairline divider (no uppercas
 | Group | View | `NavTab` | Icon | Trailing Indicator |
 | :--- | :--- | :--- | :--- | :--- |
 | Traffic | Nodes | `nodes` | `Server` | Node count |
+| Traffic | Chains | `chains` | `Waypoints` | Saved chain count |
 | Traffic | Apps | `apps` | `AppWindow` | Active rule count + amber dot ONLY on recovery fault |
 | Traffic | Routing | `routing` | `GitBranch` | Rule count |
 | Traffic | DNS | `dns` | `Globe` | `FakeIP` badge when enabled |
@@ -323,7 +325,7 @@ Every PR and pre-release audit MUST verify zero violations across these 12 rules
    - Dark mode: NEVER use `#6E7681` (~4.0:1 fail); use `--text-tertiary: #7D8590` (~5.0:1).
 8. **Mandatory Dark Canvas Hairline:** Verify `.dark` inset workspace canvas visibly renders `1px solid var(--border-hairline)` along top and left edges.
 9. **Zero Fixed Table `min-width` (G1/G2):** Reject `min-w-[...]` or CSS `min-width` on all tables and table scroll wrappers; zero horizontal overflow at `1440x900`, `1100x760`, and `940x620` in EN and zh-CN.
-10. **Mark Placement Discipline:** TitleBar and Tray Popover (`< 48px`) use `<BrandLogo variant="monochrome" />`; `<BrandLogo variant="color" />` appears ONLY at `>= 48px` (About card, empty states).
+10. **Mark Placement Discipline:** In-app `< 48px` chrome (TitleBar and Tray Popover header) uses `<BrandLogo variant="monochrome" />`; OS System Tray uses transparent-background full-rainbow `tray-color*.png` (`icon_as_template = false`); `<BrandLogo variant="color" />` squircle appears ONLY at `>= 48px` (About card, empty states).
 11. **Reduced Motion Compliance (G9):** Verify `prefers-reduced-motion: reduce` suppresses all spring curves, pulsing dots, and skeleton animations.
 12. **ASCII, Locale Parity & Brand Hygiene (G11/G12):**
     - 100% pure 7-bit ASCII in all `*.ts`, `*.tsx`, `*.js`, `*.mjs`, `*.css`, `*.rs`, `*.yml`, `*.ps1` files.

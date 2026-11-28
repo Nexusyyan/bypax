@@ -9,7 +9,7 @@ use bypax_core::parser::parse_payload;
 use bypax_core::route_eval::evaluate_route_target;
 use bypax_core::rule_cache::RuleCache;
 use bypax_core::storage::{DataPaths, Store};
-use bypax_core::tester::{batch_real_delay, batch_tcping};
+use bypax_core::tester::batch_real_delay_with_progress;
 use bypax_core::updater::fetch_text_via_channels;
 use bypax_ipc::{
     default_ctl_endpoint, default_svc_endpoint, load_ipc_token, send_ctl_request,
@@ -379,46 +379,62 @@ impl AgentClient {
 
     fn offline_select_node(&self, node_id: &str) -> Result<Value> {
         let store = self.open_store()?;
-        let nodes = store.list_nodes()?;
-        let matched = nodes
-            .iter()
-            .find(|n| n.id == node_id)
-            .ok_or_else(|| anyhow!("Node '{}' not found", node_id))?;
+        let remark = if let Some(cid) = node_id.strip_prefix("chain:") {
+            let chains = store.list_proxy_chains()?;
+            let matched = chains
+                .iter()
+                .find(|c| c.id == cid)
+                .ok_or_else(|| anyhow!("Proxy chain '{}' not found", cid))?;
+            matched.name.clone()
+        } else {
+            let nodes = store.list_nodes()?;
+            let matched = nodes
+                .iter()
+                .find(|n| n.id == node_id)
+                .ok_or_else(|| anyhow!("Node '{}' not found", node_id))?;
+            matched.remark.clone()
+        };
         let mut settings = store.load_settings()?;
-        settings.main_node_id = Some(matched.id.clone());
+        settings.main_node_id = Some(node_id.to_string());
         store.save_settings(&settings)?;
         Ok(json!({
             "ok": true,
             "controlMode": "offline",
             "hotSwitched": false,
-            "mainNodeId": matched.id,
-            "remark": matched.remark
+            "mainNodeId": node_id,
+            "remark": remark
         }))
     }
 
-    async fn offline_test_latency(&self, node_ids: Vec<String>, kind: &str) -> Result<Value> {
+    async fn offline_test_latency(&self, node_ids: Vec<String>, _kind: &str) -> Result<Value> {
         let store = self.open_store()?;
         let settings = store.load_settings()?;
         let all = store.list_nodes()?;
         let targets: Vec<NodeIR> = if node_ids.is_empty() {
-            all
+            all.clone()
         } else {
-            all.into_iter()
+            all.iter()
                 .filter(|n| node_ids.contains(&n.id))
+                .cloned()
                 .collect()
         };
 
-        let norm_kind = kind.trim().to_ascii_lowercase();
-        let is_real = norm_kind == "real" || norm_kind == "real_delay";
-        let results = if is_real {
-            let core_mgr = CoreManager::new(self.paths.core_dir.clone());
-            let bin = core_mgr
-                .resolve_binary_path()
-                .ok_or_else(|| anyhow!("CORE_NOT_INSTALLED"))?;
-            batch_real_delay(&bin, &targets, &settings.latency_test_url, 4500, 12).await?
-        } else {
-            batch_tcping(&targets, 2500, 16).await
-        };
+        let core_mgr = CoreManager::new(self.paths.core_dir.clone());
+        let bin = core_mgr
+            .resolve_binary_path()
+            .ok_or_else(|| anyhow!("CORE_NOT_INSTALLED"))?;
+        let results = batch_real_delay_with_progress(
+            &bin,
+            &targets,
+            &all,
+            &settings.latency_test_url,
+            4500,
+            12,
+            Some(&settings.dns_local_server),
+            settings.latency_strip_handshake,
+            |_| {},
+        )
+        .await?;
 
         for r in &results {
             let _ = store.record_latency_result(r);
@@ -426,7 +442,7 @@ impl AgentClient {
 
         Ok(json!({
             "controlMode": "offline",
-            "kind": if is_real { "real_delay" } else { "tcping" },
+            "kind": "real_delay",
             "total": results.len(),
             "results": results
         }))
@@ -498,6 +514,7 @@ impl AgentClient {
         let settings = store.load_settings()?;
         let rules = store.list_rules()?;
         let nodes = store.list_nodes()?;
+        let chains = store.list_proxy_chains()?;
         let rule_cache = RuleCache::new(self.paths.rule_sets_dir.clone());
         let core_mgr = CoreManager::new(self.paths.core_dir.clone());
         let bin = core_mgr.resolve_binary_path();
@@ -507,6 +524,7 @@ impl AgentClient {
             &settings,
             &rules,
             &nodes,
+            &chains,
             Some(&rule_cache),
             bin.as_deref(),
         );
@@ -715,6 +733,7 @@ impl AgentClient {
         let rules = store.list_app_proxy_rules()?;
         let settings = store.load_settings()?;
         let nodes = store.list_nodes()?;
+        let chains = store.list_proxy_chains()?;
         let query = AppRuleTestQuery {
             process_name,
             exe_path,
@@ -729,6 +748,7 @@ impl AgentClient {
             &rules,
             &query,
             &nodes,
+            &chains,
             settings.main_node_id.as_deref(),
             settings.app_proxy_bypass_lan,
         );
@@ -753,19 +773,20 @@ impl AgentClient {
             }
         }
 
-        let (rules, nodes, bypass_lan) = self
+        let (rules, nodes, chains, bypass_lan) = self
             .open_store()
             .and_then(|s| {
                 let st = s.load_settings()?;
                 Ok((
                     s.list_app_proxy_rules()?,
                     s.list_nodes()?,
+                    s.list_proxy_chains()?,
                     st.app_proxy_bypass_lan,
                 ))
             })
-            .unwrap_or_else(|_| (Vec::new(), Vec::new(), true));
+            .unwrap_or_else(|_| (Vec::new(), Vec::new(), Vec::new(), true));
 
-        let bindings = build_app_proxy_target_bindings(&rules, &nodes);
+        let bindings = build_app_proxy_target_bindings(&rules, &nodes, &chains);
         let engine = RuleEngine::from_rules(&rules, &bindings, bypass_lan, &[]).ok();
         let tracker = SnapshotProcessTracker::new(Duration::from_millis(500));
 
@@ -853,7 +874,7 @@ pub fn capability_schema() -> Value {
             "ctl --json capture off|apps|tun",
             "ctl --json node list [--group <g>] [--region <r>] [--query <q>]",
             "ctl --json node select <node_id>",
-            "ctl --json node test [--kind tcping|real] [--node-id <id>...]",
+            "ctl --json node test [--kind real] [--node-id <id>...]",
             "ctl --json sub refresh [--id <subscription_id>]",
             "ctl --json route list",
             "ctl --json route test --target <host_or_url> [--process <name>]",

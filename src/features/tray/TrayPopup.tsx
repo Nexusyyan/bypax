@@ -12,6 +12,7 @@ import {
   Power,
   ShieldCheck,
   Square,
+  Waypoints,
 } from "lucide-react";
 import { api } from "../../api/client";
 import { BrandLogo } from "../../components/BrandLogo";
@@ -34,6 +35,7 @@ import type {
   Locale,
   NodeIR,
   PrivilegedServiceStatus,
+  ProxyChain,
   RouteMode,
   ThemeMode,
   TrafficSample,
@@ -41,6 +43,7 @@ import type {
 import {
   buildTakeoverSummary,
   delayColorVar,
+  formatLatency,
   formatSpeed,
   PROTO_BADGES,
   resolveActiveRecoveryFault,
@@ -62,6 +65,7 @@ export function TrayPopup() {
   const [coreInfo, setCoreInfo] = useState<CoreInfo | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [nodes, setNodes] = useState<NodeIR[]>([]);
+  const [chains, setChains] = useState<ProxyChain[]>([]);
   const [appRules, setAppRules] = useState<AppProxyRule[]>([]);
   const [captureMode, setCaptureMode] = useState<CaptureMode>("off");
   const [serviceStatus, setServiceStatus] = useState<PrivilegedServiceStatus | null>(null);
@@ -88,6 +92,7 @@ export function TrayPopup() {
       setCoreInfo(data.coreInfo);
       setSettings(data.settings);
       setNodes(data.nodes);
+      setChains(data.chains ?? []);
       setAppRules(data.appRules ?? []);
       setCaptureMode(
         data.captureMode ??
@@ -172,18 +177,28 @@ export function TrayPopup() {
     };
   }, [refreshAll]);
 
+  const mainChain = useMemo(() => {
+    const id = settings?.mainNodeId;
+    if (!id || !id.startsWith("chain:")) return null;
+    return chains.find((c) => c.id === id.slice("chain:".length)) ?? null;
+  }, [chains, settings]);
+
   const mainNode = useMemo(() => {
+    if (mainChain) return null;
     if (!settings) return nodes[0] ?? null;
     return nodes.find((n) => n.id === settings.mainNodeId) ?? nodes[0] ?? null;
-  }, [nodes, settings]);
+  }, [mainChain, nodes, settings]);
 
   const running = coreInfo?.running ?? false;
   const routeMode: RouteMode = settings?.routeMode ?? "rule";
   const sysProxy = settings?.systemProxyEnabled ?? false;
   const mixedPort = settings?.mixedPort ?? 10808;
   const enabledAppCount = appRules.filter((r) => r.enabled).length;
-  const delay = mainNode ? (mainNode.realDelayMs ?? mainNode.tcpingMs ?? null) : null;
-  const delayKind = mainNode?.realDelayMs != null ? "real" : "tcping";
+  const delay = mainChain
+    ? mainChain.realDelayMs ?? null
+    : mainNode
+      ? mainNode.realDelayMs ?? null
+      : null;
 
   const activeFaultKind = useMemo(
     () =>
@@ -394,22 +409,30 @@ export function TrayPopup() {
           <div className="flex items-center justify-between gap-2">
             <div
               className="min-w-0 flex-1 text-[12.5px] font-medium text-[var(--text-primary)]"
-              title={mainNode ? mainNode.remark : dict.tray.noNode}
+              title={mainChain ? mainChain.name : mainNode ? mainNode.remark : dict.tray.noNode}
             >
-              {mainNode ? (
+              {mainChain ? (
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <Waypoints
+                    className="h-3.5 w-3.5 shrink-0 text-[var(--accent-focus)]"
+                    strokeWidth={1.6}
+                  />
+                  <span className="truncate">{mainChain.name}</span>
+                </span>
+              ) : mainNode ? (
                 <NodeLabel remark={mainNode.remark} region={mainNode.region} size="sm" />
               ) : (
                 <span className="text-[var(--text-secondary)]">{dict.tray.noNode}</span>
               )}
             </div>
-            {mainNode && (
+            {(mainChain || mainNode) && (
               <span className="inline-flex shrink-0 items-center gap-1.5">
-                <SignalBars ms={delay} kind={delayKind} />
+                <SignalBars ms={delay} />
                 <span
                   className="font-mono text-[11px] font-medium num-tabular"
-                  style={{ color: delayColorVar(delay, delayKind) }}
+                  style={{ color: delayColorVar(delay) }}
                 >
-                  {delay != null ? `${delay} ms` : "--"}
+                  {formatLatency(delay)}
                 </span>
               </span>
             )}
@@ -428,9 +451,13 @@ export function TrayPopup() {
               <ArrowUp className="h-3 w-3 text-[var(--text-secondary)]" strokeWidth={1.6} />
               {formatSpeed(traffic.upBytesPerSec)}
             </span>
-            {mainNode && (
+            {(mainChain || mainNode) && (
               <span className="rounded-[5px] border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-1.5 py-0.5 text-[11.5px] text-[var(--text-secondary)]">
-                {PROTO_BADGES[mainNode.protocol]}
+                {mainChain
+                  ? `${mainChain.hops.length}H`
+                  : mainNode
+                    ? PROTO_BADGES[mainNode.protocol]
+                    : ""}
               </span>
             )}
           </div>

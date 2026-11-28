@@ -6,11 +6,96 @@ import type {
   NodeIR,
   PrivilegedServiceStatus,
   Protocol,
+  ProxyChain,
   RouteMode,
   SimpleRoutingRule,
 } from "../types";
 
 export type NodeSortMode = "default" | "delay" | "name";
+
+/**
+ * Canonical latency sort key: positive RTT sorts ascending first,
+ * untested (`null`/`undefined`) sorts next (`999998`), and failed (`<= 0`, e.g. `-1ms`)
+ * sorts strictly last (`999999`) so failed nodes never float to the top.
+ */
+export function latencySortKey(ms?: number | null): number {
+  if (ms != null && ms > 0) return ms;
+  if (ms == null) return 999_998;
+  return 999_999;
+}
+
+export function formatLatency(ms?: number | null): string {
+  if (ms == null) return "--";
+  if (ms < 0) return "-1ms";
+  return `${ms} ms`;
+}
+
+export interface ChainProtocolWarning {
+  hopIndex: number;
+  relayRemark: string;
+  nextRemark: string;
+  nextProtocol: Protocol;
+}
+
+export interface ChainValidationResult {
+  valid: boolean;
+  tooFewHops: boolean;
+  missingHopIds: string[];
+  duplicateHopIds: string[];
+  httpOverUdpWarnings: ChainProtocolWarning[];
+}
+
+const UDP_QUIC_PROTOCOLS: ReadonlySet<Protocol> = new Set([
+  "hysteria2",
+  "tuic",
+  "wireguard",
+]);
+
+export function validateChainHops(
+  hops: string[],
+  nodeById: Map<string, NodeIR>,
+): ChainValidationResult {
+  const seen = new Set<string>();
+  const duplicateHopIds: string[] = [];
+  const missingHopIds: string[] = [];
+  const httpOverUdpWarnings: ChainProtocolWarning[] = [];
+
+  for (let i = 0; i < hops.length; i += 1) {
+    const hopId = hops[i];
+    if (seen.has(hopId)) {
+      duplicateHopIds.push(hopId);
+    } else {
+      seen.add(hopId);
+    }
+    const cur = nodeById.get(hopId);
+    if (!cur) {
+      missingHopIds.push(hopId);
+      continue;
+    }
+    if (cur.protocol === "http" && i + 1 < hops.length) {
+      const next = nodeById.get(hops[i + 1]);
+      if (next && UDP_QUIC_PROTOCOLS.has(next.protocol)) {
+        httpOverUdpWarnings.push({
+          hopIndex: i,
+          relayRemark: cur.remark,
+          nextRemark: next.remark,
+          nextProtocol: next.protocol,
+        });
+      }
+    }
+  }
+
+  const tooFewHops = hops.length < 2;
+  const valid =
+    !tooFewHops && missingHopIds.length === 0 && duplicateHopIds.length === 0;
+  return {
+    valid,
+    tooFewHops,
+    missingHopIds,
+    duplicateHopIds,
+    httpOverUdpWarnings,
+  };
+}
 
 export const PROTO_BADGES: Record<Protocol, string> = {
   vless: "VLESS",
@@ -67,9 +152,7 @@ export function filterAndSortNodes(
 
   if (sortMode === "delay") {
     return filtered.slice().sort((a, b) => {
-      const da = a.realDelayMs ?? a.tcpingMs ?? 999999;
-      const db = b.realDelayMs ?? b.tcpingMs ?? 999999;
-      return da - db;
+      return latencySortKey(a.realDelayMs) - latencySortKey(b.realDelayMs);
     });
   }
   if (sortMode === "name") {
@@ -79,9 +162,10 @@ export function filterAndSortNodes(
 }
 
 export interface TargetResolution {
-  kind: "direct" | "reject" | "auto" | "node";
+  kind: "direct" | "reject" | "auto" | "node" | "chain";
   label: string;
   node: NodeIR | null;
+  chain?: ProxyChain | null;
 }
 
 export interface TargetLabels {
@@ -94,7 +178,8 @@ export function resolveTargetExit(
   target: string,
   nodes: NodeIR[],
   mainNodeId: string | null | undefined,
-  labels: TargetLabels
+  labels: TargetLabels,
+  chains: ProxyChain[] = [],
 ): TargetResolution {
   if (target === "direct") {
     return { kind: "direct", label: labels.direct, node: null };
@@ -102,8 +187,34 @@ export function resolveTargetExit(
   if (target === "reject") {
     return { kind: "reject", label: labels.reject, node: null };
   }
-  const mainNode = nodes.find((n) => n.id === mainNodeId) ?? nodes[0] ?? null;
+
+  const mainChain =
+    mainNodeId && mainNodeId.startsWith("chain:")
+      ? chains.find((c) => c.id === mainNodeId.slice("chain:".length)) ?? null
+      : null;
+  const mainNode = mainChain
+    ? null
+    : nodes.find((n) => n.id === mainNodeId) ?? nodes[0] ?? null;
+
   if (target === "main") {
+    if (mainChain) {
+      return { kind: "chain", label: mainChain.name, node: null, chain: mainChain };
+    }
+    return {
+      kind: "node",
+      label: mainNode ? mainNode.remark : labels.noNode,
+      node: mainNode,
+    };
+  }
+  if (target.startsWith("chain:")) {
+    const cid = target.slice("chain:".length);
+    const chain = chains.find((c) => c.id === cid) ?? null;
+    if (chain) {
+      return { kind: "chain", label: chain.name, node: null, chain };
+    }
+    if (mainChain) {
+      return { kind: "chain", label: mainChain.name, node: null, chain: mainChain };
+    }
     return {
       kind: "node",
       label: mainNode ? mainNode.remark : labels.noNode,
@@ -112,22 +223,22 @@ export function resolveTargetExit(
   }
   if (target.startsWith("auto:")) {
     const key = target.slice("auto:".length).toUpperCase();
+    const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const tokenRe = new RegExp(`(^|[^A-Z0-9])${escaped}([^A-Z0-9]|$)`, "i");
+    const exactRegion = nodes.filter((n) => n.region.toUpperCase() === key);
     const candidates =
       key === "ALL"
         ? nodes
-        : nodes.filter(
-            (n) =>
-              n.region.toUpperCase() === key ||
-              n.remark.toUpperCase().includes(key)
-          );
+        : exactRegion.length > 0
+          ? exactRegion
+          : nodes.filter((n) => tokenRe.test(n.remark));
     const pool = candidates.length > 0 ? candidates : nodes;
     const best =
       pool
         .slice()
         .sort(
           (a, b) =>
-            (a.realDelayMs ?? a.tcpingMs ?? 999999) -
-            (b.realDelayMs ?? b.tcpingMs ?? 999999)
+            latencySortKey(a.realDelayMs) - latencySortKey(b.realDelayMs)
         )[0] ?? null;
     return {
       kind: "auto",
@@ -135,7 +246,8 @@ export function resolveTargetExit(
       node: best,
     };
   }
-  const specific = nodes.find((n) => n.id === target) ?? mainNode;
+  const cleanId = target.startsWith("node:") ? target.slice("node:".length) : target;
+  const specific = nodes.find((n) => n.id === cleanId) ?? mainNode;
   return {
     kind: "node",
     label: specific ? specific.remark : labels.noNode,
@@ -162,7 +274,8 @@ export function evaluateRouteSimulation(
     matchedPrefix: string;
   },
   useEnglishTitle: boolean,
-  presetTitles?: Record<string, string>
+  presetTitles?: Record<string, string>,
+  chains: ProxyChain[] = [],
 ): SimResult {
   const host = rawHost.trim().toLowerCase();
   if (routeMode === "direct") {
@@ -176,7 +289,7 @@ export function evaluateRouteSimulation(
     return {
       matchedRuleId: null,
       ruleLabel: labels.globalMode,
-      exit: resolveTargetExit("main", nodes, mainNodeId, labels),
+      exit: resolveTargetExit("main", nodes, mainNodeId, labels, chains),
     };
   }
 
@@ -193,7 +306,7 @@ export function evaluateRouteSimulation(
       return {
         matchedRuleId: rule.id,
         ruleLabel: `${labels.matchedPrefix} ${title}`,
-        exit: resolveTargetExit(rule.target, nodes, mainNodeId, labels),
+        exit: resolveTargetExit(rule.target, nodes, mainNodeId, labels, chains),
       };
     }
   }
@@ -201,7 +314,7 @@ export function evaluateRouteSimulation(
   return {
     matchedRuleId: null,
     ruleLabel: labels.defaultFallback,
-    exit: resolveTargetExit("main", nodes, mainNodeId, labels),
+    exit: resolveTargetExit("main", nodes, mainNodeId, labels, chains),
   };
 }
 
@@ -229,20 +342,12 @@ export function formatSpeed(bps: number): string {
   return `${formatBytes(bps)}/s`;
 }
 
-export function delayColorVar(
-  ms?: number | null,
-  kind: "tcping" | "real" = "tcping"
-): string {
+export function delayColorVar(ms?: number | null): string {
   if (ms == null) return "var(--latency-none)";
-  if (kind === "real") {
-    if (ms <= 120) return "var(--latency-fast)";
-    if (ms <= 260) return "var(--latency-ok)";
-    if (ms <= 500) return "var(--latency-slow)";
-    return "var(--latency-bad)";
-  }
-  if (ms <= 80) return "var(--latency-fast)";
-  if (ms <= 180) return "var(--latency-ok)";
-  if (ms <= 350) return "var(--latency-slow)";
+  if (ms < 0) return "var(--latency-bad)";
+  if (ms <= 120) return "var(--latency-fast)";
+  if (ms <= 260) return "var(--latency-ok)";
+  if (ms <= 500) return "var(--latency-slow)";
   return "var(--latency-bad)";
 }
 
@@ -396,13 +501,35 @@ function formatGroupTag(tag: string, labels: ExitDisplayLabels): string | undefi
   return undefined;
 }
 
+export function chainOutboundTag(chainId: string): string {
+  const sanitized = chainId
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `chain-${sanitized || "custom"}`;
+}
+
 export function formatConnectionExit(
   chain: string[],
   nodeById: Map<string, NodeIR>,
-  labels: ExitDisplayLabels
+  labels: ExitDisplayLabels,
+  proxyChains: ProxyChain[] = [],
 ): ResolvedExit {
   if (!chain || chain.length === 0) {
     return { label: labels.direct, kind: "direct", rawTag: "direct" };
+  }
+
+  for (const tag of chain) {
+    const matchedChain = proxyChains.find((c) => chainOutboundTag(c.id) === tag);
+    if (matchedChain) {
+      return {
+        label: matchedChain.name,
+        protocol: `${matchedChain.hops.length}H`,
+        kind: "node",
+        rawTag: tag,
+      };
+    }
   }
 
   let matchedNode: NodeIR | undefined;
@@ -468,6 +595,9 @@ export interface FormattedRule {
 
 function ruleTargetTag(target: string): string {
   if (target === "main") return "main-exit";
+  if (target.startsWith("chain:")) {
+    return chainOutboundTag(target.slice("chain:".length));
+  }
   if (target.startsWith("auto:")) {
     const suffix = target
       .slice("auto:".length)
@@ -624,12 +754,17 @@ export function formatConnectionRule(
 export function humanizeLogMessage(
   message: string,
   nodeById: Map<string, NodeIR>,
-  labels: ExitDisplayLabels
+  labels: ExitDisplayLabels,
+  proxyChains: ProxyChain[] = [],
 ): string {
   let out = message.replace(/\bn-[a-z0-9]+-[a-f0-9]{6,12}\b/g, (id) => {
     const node = nodeById.get(id);
     return node ? node.remark : id;
   });
+  for (const c of proxyChains) {
+    const tag = chainOutboundTag(c.id);
+    out = out.split(`[${tag}]`).join(`[${c.name}]`);
+  }
   out = out.replace(/\[main-exit\]/g, `[${labels.mainExit}]`);
   out = out.replace(/\[auto-([a-z0-9-]+)\]/g, (full, suffix: string) => {
     const tag = `auto-${suffix}`;

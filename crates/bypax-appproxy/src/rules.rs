@@ -1,7 +1,7 @@
 use crate::capture::{FiveTuple, TransportProtocol};
 use crate::process::{MockProcessTracker, ProcessInfo, ProcessTracker};
 use bypax_core::compiler::{build_app_proxy_target_bindings, match_auto_nodes};
-use bypax_core::model::{AppProxyRule, DomainOverrideAction, NodeIR};
+use bypax_core::model::{AppProxyRule, DomainOverrideAction, NodeIR, ProxyChain};
 use bypax_ipc::{AppProxyRuleWire, AppProxyTargetBinding};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -476,10 +476,11 @@ impl RuleEngine {
         rules: &[AppProxyRule],
         query: &AppRuleTestQuery,
         nodes: &[NodeIR],
+        chains: &[ProxyChain],
         main_node_id: Option<&str>,
         bypass_lan: bool,
     ) -> AppRuleTestTrace {
-        let bindings = build_app_proxy_target_bindings(rules, nodes);
+        let bindings = build_app_proxy_target_bindings(rules, nodes, chains);
         let engine = match Self::from_rules(rules, &bindings, bypass_lan, &[]) {
             Ok(e) => e,
             Err(err) => {
@@ -713,7 +714,7 @@ impl RuleEngine {
             }
         }
 
-        let resolved_label = describe_target(&final_target, nodes, main_node_id);
+        let resolved_label = describe_target(&final_target, nodes, chains, main_node_id);
         let step3 = if bypassed_to_routing {
             "Bypasses App Proxy (handled by Routing or Direct)".to_string()
         } else {
@@ -750,26 +751,48 @@ fn normalize_host_input(raw: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
-fn describe_target(target: &str, nodes: &[NodeIR], main_node_id: Option<&str>) -> String {
-    let main_node = main_node_id
-        .and_then(|id| nodes.iter().find(|n| n.id == id))
-        .or_else(|| nodes.first());
+fn describe_target(
+    target: &str,
+    nodes: &[NodeIR],
+    chains: &[ProxyChain],
+    main_node_id: Option<&str>,
+) -> String {
+    let main_label = main_node_id
+        .and_then(|id| {
+            if let Some(cid) = id.strip_prefix("chain:") {
+                chains
+                    .iter()
+                    .find(|c| c.id == cid)
+                    .map(|c| format!("Chain: {}", c.name))
+            } else {
+                nodes.iter().find(|n| n.id == id).map(|n| n.remark.clone())
+            }
+        })
+        .or_else(|| nodes.first().map(|n| n.remark.clone()));
 
     match target {
         "direct" => "Direct".to_string(),
         "reject" => "Reject".to_string(),
-        "follow" => match main_node {
-            Some(n) => format!("Follow Routing (Main Exit: {})", n.remark),
+        "follow" => match main_label {
+            Some(name) => format!("Follow Routing (Main Exit: {name})"),
             None => "Follow Routing".to_string(),
         },
-        "main" => match main_node {
-            Some(n) => format!("Main Exit: {}", n.remark),
+        "main" => match main_label {
+            Some(name) => format!("Main Exit: {name}"),
             None => "Main Exit".to_string(),
         },
         t if t.starts_with("auto:") => {
             let matched = match_auto_nodes(t, nodes);
             let region = t.strip_prefix("auto:").unwrap_or("ALL");
             format!("Auto Region {} ({} nodes)", region, matched.len())
+        }
+        t if t.starts_with("chain:") => {
+            let cid = t.strip_prefix("chain:").unwrap_or("");
+            if let Some(chain) = chains.iter().find(|c| c.id == cid) {
+                format!("Chain: {} ({} hops)", chain.name, chain.hops.len())
+            } else {
+                "Follow Routing (chain missing fallback)".to_string()
+            }
         }
         other => {
             let clean = other.strip_prefix("node:").unwrap_or(other);
@@ -981,7 +1004,7 @@ mod tests {
             action: DomainOverrideAction::Reject,
         });
         let nodes = vec![NodeIR::new("n-us", Protocol::Vless, "US-01", "us.example.com", 443, "Sub")];
-        let bindings = build_app_proxy_target_bindings(std::slice::from_ref(&rule), &nodes);
+        let bindings = build_app_proxy_target_bindings(std::slice::from_ref(&rule), &nodes, &[]);
         let engine = RuleEngine::from_rules(
             std::slice::from_ref(&rule),
             &bindings,
@@ -1042,6 +1065,7 @@ mod tests {
                 protocol: "tcp".into(),
             },
             &nodes,
+            &[],
             Some("n-us"),
             true,
         );

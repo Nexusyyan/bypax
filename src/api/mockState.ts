@@ -18,6 +18,7 @@ import type {
   ApplyStrategyResult,
   BootstrapPayload,
   CaptureMode,
+  ChainMutationResult,
   CliIntegrationInfo,
   CompileOutput,
   ConnectionHistoryPage,
@@ -39,6 +40,7 @@ import type {
   PreflightReport,
   PrivilegedServiceStatus,
   ProcessInfoDto,
+  ProxyChain,
   RouteMode,
   RouteTestResult,
   RulePresetSpec,
@@ -90,6 +92,7 @@ interface MockStore {
   coreInfo: CoreInfo;
   settings: AppSettings;
   nodes: NodeIR[];
+  chains: ProxyChain[];
   subscriptions: SubscriptionGroup[];
   rules: SimpleRoutingRule[];
   ruleSets: RuleSetStatus[];
@@ -214,7 +217,6 @@ const MOCK_NODES: NodeIR[] = [
     group: "Studio Sub",
     region: "JP",
     wgLocalAddress: [],
-    tcpingMs: 38,
     realDelayMs: 64,
     rawUri: "vless://11111111-1111-1111-1111-111111111111@tokyo02.edge-relay.example:443?security=reality#JP%20Tokyo-02%20Direct-IPLC",
     createdAt: "2026-11-26T00:00:00Z",
@@ -228,7 +230,6 @@ const MOCK_NODES: NodeIR[] = [
     group: "Studio Sub",
     region: "HK",
     wgLocalAddress: [],
-    tcpingMs: 24,
     realDelayMs: 42,
     rawUri: "hysteria2://samplepass@hk01.edge-relay.example:8443?sni=hk01.edge-relay.example#HK%20Kowloon-01",
     createdAt: "2026-11-26T00:00:00Z",
@@ -242,7 +243,6 @@ const MOCK_NODES: NodeIR[] = [
     group: "Studio Sub",
     region: "SG",
     wgLocalAddress: [],
-    tcpingMs: 62,
     realDelayMs: 118,
     createdAt: "2026-11-26T00:00:00Z",
   },
@@ -255,7 +255,6 @@ const MOCK_NODES: NodeIR[] = [
     group: "Self-Hosted",
     region: "US",
     wgLocalAddress: [],
-    tcpingMs: 148,
     realDelayMs: 214,
     createdAt: "2026-11-26T00:00:00Z",
   },
@@ -268,7 +267,6 @@ const MOCK_NODES: NodeIR[] = [
     group: "Self-Hosted",
     region: "DE",
     wgLocalAddress: [],
-    tcpingMs: 186,
     realDelayMs: 342,
     createdAt: "2026-11-26T00:00:00Z",
   },
@@ -281,9 +279,29 @@ const MOCK_NODES: NodeIR[] = [
     group: "Self-Hosted",
     region: "UK",
     wgLocalAddress: [],
-    tcpingMs: 245,
-    realDelayMs: 540,
+    realDelayMs: -1,
     createdAt: "2026-11-26T00:00:00Z",
+  },
+];
+
+const MOCK_CHAINS: ProxyChain[] = [
+  {
+    id: "c-hk-us",
+    name: "HK IPLC -> US AI Residential",
+    hops: ["n-hk-01", "n-us-01"],
+    enabled: true,
+    realDelayMs: 186,
+    description: null,
+    createdAt: "2026-11-27T10:00:00Z",
+  },
+  {
+    id: "c-jp-sg-de",
+    name: "JP -> SG -> DE Triple Relay",
+    hops: ["n-jp-02", "n-sg-01", "n-de-01"],
+    enabled: true,
+    realDelayMs: 278,
+    description: null,
+    createdAt: "2026-11-27T10:05:00Z",
   },
 ];
 
@@ -308,7 +326,7 @@ const MOCK_ROUTING_RULES: SimpleRoutingRule[] = [
     patterns: ["openai.com", "chatgpt.com", "anthropic.com", "claude.ai"],
     processNames: [],
     ruleSet: "geosite-openai",
-    target: "auto:US",
+    target: "chain:c-hk-us",
     enabled: true,
     priority: 20,
   },
@@ -516,6 +534,7 @@ const store: MockStore = {
     ],
   },
   nodes: [],
+  chains: [],
   subscriptions: [],
   rules: [],
   ruleSets: [],
@@ -676,6 +695,7 @@ function ensureInit(): void {
   const isMac = sc === "macos";
   store.platform = isMac ? "macos" : "windows";
   store.nodes = sc === "empty" ? [] : MOCK_NODES.map((n) => ({ ...n }));
+  store.chains = sc === "empty" ? [] : MOCK_CHAINS.map((c) => ({ ...c, hops: [...c.hops] }));
   store.subscriptions =
     sc === "empty"
       ? []
@@ -1029,6 +1049,7 @@ export const mockBackend = {
       coreInfo: { ...store.coreInfo },
       settings: { ...store.settings },
       nodes: store.nodes.map((n) => ({ ...n })),
+      chains: store.chains.map((c) => ({ ...c, hops: [...c.hops] })),
       subscriptions: store.subscriptions.map((s) => ({ ...s })),
       rules: store.rules.map((r) => ({ ...r })),
       extraPorts: store.extraPorts.map((p) => ({ ...p })),
@@ -1109,7 +1130,6 @@ export const mockBackend = {
         group: groupName || "Imported",
         region: remark.includes("US") ? "US" : remark.includes("HK") ? "HK" : "JP",
         wgLocalAddress: [],
-        tcpingMs: 35 + idx * 28,
         realDelayMs: 65 + idx * 42,
         createdAt: new Date().toISOString(),
       };
@@ -1603,18 +1623,120 @@ export const mockBackend = {
     };
   },
 
-  runBatchLatency(kind: "tcping" | "real", nodeIds: string[]): LatencyResult[] {
+  saveRule(rule: SimpleRoutingRule): CompileOutput {
     ensureInit();
-    return nodeIds.map((id, idx) => {
-      const ms = (kind === "tcping" ? 28 : 54) + idx * 37;
+    const exists = store.rules.some((r) => r.id === rule.id);
+    if (exists) {
+      store.rules = store.rules.map((r) => (r.id === rule.id ? { ...rule } : r));
+    } else {
+      store.rules = [...store.rules, { ...rule }];
+    }
+    store.rules.sort((a, b) => a.priority - b.priority);
+    return buildCompiled();
+  },
+
+  deleteRule(id: string): CompileOutput {
+    ensureInit();
+    store.rules = store.rules.filter((r) => r.id !== id);
+    return buildCompiled();
+  },
+
+  saveInboundPort(port: InboundPort): CompileOutput {
+    ensureInit();
+    const exists = store.extraPorts.some((p) => p.id === port.id);
+    if (exists) {
+      store.extraPorts = store.extraPorts.map((p) => (p.id === port.id ? { ...port } : p));
+    } else {
+      store.extraPorts = [...store.extraPorts, { ...port }];
+    }
+    return buildCompiled();
+  },
+
+  deleteInboundPort(id: string): CompileOutput {
+    ensureInit();
+    store.extraPorts = store.extraPorts.filter((p) => p.id !== id);
+    return buildCompiled();
+  },
+
+  saveProxyChain(chain: ProxyChain): ChainMutationResult {
+    ensureInit();
+    const trimmedName = chain.name.trim();
+    if (!trimmedName) {
+      throw new Error("Proxy chain name cannot be empty");
+    }
+    if (chain.hops.length < 2) {
+      throw new Error("Proxy chain requires at least 2 hops");
+    }
+    const nextChain: ProxyChain = {
+      ...chain,
+      id: chain.id?.trim() || `chain-${Date.now()}`,
+      name: trimmedName,
+      hops: [...chain.hops],
+      enabled: chain.enabled ?? true,
+      createdAt: chain.createdAt || new Date().toISOString(),
+    };
+    const exists = store.chains.some((c) => c.id === nextChain.id);
+    if (exists) {
+      store.chains = store.chains.map((c) => (c.id === nextChain.id ? nextChain : c));
+    } else {
+      store.chains = [...store.chains, nextChain];
+    }
+    return {
+      chains: store.chains.map((c) => ({ ...c, hops: [...c.hops] })),
+      compiled: buildCompiled(),
+    };
+  },
+
+  deleteProxyChain(id: string): ChainMutationResult {
+    ensureInit();
+    store.chains = store.chains.filter((c) => c.id !== id);
+    if (store.settings.mainNodeId === `chain:${id}`) {
+      store.settings.mainNodeId = store.nodes[0]?.id ?? null;
+    }
+    return {
+      chains: store.chains.map((c) => ({ ...c, hops: [...c.hops] })),
+      compiled: buildCompiled(),
+    };
+  },
+
+  testProxyChainDelay(chainId: string): LatencyResult {
+    ensureInit();
+    const chain = store.chains.find((c) => c.id === chainId);
+    if (!chain) {
+      return { nodeId: `chain:${chainId}`, kind: "real", delayMs: -1, error: "Chain not found" };
+    }
+    const hopDelays = chain.hops.map(
+      (hid) => store.nodes.find((n) => n.id === hid)?.realDelayMs ?? null,
+    );
+    const hasFailedHop = hopDelays.some((d) => d != null && d < 0);
+    const ms = hasFailedHop
+      ? -1
+      : hopDelays.reduce<number>((sum, d) => sum + (d && d > 0 ? d : 90), 0);
+    store.chains = store.chains.map((c) =>
+      c.id === chainId ? { ...c, realDelayMs: ms } : c,
+    );
+    return {
+      nodeId: `chain:${chainId}`,
+      kind: "real",
+      delayMs: ms,
+      error: ms < 0 ? "Hop unreachable" : null,
+    };
+  },
+
+  runBatchRealDelay(nodeIds: string[]): LatencyResult[] {
+    ensureInit();
+    const ids = nodeIds.length > 0 ? nodeIds : store.nodes.map((n) => n.id);
+    return ids.map((id, idx) => {
+      const ms = id === "n-uk-01" ? -1 : 54 + idx * 37;
       store.nodes = store.nodes.map((n) =>
-        n.id === id
-          ? kind === "tcping"
-            ? { ...n, tcpingMs: ms }
-            : { ...n, realDelayMs: ms }
-          : n,
+        n.id === id ? { ...n, realDelayMs: ms } : n,
       );
-      return { nodeId: id, kind, delayMs: ms, error: null };
+      return {
+        nodeId: id,
+        kind: "real",
+        delayMs: ms,
+        error: ms < 0 ? "Probe timed out" : null,
+      };
     });
   },
 
@@ -1702,25 +1824,121 @@ export const mockBackend = {
 
   testRouteTarget(input: string): RouteTestResult {
     ensureInit();
-    const host = input.trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0];
+    const host = input
+      .trim()
+      .toLowerCase()
+      .replace(/^https?:\/\//, "")
+      .split("/")[0]
+      .split(":")[0];
+    const isIp = /^\d+\.\d+\.\d+\.\d+$/.test(host);
+    const isPrivateIp =
+      host.startsWith("192.168.") || host.startsWith("10.") || host.startsWith("100.64.");
+    if (isPrivateIp) {
+      return {
+        input,
+        normalizedHost: host,
+        isIp,
+        isPrivateIp,
+        routeMode: store.settings.routeMode,
+        matchedRuleId: "classic-private",
+        matchedRuleTitle: "Private & LAN",
+        matchedBy: "ip_is_private",
+        target: "direct",
+        resolvedExitKind: "direct",
+        resolvedExitLabel: "Direct",
+        resolvedNodeId: null,
+        resolvedNodeRegion: null,
+        dnsServer: "dns-system",
+        dnsReason: "Private LAN direct bypass",
+      };
+    }
+
+    const matchedRule =
+      store.settings.routeMode === "rule"
+        ? store.rules.find((r) => {
+            if (!r.enabled) return false;
+            return r.patterns.some((p) => {
+              const needle = p.trim().toLowerCase().replace(/^\./, "");
+              return needle.length > 0 && (host === needle || host.endsWith(`.${needle}`));
+            });
+          }) ?? null
+        : null;
+
+    const target =
+      store.settings.routeMode === "direct"
+        ? "direct"
+        : store.settings.routeMode === "global"
+          ? "main"
+          : matchedRule?.target ?? "main";
+
+    let resolvedExitKind = "node";
+    let resolvedExitLabel = "JP Tokyo-02 Direct-IPLC";
+    let resolvedNodeId: string | null = store.settings.mainNodeId ?? "n-jp-02";
+    let resolvedNodeRegion: string | null = "JP";
+
+    if (target === "direct") {
+      resolvedExitKind = "direct";
+      resolvedExitLabel = "Direct";
+      resolvedNodeId = null;
+      resolvedNodeRegion = null;
+    } else if (target === "reject") {
+      resolvedExitKind = "reject";
+      resolvedExitLabel = "Reject";
+      resolvedNodeId = null;
+      resolvedNodeRegion = null;
+    } else if (target.startsWith("chain:")) {
+      const cid = target.slice("chain:".length);
+      const chain = store.chains.find((c) => c.id === cid);
+      resolvedExitKind = "chain";
+      resolvedExitLabel = chain ? chain.name : cid;
+      resolvedNodeId = target;
+      resolvedNodeRegion = null;
+    } else if (target.startsWith("auto:")) {
+      const region = target.slice("auto:".length).toUpperCase();
+      const cand =
+        store.nodes.find((n) => n.region.toUpperCase() === region) ?? store.nodes[0] ?? null;
+      resolvedExitKind = "auto";
+      resolvedExitLabel = cand ? cand.remark : target;
+      resolvedNodeId = cand?.id ?? null;
+      resolvedNodeRegion = cand?.region ?? region;
+    } else {
+      const lookupId = target === "main" ? store.settings.mainNodeId ?? "" : target;
+      if (lookupId.startsWith("chain:")) {
+        const cid = lookupId.slice("chain:".length);
+        const chain = store.chains.find((c) => c.id === cid);
+        resolvedExitKind = "chain";
+        resolvedExitLabel = chain ? chain.name : cid;
+        resolvedNodeId = lookupId;
+        resolvedNodeRegion = null;
+      } else {
+        const node = store.nodes.find((n) => n.id === lookupId) ?? store.nodes[0] ?? null;
+        resolvedExitKind = "node";
+        resolvedExitLabel = node ? node.remark : "None";
+        resolvedNodeId = node?.id ?? null;
+        resolvedNodeRegion = node?.region ?? null;
+      }
+    }
+
     return {
       input,
       normalizedHost: host,
-      isIp: /^\d+\.\d+\.\d+\.\d+$/.test(host),
-      isPrivateIp: host.startsWith("192.168.") || host.startsWith("10."),
+      isIp,
+      isPrivateIp,
       routeMode: store.settings.routeMode,
-      matchedRuleId: host.includes("openai") || host.includes("chatgpt") ? "classic-ai" : null,
-      matchedRuleTitle: host.includes("openai") || host.includes("chatgpt") ? "AI Platforms" : null,
-      matchedBy: host.includes("openai") ? "rule_set:geosite-openai" : "final",
-      target: host.includes("openai") ? "auto:US" : "main",
-      resolvedExitKind: "node",
-      resolvedExitLabel: host.includes("openai")
-        ? "US SanJose-01 AI-Residential"
-        : "JP Tokyo-02 Direct-IPLC",
-      resolvedNodeId: host.includes("openai") ? "n-us-01" : "n-jp-02",
-      resolvedNodeRegion: host.includes("openai") ? "US" : "JP",
-      dnsServer: "dns-remote",
-      dnsReason: "Remote encrypted DNS",
+      matchedRuleId: matchedRule?.id ?? null,
+      matchedRuleTitle: matchedRule?.title ?? null,
+      matchedBy: matchedRule
+        ? matchedRule.ruleSet
+          ? `rule_set:${matchedRule.ruleSet}`
+          : "domain_suffix"
+        : "final",
+      target,
+      resolvedExitKind,
+      resolvedExitLabel,
+      resolvedNodeId,
+      resolvedNodeRegion,
+      dnsServer: target === "direct" ? "dns-local" : "dns-remote",
+      dnsReason: target === "direct" ? "Local China DNS" : "Remote encrypted DNS",
     };
   },
 

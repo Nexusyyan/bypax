@@ -1,11 +1,12 @@
 use crate::state::AppState;
 use crate::tray;
 use bypax_appproxy::{AppRuleTestQuery, ProcessTracker, RuleEngine};
+use bypax_core::compiler::chain_outbound_tag;
 use bypax_core::control::ControlClient;
 use bypax_core::model::{AppProxyRule, CaptureMode, NodeIR, RouteMode};
 use bypax_core::parser::parse_payload;
 use bypax_core::route_eval::evaluate_route_target;
-use bypax_core::tester::{batch_real_delay_with_progress, batch_tcping_with_progress};
+use bypax_core::tester::batch_real_delay_with_progress;
 use bypax_core::updater::{fetch_text_via_channels, CURRENT_APP_VERSION};
 use bypax_ipc::{
     default_ctl_endpoint, CtlEnvelope, CtlHandler, CtlIpcServer, CtlRequest, CtlResponse,
@@ -318,27 +319,36 @@ async fn dispatch_ctl_request(
         }
 
         CtlRequest::SelectNode { node_id } => {
-            let (control_port, remark) = {
+            let (control_port, remark, selector_tag) = {
                 let store = state
                     .store
                     .lock()
                     .map_err(|_| "store lock poisoned".to_string())?;
-                let nodes = store.list_nodes().map_err(|e| e.to_string())?;
-                let found = nodes
-                    .iter()
-                    .find(|n| n.id == node_id)
-                    .ok_or_else(|| format!("Node '{}' not found", node_id))?;
-                let remark = found.remark.clone();
+                let (remark, selector_tag) = if let Some(cid) = node_id.strip_prefix("chain:") {
+                    let chains = store.list_proxy_chains().map_err(|e| e.to_string())?;
+                    let found = chains
+                        .iter()
+                        .find(|c| c.id == cid)
+                        .ok_or_else(|| format!("Proxy chain '{}' not found", cid))?;
+                    (found.name.clone(), chain_outbound_tag(cid))
+                } else {
+                    let nodes = store.list_nodes().map_err(|e| e.to_string())?;
+                    let found = nodes
+                        .iter()
+                        .find(|n| n.id == node_id)
+                        .ok_or_else(|| format!("Node '{}' not found", node_id))?;
+                    (found.remark.clone(), node_id.clone())
+                };
                 let mut settings = store.load_settings().map_err(|e| e.to_string())?;
                 settings.main_node_id = Some(node_id.clone());
                 store.save_settings(&settings).map_err(|e| e.to_string())?;
-                (settings.control_port, remark)
+                (settings.control_port, remark, selector_tag)
             };
 
             let mut hot_switched = false;
             if state.is_core_running() {
                 if let Ok(client) = ControlClient::new(control_port, &state.control_secret) {
-                    if client.select_proxy("main-exit", &node_id).await.is_ok() {
+                    if client.select_proxy("main-exit", &selector_tag).await.is_ok() {
                         hot_switched = true;
                     }
                 }
@@ -365,8 +375,8 @@ async fn dispatch_ctl_request(
             ))
         }
 
-        CtlRequest::TestLatency { node_ids, kind } => {
-            let (targets, test_url, local_dns, strip_handshake) = {
+        CtlRequest::TestLatency { node_ids, kind: _ } => {
+            let (targets, all_nodes, test_url, local_dns, strip_handshake) = {
                 let store = state
                     .store
                     .lock()
@@ -374,45 +384,39 @@ async fn dispatch_ctl_request(
                 let settings = store.load_settings().map_err(|e| e.to_string())?;
                 let all = store.list_nodes().map_err(|e| e.to_string())?;
                 let list = if node_ids.is_empty() {
-                    all
+                    all.clone()
                 } else {
-                    all.into_iter()
+                    all.iter()
                         .filter(|n| node_ids.contains(&n.id))
+                        .cloned()
                         .collect()
                 };
                 (
                     list,
+                    all,
                     settings.latency_test_url,
                     settings.dns_local_server,
                     settings.latency_strip_handshake,
                 )
             };
 
-            let norm_kind = kind.trim().to_ascii_lowercase();
-            let is_real = norm_kind == "real" || norm_kind == "real_delay";
             let emit_handle = app.clone();
-            let results = if is_real {
-                let bin = state.require_core_binary()?;
-                batch_real_delay_with_progress(
-                    &bin,
-                    &targets,
-                    &test_url,
-                    4500,
-                    12,
-                    Some(&local_dns),
-                    strip_handshake,
-                    move |ev| {
-                        let _ = emit_handle.emit("bypax-latency-progress", ev);
-                    },
-                )
-                .await
-                .map_err(|e| e.to_string())?
-            } else {
-                batch_tcping_with_progress(&targets, 2500, 16, move |ev| {
+            let bin = state.require_core_binary()?;
+            let results = batch_real_delay_with_progress(
+                &bin,
+                &targets,
+                &all_nodes,
+                &test_url,
+                4500,
+                12,
+                Some(&local_dns),
+                strip_handshake,
+                move |ev| {
                     let _ = emit_handle.emit("bypax-latency-progress", ev);
-                })
-                .await
-            };
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
 
             if let Ok(store) = state.store.lock() {
                 for r in &results {
@@ -423,7 +427,7 @@ async fn dispatch_ctl_request(
             Ok((
                 json!({
                     "controlMode": "live",
-                    "kind": if is_real { "real_delay" } else { "tcping" },
+                    "kind": "real_delay",
                     "total": results.len(),
                     "results": results
                 }),
@@ -519,7 +523,7 @@ async fn dispatch_ctl_request(
             input,
             process_name,
         } => {
-            let (settings, rules, nodes) = {
+            let (settings, rules, nodes, chains) = {
                 let store = state
                     .store
                     .lock()
@@ -528,6 +532,7 @@ async fn dispatch_ctl_request(
                     store.load_settings().map_err(|e| e.to_string())?,
                     store.list_rules().map_err(|e| e.to_string())?,
                     store.list_nodes().map_err(|e| e.to_string())?,
+                    store.list_proxy_chains().map_err(|e| e.to_string())?,
                 )
             };
             let sb = state.core_manager.resolve_binary_path();
@@ -537,6 +542,7 @@ async fn dispatch_ctl_request(
                 &settings,
                 &rules,
                 &nodes,
+                &chains,
                 Some(&state.rule_cache),
                 sb.as_deref(),
             );
@@ -823,7 +829,7 @@ async fn dispatch_ctl_request(
             dst_port,
             protocol,
         } => {
-            let (app_rules, nodes, settings) = {
+            let (app_rules, nodes, chains, settings) = {
                 let store = state
                     .store
                     .lock()
@@ -831,6 +837,7 @@ async fn dispatch_ctl_request(
                 (
                     store.list_app_proxy_rules().map_err(|e| e.to_string())?,
                     store.list_nodes().map_err(|e| e.to_string())?,
+                    store.list_proxy_chains().map_err(|e| e.to_string())?,
                     store.load_settings().map_err(|e| e.to_string())?,
                 )
             };
@@ -848,6 +855,7 @@ async fn dispatch_ctl_request(
                 &app_rules,
                 &query,
                 &nodes,
+                &chains,
                 settings.main_node_id.as_deref(),
                 settings.app_proxy_bypass_lan,
             );
@@ -858,7 +866,7 @@ async fn dispatch_ctl_request(
         }
 
         CtlRequest::ListProcesses { filter } => {
-            let (app_rules, nodes, bypass_lan) = {
+            let (app_rules, nodes, chains, bypass_lan) = {
                 let store = state
                     .store
                     .lock()
@@ -867,11 +875,12 @@ async fn dispatch_ctl_request(
                 (
                     store.list_app_proxy_rules().map_err(|e| e.to_string())?,
                     store.list_nodes().map_err(|e| e.to_string())?,
+                    store.list_proxy_chains().map_err(|e| e.to_string())?,
                     s.app_proxy_bypass_lan,
                 )
             };
             let bindings =
-                bypax_core::compiler::build_app_proxy_target_bindings(&app_rules, &nodes);
+                bypax_core::compiler::build_app_proxy_target_bindings(&app_rules, &nodes, &chains);
             let engine = RuleEngine::from_rules(&app_rules, &bindings, bypass_lan, &[]).ok();
 
             let needle = filter

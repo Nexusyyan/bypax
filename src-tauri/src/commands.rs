@@ -6,20 +6,20 @@ use bypax_appproxy::{
     AppRuleTestQuery, AppRuleTestTrace, ExternalChildAlert, InstalledAppItem, ProcessTracker,
     RuleEngine,
 };
-use bypax_core::compiler::SingBox114Compiler;
+use bypax_core::compiler::{chain_outbound_tag, SingBox114Compiler};
 use bypax_core::control::ControlClient;
 use bypax_core::core_manager::{CoreDownloadProgressEvent, CoreUpdateCheckReport};
 use bypax_core::model::{
     AppProxyRule, AppSettings, CaptureMode, CompileOutput, ConnectionHistoryRecord, ConnectionItem,
     CoreInfo, InboundPort, LatencyResult, LogEntry, NodeIR, PlatformTrafficStat, PreflightReport,
-    RouteMode, RouteTestResult, RulePresetSpec, SimpleRoutingRule, SubscriptionGroup,
+    ProxyChain, RouteMode, RouteTestResult, RulePresetSpec, SimpleRoutingRule, SubscriptionGroup,
     TrafficSample,
 };
 use bypax_core::parser::{parse_payload, ImportSummary};
 use bypax_core::route_eval::evaluate_route_target;
 use bypax_core::rule_cache::RuleSetStatus;
 use bypax_core::storage::{classify_platform, extract_host, rule_preset_catalog};
-use bypax_core::tester::{batch_real_delay_with_progress, batch_tcping_with_progress};
+use bypax_core::tester::{batch_real_delay_with_progress, test_proxy_chain_real_delay};
 use bypax_core::updater::{
     check_for_app_update, download_and_stage_update, fetch_text_via_channels,
     find_macos_app_bundle_root, is_macos_translocated_path, is_safe_release_url,
@@ -44,6 +44,7 @@ pub struct BootstrapPayload {
     pub core_info: CoreInfo,
     pub settings: AppSettings,
     pub nodes: Vec<NodeIR>,
+    pub chains: Vec<ProxyChain>,
     pub subscriptions: Vec<SubscriptionGroup>,
     pub rules: Vec<SimpleRoutingRule>,
     pub app_rules: Vec<AppProxyRule>,
@@ -86,6 +87,13 @@ pub struct AppRulesMutationResult {
 pub struct SelectNodeResult {
     pub hot_switched: bool,
     pub main_node_id: String,
+    pub compiled: CompileOutput,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainMutationResult {
+    pub chains: Vec<ProxyChain>,
     pub compiled: CompileOutput,
 }
 
@@ -201,7 +209,7 @@ async fn post_import_sync_core(
 
 #[tauri::command]
 pub async fn get_bootstrap_state(state: State<'_, AppState>) -> Result<BootstrapPayload, String> {
-    let (mut settings, nodes, subscriptions, rules, app_rules, extra_ports) = {
+    let (mut settings, nodes, chains, subscriptions, rules, app_rules, extra_ports) = {
         let store = state
             .store
             .lock()
@@ -209,6 +217,7 @@ pub async fn get_bootstrap_state(state: State<'_, AppState>) -> Result<Bootstrap
         (
             store.load_settings().map_err(|e| e.to_string())?,
             store.list_nodes().map_err(|e| e.to_string())?,
+            store.list_proxy_chains().map_err(|e| e.to_string())?,
             store.list_subscriptions().map_err(|e| e.to_string())?,
             store.list_rules().map_err(|e| e.to_string())?,
             store.list_app_proxy_rules().map_err(|e| e.to_string())?,
@@ -258,6 +267,7 @@ pub async fn get_bootstrap_state(state: State<'_, AppState>) -> Result<Bootstrap
         core_info: state.build_core_info(),
         settings,
         nodes,
+        chains,
         subscriptions,
         rules,
         app_rules,
@@ -540,9 +550,13 @@ pub async fn select_main_node(
 
     let running = state.is_core_running();
     let mut hot_switched = false;
+    let selector_tag = id
+        .strip_prefix("chain:")
+        .map(chain_outbound_tag)
+        .unwrap_or_else(|| id.clone());
     if running {
         if let Ok(client) = ControlClient::new(control_port, &state.control_secret) {
-            if client.select_proxy("main-exit", &id).await.is_ok() {
+            if client.select_proxy("main-exit", &selector_tag).await.is_ok() {
                 hot_switched = true;
                 state.push_log(
                     "INFO",
@@ -841,7 +855,7 @@ pub fn test_app_proxy_rule(
     state: State<'_, AppState>,
     query: AppRuleTestQuery,
 ) -> Result<AppRuleTestTrace, String> {
-    let (app_rules, nodes, settings) = {
+    let (app_rules, nodes, chains, settings) = {
         let store = state
             .store
             .lock()
@@ -849,6 +863,7 @@ pub fn test_app_proxy_rule(
         (
             store.list_app_proxy_rules().map_err(|e| e.to_string())?,
             store.list_nodes().map_err(|e| e.to_string())?,
+            store.list_proxy_chains().map_err(|e| e.to_string())?,
             store.load_settings().map_err(|e| e.to_string())?,
         )
     };
@@ -856,6 +871,7 @@ pub fn test_app_proxy_rule(
         &app_rules,
         &query,
         &nodes,
+        &chains,
         settings.main_node_id.as_deref(),
         settings.app_proxy_bypass_lan,
     ))
@@ -866,7 +882,7 @@ pub fn list_running_processes(
     state: State<'_, AppState>,
     filter: Option<String>,
 ) -> Result<Vec<ProcessInfoDto>, String> {
-    let (app_rules, nodes, bypass_lan) = {
+    let (app_rules, nodes, chains, bypass_lan) = {
         let store = state
             .store
             .lock()
@@ -875,10 +891,12 @@ pub fn list_running_processes(
         (
             store.list_app_proxy_rules().map_err(|e| e.to_string())?,
             store.list_nodes().map_err(|e| e.to_string())?,
+            store.list_proxy_chains().map_err(|e| e.to_string())?,
             s.app_proxy_bypass_lan,
         )
     };
-    let bindings = bypax_core::compiler::build_app_proxy_target_bindings(&app_rules, &nodes);
+    let bindings =
+        bypax_core::compiler::build_app_proxy_target_bindings(&app_rules, &nodes, &chains);
     let engine = RuleEngine::from_rules(&app_rules, &bindings, bypass_lan, &[]).ok();
 
     let needle = filter
@@ -1348,7 +1366,7 @@ pub fn test_route_target(
     input: String,
     process_name: Option<String>,
 ) -> Result<RouteTestResult, String> {
-    let (settings, rules, nodes) = {
+    let (settings, rules, nodes, chains) = {
         let store = state
             .store
             .lock()
@@ -1357,6 +1375,7 @@ pub fn test_route_target(
             store.load_settings().map_err(|e| e.to_string())?,
             store.list_rules().map_err(|e| e.to_string())?,
             store.list_nodes().map_err(|e| e.to_string())?,
+            store.list_proxy_chains().map_err(|e| e.to_string())?,
         )
     };
     let sb = state.core_manager.resolve_binary_path();
@@ -1366,6 +1385,7 @@ pub fn test_route_target(
         &settings,
         &rules,
         &nodes,
+        &chains,
         Some(&state.rule_cache),
         sb.as_deref(),
     ))
@@ -2035,41 +2055,140 @@ pub fn open_external_url(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn run_batch_tcping(
+pub async fn save_proxy_chain(
     app: AppHandle,
     state: State<'_, AppState>,
-    node_ids: Vec<String>,
-) -> Result<Vec<LatencyResult>, String> {
-    let targets = {
+    mut chain: ProxyChain,
+) -> Result<ChainMutationResult, String> {
+    chain.name = chain.name.trim().to_string();
+    if chain.name.is_empty() {
+        return Err("Proxy chain name cannot be empty".to_string());
+    }
+    if chain.hops.len() < 2 {
+        return Err("Proxy chain requires at least 2 hops".to_string());
+    }
+    let mut seen_hops = HashSet::new();
+    for hop in &chain.hops {
+        if !seen_hops.insert(hop.as_str()) {
+            return Err("Proxy chain contains duplicate hop nodes (cycle detected)".to_string());
+        }
+    }
+    if chain.id.trim().is_empty() {
+        chain.id = format!("chain-{}", uuid::Uuid::new_v4().simple());
+    }
+    if chain.created_at.trim().is_empty() {
+        chain.created_at = chrono::Utc::now().to_rfc3339();
+    }
+
+    let chains = {
         let store = state
             .store
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
-        let all = store.list_nodes().map_err(|e| e.to_string())?;
-        if node_ids.is_empty() {
-            all
-        } else {
-            all.into_iter()
-                .filter(|n| node_ids.contains(&n.id))
-                .collect()
-        }
+        store
+            .upsert_proxy_chain(&chain)
+            .map_err(|e| e.to_string())?;
+        store.list_proxy_chains().map_err(|e| e.to_string())?
     };
-    let emit_handle = app.clone();
-    let results = batch_tcping_with_progress(&targets, 2500, 16, move |ev| {
-        let _ = emit_handle.emit("bypax-latency-progress", ev);
-    })
-    .await;
+
+    state.push_log(
+        "INFO",
+        format!(
+            "chains: saved proxy chain '{}' ({} hops)",
+            chain.name,
+            chain.hops.len()
+        ),
+    );
+    let _ = state.reload_core_if_running_async().await;
+    let compiled = state.compile_current()?;
+    notify_sync(&app);
+    Ok(ChainMutationResult { chains, compiled })
+}
+
+#[tauri::command]
+pub async fn delete_proxy_chain(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<ChainMutationResult, String> {
+    let target_ref = format!("chain:{}", id);
+    let chains = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "store lock poisoned".to_string())?;
+        store.delete_proxy_chain(&id).map_err(|e| e.to_string())?;
+        let mut settings = store.load_settings().map_err(|e| e.to_string())?;
+        if settings.main_node_id.as_deref() == Some(target_ref.as_str()) {
+            settings.main_node_id = store
+                .list_nodes()
+                .ok()
+                .and_then(|list| list.first().map(|n| n.id.clone()));
+            store.save_settings(&settings).map_err(|e| e.to_string())?;
+        }
+        store.list_proxy_chains().map_err(|e| e.to_string())?
+    };
+
+    state.push_log("INFO", format!("chains: deleted proxy chain {}", id));
+    let _ = state.reload_core_if_running_async().await;
+    let compiled = state.compile_current()?;
+    notify_sync(&app);
+    Ok(ChainMutationResult { chains, compiled })
+}
+
+#[tauri::command]
+pub async fn test_proxy_chain_delay(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    chain_id: String,
+) -> Result<LatencyResult, String> {
+    let bin = state.require_core_binary()?;
+    let (chain, all_nodes, test_url, local_dns, strip_handshake) = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "store lock poisoned".to_string())?;
+        let settings = store.load_settings().map_err(|e| e.to_string())?;
+        let chains = store.list_proxy_chains().map_err(|e| e.to_string())?;
+        let found = chains
+            .into_iter()
+            .find(|c| c.id == chain_id)
+            .ok_or_else(|| format!("Proxy chain '{}' not found", chain_id))?;
+        let all = store.list_nodes().map_err(|e| e.to_string())?;
+        (
+            found,
+            all,
+            settings.latency_test_url,
+            settings.dns_local_server,
+            settings.latency_strip_handshake,
+        )
+    };
+
+    let result = test_proxy_chain_real_delay(
+        &bin,
+        &chain,
+        &all_nodes,
+        &test_url,
+        5500,
+        Some(&local_dns),
+        strip_handshake,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     if let Ok(store) = state.store.lock() {
-        for r in &results {
-            let _ = store.record_latency_result(r);
-        }
+        let _ = store.record_latency_result(&result);
     }
     state.push_log(
         "INFO",
-        format!("tester: TCPing finished ({} nodes)", results.len()),
+        format!(
+            "tester: chain '{}' real-delay -> {}ms",
+            chain.name,
+            result.delay_ms.unwrap_or(-1)
+        ),
     );
-    Ok(results)
+    notify_sync(&app);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -2079,7 +2198,7 @@ pub async fn run_batch_real_delay(
     node_ids: Vec<String>,
 ) -> Result<Vec<LatencyResult>, String> {
     let bin = state.require_core_binary()?;
-    let (targets, test_url, local_dns, strip_handshake) = {
+    let (targets, all_nodes, test_url, local_dns, strip_handshake) = {
         let store = state
             .store
             .lock()
@@ -2087,14 +2206,16 @@ pub async fn run_batch_real_delay(
         let settings = store.load_settings().map_err(|e| e.to_string())?;
         let all = store.list_nodes().map_err(|e| e.to_string())?;
         let list = if node_ids.is_empty() {
-            all
+            all.clone()
         } else {
-            all.into_iter()
+            all.iter()
                 .filter(|n| node_ids.contains(&n.id))
+                .cloned()
                 .collect()
         };
         (
             list,
+            all,
             settings.latency_test_url,
             settings.dns_local_server,
             settings.latency_strip_handshake,
@@ -2104,6 +2225,7 @@ pub async fn run_batch_real_delay(
     let results = batch_real_delay_with_progress(
         &bin,
         &targets,
+        &all_nodes,
         &test_url,
         4500,
         12,

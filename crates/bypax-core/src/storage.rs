@@ -1,6 +1,6 @@
 use crate::model::{
     AppProxyRule, AppSettings, ConnectionHistoryRecord, DomainOverride, InboundPort,
-    NetworkSnapshot, NodeIR, PlatformTrafficStat, RulePresetSpec, SimpleRoutingRule,
+    NetworkSnapshot, NodeIR, PlatformTrafficStat, ProxyChain, RulePresetSpec, SimpleRoutingRule,
     SubscriptionGroup,
 };
 use anyhow::{Context, Result};
@@ -505,6 +505,11 @@ impl Store {
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS proxy_chains (
+                id TEXT PRIMARY KEY,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                payload TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS subscriptions (
                 id TEXT PRIMARY KEY,
                 payload TEXT NOT NULL
@@ -689,13 +694,87 @@ impl Store {
 
     pub fn replace_group_nodes(&mut self, group_name: &str, nodes: &[NodeIR]) -> Result<()> {
         let tx = self.conn.transaction()?;
+        let existing_nodes: Vec<NodeIR> = {
+            let mut stmt = tx.prepare(
+                "SELECT payload FROM nodes WHERE group_name = ?1 ORDER BY sort_order ASC, rowid ASC",
+            )?;
+            let rows = stmt.query_map(params![group_name], |r| r.get::<_, String>(0))?;
+            let mut list = Vec::new();
+            for row in rows {
+                if let Ok(n) = serde_json::from_str::<NodeIR>(&row?) {
+                    list.push(n);
+                }
+            }
+            list
+        };
+
+        // Preserve stable node IDs (and cached latency) across subscription refreshes so
+        // Proxy Chains, pinned routing rules, App Proxy rules, and Main Exit never break.
+        type NodeIdentityKey = (String, String, u16, String);
+        type PreservedNodeMeta = (String, Option<i32>);
+        let mut exact_map: HashMap<NodeIdentityKey, Vec<PreservedNodeMeta>> = HashMap::new();
+        let mut remark_counts: HashMap<String, usize> = HashMap::new();
+        let mut remark_map: HashMap<String, PreservedNodeMeta> = HashMap::new();
+        for old in &existing_nodes {
+            let key = (
+                old.protocol.as_singbox_type().to_string(),
+                old.server.to_ascii_lowercase(),
+                old.port,
+                old.remark.clone(),
+            );
+            exact_map
+                .entry(key)
+                .or_default()
+                .push((old.id.clone(), old.real_delay_ms));
+            *remark_counts.entry(old.remark.clone()).or_insert(0) += 1;
+            remark_map.insert(old.remark.clone(), (old.id.clone(), old.real_delay_ms));
+        }
+
+        let mut used_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut preserved_nodes: Vec<NodeIR> = Vec::with_capacity(nodes.len());
+        for incoming in nodes {
+            let mut node = incoming.clone();
+            let exact_key = (
+                node.protocol.as_singbox_type().to_string(),
+                node.server.to_ascii_lowercase(),
+                node.port,
+                node.remark.clone(),
+            );
+            let matched = exact_map
+                .get_mut(&exact_key)
+                .and_then(|bucket| {
+                    bucket
+                        .iter()
+                        .position(|(id, _)| !used_ids.contains(id))
+                        .map(|idx| bucket.remove(idx))
+                })
+                .or_else(|| {
+                    if remark_counts.get(&node.remark).copied() == Some(1) {
+                        remark_map
+                            .get(&node.remark)
+                            .filter(|(id, _)| !used_ids.contains(id))
+                            .cloned()
+                    } else {
+                        None
+                    }
+                });
+            if let Some((old_id, old_delay)) = matched {
+                used_ids.insert(old_id.clone());
+                node.id = old_id;
+                if node.real_delay_ms.is_none() {
+                    node.real_delay_ms = old_delay;
+                }
+            }
+            preserved_nodes.push(node);
+        }
+
         tx.execute("DELETE FROM nodes WHERE group_name = ?1", params![group_name])?;
         let max_order: i64 = tx.query_row(
             "SELECT COALESCE(MAX(sort_order), 0) FROM nodes",
             [],
             |r| r.get(0),
         )?;
-        for (i, node) in nodes.iter().enumerate() {
+        for (i, node) in preserved_nodes.iter().enumerate() {
             let payload = serde_json::to_string(node)?;
             tx.execute(
                 "INSERT INTO nodes (id, group_name, sort_order, payload) VALUES (?1, ?2, ?3, ?4)",
@@ -713,12 +792,7 @@ impl Store {
         Ok(changed > 0)
     }
 
-    pub fn update_node_latency(
-        &self,
-        id: &str,
-        tcping_ms: Option<u32>,
-        real_delay_ms: Option<u32>,
-    ) -> Result<()> {
+    pub fn update_node_latency(&self, id: &str, real_delay_ms: Option<i32>) -> Result<()> {
         let existing: Option<String> = self
             .conn
             .query_row("SELECT payload FROM nodes WHERE id = ?1", params![id], |r| {
@@ -727,9 +801,6 @@ impl Store {
             .optional()?;
         if let Some(raw) = existing {
             let mut node: NodeIR = serde_json::from_str(&raw)?;
-            if tcping_ms.is_some() {
-                node.tcping_ms = tcping_ms;
-            }
             if real_delay_ms.is_some() {
                 node.real_delay_ms = real_delay_ms;
             }
@@ -743,6 +814,10 @@ impl Store {
     }
 
     pub fn record_latency_result(&self, res: &crate::model::LatencyResult) -> Result<()> {
+        let effective_ms = res.delay_ms.unwrap_or(-1);
+        if let Some(chain_id) = res.node_id.strip_prefix("chain:") {
+            return self.record_chain_latency(chain_id, effective_ms);
+        }
         let existing: Option<String> = self
             .conn
             .query_row(
@@ -753,15 +828,68 @@ impl Store {
             .optional()?;
         if let Some(raw) = existing {
             let mut node: NodeIR = serde_json::from_str(&raw)?;
-            if res.kind == "real" {
-                node.real_delay_ms = res.delay_ms;
-            } else {
-                node.tcping_ms = res.delay_ms;
-            }
+            node.real_delay_ms = Some(effective_ms);
             let updated = serde_json::to_string(&node)?;
             self.conn.execute(
                 "UPDATE nodes SET payload = ?2 WHERE id = ?1",
                 params![res.node_id, updated],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_proxy_chains(&self) -> Result<Vec<ProxyChain>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT payload FROM proxy_chains ORDER BY sort_order ASC, rowid ASC")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let Ok(chain) = serde_json::from_str::<ProxyChain>(&row?) {
+                out.push(chain);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_proxy_chain(&self, chain: &ProxyChain) -> Result<()> {
+        let payload = serde_json::to_string(chain)?;
+        let max_order: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) FROM proxy_chains",
+            [],
+            |r| r.get(0),
+        )?;
+        self.conn.execute(
+            "INSERT INTO proxy_chains (id, sort_order, payload) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
+            params![chain.id, max_order + 1, payload],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_proxy_chain(&self, id: &str) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM proxy_chains WHERE id = ?1", params![id])?;
+        Ok(changed > 0)
+    }
+
+    pub fn record_chain_latency(&self, id: &str, delay_ms: i32) -> Result<()> {
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT payload FROM proxy_chains WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = existing {
+            let mut chain: ProxyChain = serde_json::from_str(&raw)?;
+            chain.real_delay_ms = Some(delay_ms);
+            let updated = serde_json::to_string(&chain)?;
+            self.conn.execute(
+                "UPDATE proxy_chains SET payload = ?2 WHERE id = ?1",
+                params![id, updated],
             )?;
         }
         Ok(())

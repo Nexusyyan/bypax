@@ -12,15 +12,18 @@ import {
   RefreshCw,
   Search,
   Trash2,
+  Waypoints,
   X,
 } from "lucide-react";
 import { CustomSelect, type SelectGroup } from "../../components/CustomSelect";
 import { NodeLabel, RegionFlag, parseFlagText } from "../../components/RegionFlag";
+import { SegmentedControl } from "../../components/SegmentedControl";
 import type { Dict } from "../../i18n";
 import type {
   InboundPort,
   Locale,
   NodeIR,
+  ProxyChain,
   RouteMode,
   RouteTestResult,
   RulePresetSpec,
@@ -31,14 +34,33 @@ import {
   computeAvailableRegions,
   evaluateRouteSimulation,
   formatBytes,
+  formatLatency,
   resolveTargetExit,
 } from "../../utils/nodes";
+import { RoutingFlowCanvas } from "./RoutingFlowCanvas";
+
+const ROUTING_VIEW_STORAGE_KEY = "bypax-routing-view";
+
+function readInitialRoutingView(): "list" | "flow" {
+  if (typeof window !== "undefined") {
+    const param = new URLSearchParams(window.location.search).get("view");
+    if (param === "flow" || param === "list") return param;
+    try {
+      const saved = window.localStorage.getItem(ROUTING_VIEW_STORAGE_KEY);
+      if (saved === "flow" || saved === "list") return saved;
+    } catch {
+      // ignore
+    }
+  }
+  return "list";
+}
 
 interface RoutingViewProps {
   dict: Dict;
   locale: Locale;
   routeMode: RouteMode;
   nodes: NodeIR[];
+  chains: ProxyChain[];
   rules: SimpleRoutingRule[];
   rulePresets: RulePresetSpec[];
   ruleSets: RuleSetStatus[];
@@ -56,6 +78,7 @@ interface RoutingViewProps {
   onSavePort: (port: InboundPort) => void;
   onDeletePort: (id: string) => void;
   onGoToNodes: () => void;
+  onOpenChains: (chainId?: string) => void;
   onCopyText: (text: string) => void;
   onInvalidPort: () => void;
 }
@@ -65,6 +88,7 @@ export function RoutingView({
   locale,
   routeMode,
   nodes,
+  chains,
   rules,
   rulePresets,
   ruleSets,
@@ -82,10 +106,21 @@ export function RoutingView({
   onSavePort,
   onDeletePort,
   onGoToNodes,
+  onOpenChains,
   onCopyText,
   onInvalidPort,
 }: RoutingViewProps) {
+  const [viewMode, setViewMode] = useState<"list" | "flow">(readInitialRoutingView);
   const [testInput, setTestInput] = useState(initialTestHost || "chatgpt.com");
+
+  const handleSetViewMode = (mode: "list" | "flow") => {
+    setViewMode(mode);
+    try {
+      window.localStorage.setItem(ROUTING_VIEW_STORAGE_KEY, mode);
+    } catch {
+      // ignore
+    }
+  };
 
   useEffect(() => {
     if (initialTestHost) {
@@ -188,16 +223,30 @@ export function RoutingView({
       { label: dict.routing.optActionsGroup, options: actionOptions },
     ];
 
+    if (chains.length > 0) {
+      groups.push({
+        label: dict.routing.optChainsGroup,
+        options: chains.map((c) => ({
+          value: `chain:${c.id}`,
+          label: c.name,
+          meta:
+            c.realDelayMs != null
+              ? `${c.hops.length}H \u00b7 ${formatLatency(c.realDelayMs)}`
+              : `${c.hops.length}H`,
+          icon: <Waypoints className="h-3 w-3 shrink-0 text-[var(--accent-focus)]" strokeWidth={1.6} />,
+        })),
+      });
+    }
+
     if (nodes.length > 0) {
       groups.push({
         label: dict.routing.optNodesGroup,
         options: nodes.map((n) => {
-          const ms = n.realDelayMs ?? n.tcpingMs;
           const parsed = parseFlagText(n.remark, n.region);
           return {
             value: n.id,
             label: parsed.cleanText,
-            meta: ms != null ? `${ms} ms` : undefined,
+            meta: n.realDelayMs != null ? formatLatency(n.realDelayMs) : undefined,
             icon: parsed.isoCode ? <RegionFlag code={parsed.isoCode} size="xs" /> : undefined,
           };
         }),
@@ -224,9 +273,10 @@ export function RoutingView({
           matchedPrefix: dict.routing.matchedRule,
         },
         locale === "en",
-        presets
+        presets,
+        chains,
       ),
-    [testInput, routeMode, rules, nodes, mainNodeId, targetLabels, dict, locale, presets]
+    [testInput, routeMode, rules, nodes, mainNodeId, targetLabels, dict, locale, presets, chains]
   );
 
   const runRouteTest = async (overrideInput?: string) => {
@@ -432,7 +482,13 @@ export function RoutingView({
     return ["ALL", ...cats];
   }, [rulePresets]);
 
-  const mainNode = nodes.find((n) => n.id === mainNodeId) ?? nodes[0] ?? null;
+  const mainChain =
+    mainNodeId && mainNodeId.startsWith("chain:")
+      ? chains.find((c) => c.id === mainNodeId.slice("chain:".length)) ?? null
+      : null;
+  const mainNode = mainChain
+    ? null
+    : nodes.find((n) => n.id === mainNodeId) ?? nodes[0] ?? null;
   const activePortsList = [
     mixedPort,
     ...extraPorts.filter((p) => p.enabled).map((p) => p.port),
@@ -505,10 +561,19 @@ export function RoutingView({
     <section className="flex min-h-0 flex-1 flex-col overflow-hidden">
       {/* Unified Single-Row 40px Page Header */}
       <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-[var(--border-hairline)] px-4 py-2.5 lg:px-5">
-        <div className="min-w-0">
+        <div className="flex min-w-0 items-center gap-3">
           <h1 className="truncate text-[18px] font-semibold tracking-[-0.015em] text-[var(--text-primary)]">
             {dict.routing.title}
           </h1>
+          <SegmentedControl
+            value={viewMode}
+            options={[
+              { value: "list" as const, label: dict.routing.viewList },
+              { value: "flow" as const, label: dict.routing.viewFlow },
+            ]}
+            onChange={handleSetViewMode}
+            ariaLabel={dict.routing.title}
+          />
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
           <button
@@ -546,7 +611,32 @@ export function RoutingView({
         </div>
       </div>
 
-      {/* Scrollable Body (B6: Rules Table fills full width below 1200px; forms stay readable) */}
+      {/* Interactive DIY Flow Canvas Mode OR Scrollable List Mode */}
+      {viewMode === "flow" ? (
+        <RoutingFlowCanvas
+          dict={dict}
+          locale={locale}
+          routeMode={routeMode}
+          nodes={nodes}
+          chains={chains}
+          rules={rules}
+          ruleSets={ruleSets}
+          mainNodeId={mainNodeId}
+          mixedPort={mixedPort}
+          testInput={testInput}
+          onChangeTestInput={setTestInput}
+          testResult={testResult}
+          testingRoute={testingRoute}
+          activeMatchedRuleId={activeMatchedRuleId}
+          displayMatchedRule={displayMatchedRule}
+          displayExitLabel={displayExitLabel}
+          displayDns={displayDns}
+          onRunRouteTest={(override) => void runRouteTest(override)}
+          onSaveRule={onSaveRule}
+          onEditRule={openEditModal}
+          onOpenChains={onOpenChains}
+        />
+      ) : (
       <div className="min-h-0 flex-1 overflow-auto">
         <div className="w-full space-y-5 px-4 py-4 lg:px-5">
           {/* Dedicated Route & DNS Target Tester Card */}
@@ -581,6 +671,7 @@ export function RoutingView({
                 value={testInput}
                 onChange={(e) => setTestInput(e.target.value)}
                 onKeyDown={(e) => {
+                  if (e.nativeEvent.isComposing || e.keyCode === 229) return;
                   if (e.key === "Enter") void runRouteTest();
                 }}
                 placeholder={dict.routing.simPlaceholder}
@@ -591,6 +682,7 @@ export function RoutingView({
                 value={testProcess}
                 onChange={(e) => setTestProcess(e.target.value)}
                 onKeyDown={(e) => {
+                  if (e.nativeEvent.isComposing || e.keyCode === 229) return;
                   if (e.key === "Enter") void runRouteTest();
                 }}
                 placeholder={dict.routing.testProcessPh}
@@ -755,7 +847,8 @@ export function RoutingView({
                 r.target,
                 nodes,
                 mainNodeId,
-                targetLabels
+                targetLabels,
+                chains,
               );
               const showAutoHint = r.target.startsWith("auto:") && resolved.node !== null;
               const rsStatus = r.ruleSet ? ruleSetMap.get(r.ruleSet) : undefined;
@@ -824,7 +917,7 @@ export function RoutingView({
                           size="xs"
                         />
                         {resolved.node.realDelayMs != null && (
-                          <span className="shrink-0">({resolved.node.realDelayMs} ms)</span>
+                          <span className="shrink-0">({formatLatency(resolved.node.realDelayMs)})</span>
                         )}
                       </div>
                     )}
@@ -883,7 +976,15 @@ export function RoutingView({
                   <span className="shrink-0 text-[var(--text-secondary)]">
                     {dict.routing.followMain}
                   </span>
-                  {mainNode ? (
+                  {mainChain ? (
+                    <span className="inline-flex min-w-0 items-center gap-1.5">
+                      <Waypoints
+                        className="h-3.5 w-3.5 shrink-0 text-[var(--accent-focus)]"
+                        strokeWidth={1.6}
+                      />
+                      <span className="truncate">{mainChain.name}</span>
+                    </span>
+                  ) : mainNode ? (
                     <NodeLabel remark={mainNode.remark} region={mainNode.region} size="xs" />
                   ) : (
                     <span className="truncate">{dict.nav.noNodeSelected}</span>
@@ -1033,6 +1134,7 @@ export function RoutingView({
         </div>
         </div>
       </div>
+      )}
 
       {/* Geosite Preset Library Modal */}
       {showPresetModal && (

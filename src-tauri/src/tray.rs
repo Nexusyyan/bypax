@@ -17,25 +17,18 @@ const POPUP_BG_LIGHT: Color = Color(0xFF, 0xFF, 0xFF, 0xFF);
 const POPUP_BG_DARK: Color = Color(0x16, 0x1B, 0x22, 0xFF);
 
 #[cfg(target_os = "macos")]
-const TRAY_TEMPLATE_IDLE: &[u8] = include_bytes!("../icons/tray-template.png");
+const TRAY_COLOR_IDLE: &[u8] = include_bytes!("../icons/tray-color-2x.png");
 #[cfg(target_os = "macos")]
-const TRAY_TEMPLATE_ACTIVE: &[u8] = include_bytes!("../icons/tray-template-active.png");
+const TRAY_COLOR_ACTIVE: &[u8] = include_bytes!("../icons/tray-color-2x-active.png");
 #[cfg(target_os = "macos")]
-const TRAY_TEMPLATE_WARN: &[u8] = include_bytes!("../icons/tray-template-warn.png");
+const TRAY_COLOR_WARN: &[u8] = include_bytes!("../icons/tray-color-2x-warn.png");
 
 #[cfg(not(target_os = "macos"))]
-const TRAY_LIGHT_IDLE: &[u8] = include_bytes!("../icons/tray-light.png");
+const TRAY_COLOR_IDLE: &[u8] = include_bytes!("../icons/tray-color.png");
 #[cfg(not(target_os = "macos"))]
-const TRAY_LIGHT_ACTIVE: &[u8] = include_bytes!("../icons/tray-light-active.png");
+const TRAY_COLOR_ACTIVE: &[u8] = include_bytes!("../icons/tray-color-active.png");
 #[cfg(not(target_os = "macos"))]
-const TRAY_LIGHT_WARN: &[u8] = include_bytes!("../icons/tray-light-warn.png");
-
-#[cfg(not(target_os = "macos"))]
-const TRAY_DARK_IDLE: &[u8] = include_bytes!("../icons/tray-dark.png");
-#[cfg(not(target_os = "macos"))]
-const TRAY_DARK_ACTIVE: &[u8] = include_bytes!("../icons/tray-dark-active.png");
-#[cfg(not(target_os = "macos"))]
-const TRAY_DARK_WARN: &[u8] = include_bytes!("../icons/tray-dark-warn.png");
+const TRAY_COLOR_WARN: &[u8] = include_bytes!("../icons/tray-color-warn.png");
 
 pub fn resolve_theme_is_dark(theme: &str) -> bool {
     match theme.trim().to_ascii_lowercase().as_str() {
@@ -98,13 +91,6 @@ fn is_system_app_dark() -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(target_os = "windows")]
-fn is_system_taskbar_dark() -> bool {
-    read_personalize_dword("SystemUsesLightTheme")
-        .map(|v| v == 0)
-        .unwrap_or(true)
-}
-
 #[cfg(target_os = "macos")]
 fn is_system_app_dark() -> bool {
     std::process::Command::new("defaults")
@@ -122,11 +108,6 @@ fn is_system_app_dark() -> bool {
 #[cfg(all(unix, not(target_os = "macos")))]
 fn is_system_app_dark() -> bool {
     false
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn is_system_taskbar_dark() -> bool {
-    true
 }
 
 fn current_saved_theme(app: &AppHandle) -> String {
@@ -153,31 +134,15 @@ pub fn sync_window_background_colors(app: &AppHandle, theme: &str) {
 }
 
 fn load_tray_icon(active: bool, warn: bool) -> Option<(Image<'static>, bool)> {
-    #[cfg(target_os = "macos")]
-    {
-        let (bytes, as_template) = if warn {
-            (TRAY_TEMPLATE_WARN, false)
-        } else if active {
-            (TRAY_TEMPLATE_ACTIVE, false)
-        } else {
-            (TRAY_TEMPLATE_IDLE, true)
-        };
-        Image::from_bytes(bytes).ok().map(|img| (img, as_template))
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let dark_bar = is_system_taskbar_dark();
-        let bytes = match (dark_bar, warn, active) {
-            (true, true, _) => TRAY_DARK_WARN,
-            (true, false, true) => TRAY_DARK_ACTIVE,
-            (true, false, false) => TRAY_DARK_IDLE,
-            (false, true, _) => TRAY_LIGHT_WARN,
-            (false, false, true) => TRAY_LIGHT_ACTIVE,
-            (false, false, false) => TRAY_LIGHT_IDLE,
-        };
-        Image::from_bytes(bytes).ok().map(|img| (img, false))
-    }
+    let bytes = if warn {
+        TRAY_COLOR_WARN
+    } else if active {
+        TRAY_COLOR_ACTIVE
+    } else {
+        TRAY_COLOR_IDLE
+    };
+    // Always preserve full rainbow colors (icon_as_template = false on macOS).
+    Image::from_bytes(bytes).ok().map(|img| (img, false))
 }
 
 pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {

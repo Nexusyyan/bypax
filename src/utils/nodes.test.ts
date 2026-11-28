@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import en from "../locales/en.json";
 import zhCN from "../locales/zh-CN.json";
-import type { NodeIR, SimpleRoutingRule } from "../types";
+import type { NodeIR, ProxyChain, SimpleRoutingRule } from "../types";
 import {
   buildTakeoverSummary,
   computeAvailableRegions,
@@ -11,12 +11,16 @@ import {
   formatBytes,
   formatConnectionExit,
   formatConnectionRule,
+  formatLatency,
   humanizeLogMessage,
+  latencySortKey,
   middleTruncate,
   normalizeRecoveryFaultKind,
   PROTO_BADGES,
   pushRingBuffer,
   resolveActiveRecoveryFault,
+  resolveTargetExit,
+  validateChainHops,
 } from "./nodes";
 import { latencyTier } from "../components/SignalBars";
 import { normalizeIsoCode, parseFlagText } from "../components/RegionFlag";
@@ -44,7 +48,6 @@ const SAMPLE_NODES: NodeIR[] = [
     group: "VPS",
     region: "JP",
     wgLocalAddress: [],
-    tcpingMs: 40,
     realDelayMs: 52,
     createdAt: "2026-11-25T00:00:00Z",
   },
@@ -57,7 +60,6 @@ const SAMPLE_NODES: NodeIR[] = [
     group: "Sub",
     region: "US",
     wgLocalAddress: [],
-    tcpingMs: 120,
     realDelayMs: 145,
     createdAt: "2026-11-25T00:00:00Z",
   },
@@ -70,7 +72,6 @@ const SAMPLE_NODES: NodeIR[] = [
     group: "Sub",
     region: "HK",
     wgLocalAddress: [],
-    tcpingMs: 22,
     realDelayMs: 31,
     createdAt: "2026-11-25T00:00:00Z",
   },
@@ -121,9 +122,84 @@ describe("Bypax frontend utilities, brand hygiene & i18n parity", () => {
       "Direct \u00b7 Not capturing any traffic",
     );
     expect(middleTruncate("C:\\Users\\demo\\AppData\\Local\\Cursor.exe", 26).length).toBeLessThanOrEqual(26);
-    expect(latencyTier(45, "real").bars).toBe(4);
-    expect(latencyTier(580, "real").bars).toBe(1);
-    expect(delayColorVar(45, "real")).toBe("var(--latency-fast)");
+    expect(latencyTier(45).bars).toBe(4);
+    expect(latencyTier(580).bars).toBe(1);
+    expect(latencyTier(-1)).toEqual({ bars: 0, colorVar: "var(--latency-bad)" });
+    expect(delayColorVar(45)).toBe("var(--latency-fast)");
+    expect(delayColorVar(-1)).toBe("var(--latency-bad)");
+    expect(formatLatency(null)).toBe("--");
+    expect(formatLatency(-1)).toBe("-1ms");
+    expect(formatLatency(64)).toBe("64 ms");
+  });
+
+  it("ranks failed -1ms nodes strictly last when sorting by latency and validates proxy chains", () => {
+    const mixed: NodeIR[] = [
+      { ...SAMPLE_NODES[0], id: "n-fail", remark: "Failed Node", realDelayMs: -1 },
+      { ...SAMPLE_NODES[0], id: "n-untested", remark: "Untested Node", realDelayMs: null },
+      { ...SAMPLE_NODES[0], id: "n-slow", remark: "Slow Node", realDelayMs: 280 },
+      { ...SAMPLE_NODES[0], id: "n-fast", remark: "Fast Node", realDelayMs: 42 },
+    ];
+    const sorted = filterAndSortNodes(mixed, "ALL", "", "delay");
+    expect(sorted.map((n) => n.id)).toEqual(["n-fast", "n-slow", "n-untested", "n-fail"]);
+    expect(latencySortKey(42)).toBeLessThan(latencySortKey(null));
+    expect(latencySortKey(null)).toBeLessThan(latencySortKey(-1));
+
+    const httpRelay: NodeIR = {
+      ...SAMPLE_NODES[0],
+      id: "n-http-relay",
+      protocol: "http",
+      remark: "HTTP Relay",
+    };
+    const nodeMap = new Map<string, NodeIR>([
+      ...SAMPLE_NODES.map((n) => [n.id, n] as const),
+      [httpRelay.id, httpRelay],
+    ]);
+
+    const okChain = validateChainHops(["n-hk-1", "n-us-1"], nodeMap);
+    expect(okChain.valid).toBe(true);
+    expect(okChain.httpOverUdpWarnings).toHaveLength(0);
+
+    const warnChain = validateChainHops(["n-http-relay", "n-us-1"], nodeMap);
+    expect(warnChain.valid).toBe(true);
+    expect(warnChain.httpOverUdpWarnings).toHaveLength(1);
+    expect(warnChain.httpOverUdpWarnings[0].nextProtocol).toBe("hysteria2");
+
+    const dupChain = validateChainHops(["n-hk-1", "n-hk-1"], nodeMap);
+    expect(dupChain.valid).toBe(false);
+    expect(dupChain.duplicateHopIds).toEqual(["n-hk-1"]);
+
+    const chains: ProxyChain[] = [
+      {
+        id: "c-hk-us",
+        name: "HK -> US Chain",
+        hops: ["n-hk-1", "n-us-1"],
+        enabled: true,
+        realDelayMs: 180,
+        createdAt: "2026-11-27T00:00:00Z",
+      },
+    ];
+    const resolved = resolveTargetExit(
+      "chain:c-hk-us",
+      SAMPLE_NODES,
+      "n-jp-1",
+      { direct: "Direct", reject: "Reject", noNode: "None" },
+      chains,
+    );
+    expect(resolved.kind).toBe("chain");
+    expect(resolved.label).toBe("HK -> US Chain");
+
+    // Exact region match must never confuse "DE" with substring inside "RESIDENTIAL"
+    const deRes = resolveTargetExit(
+      "auto:DE",
+      [
+        ...SAMPLE_NODES,
+        { ...SAMPLE_NODES[0], id: "n-de-1", remark: "DE-Frankfurt-01", region: "DE", realDelayMs: 320 },
+      ],
+      "n-jp-1",
+      { direct: "Direct", reject: "Reject", noNode: "None" },
+      chains,
+    );
+    expect(deRes.node?.id).toBe("n-de-1");
   });
 
   it("filters and sorts nodes by group, query, delay, and name", () => {
@@ -351,9 +427,9 @@ describe("Bypax frontend utilities, brand hygiene & i18n parity", () => {
     expect(ukFallback.cleanText).toBe("London Node");
 
     expect(normalizeIsoCode("OTHER")).toBeNull();
-    expect(delayColorVar(140, "real")).toBe("var(--latency-ok)");
-    expect(delayColorVar(280, "real")).toBe("var(--latency-slow)");
-    expect(delayColorVar(420, "tcping")).toBe("var(--latency-bad)");
+    expect(delayColorVar(140)).toBe("var(--latency-ok)");
+    expect(delayColorVar(280)).toBe("var(--latency-slow)");
+    expect(delayColorVar(550)).toBe("var(--latency-bad)");
   });
 
   it("suppresses false standby alarms and maps canonical recovery faults without unknown pipe fallback", () => {

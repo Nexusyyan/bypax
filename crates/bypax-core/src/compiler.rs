@@ -1,6 +1,7 @@
 use crate::model::{
     AppProxyRule, AppSettings, CompileOutput, DomainOverrideAction, InboundPort,
-    MissingAppTargetWarning, NodeIR, PreflightReport, Protocol, SimpleRoutingRule,
+    MissingAppTargetWarning, MissingChainWarning, NodeIR, PreflightReport, Protocol, ProxyChain,
+    SimpleRoutingRule,
 };
 use crate::rule_cache::RuleCache;
 use anyhow::{anyhow, Context, Result};
@@ -55,6 +56,7 @@ impl CompilePlatform {
 
 pub struct CompileInput<'a> {
     pub nodes: &'a [NodeIR],
+    pub chains: &'a [ProxyChain],
     pub rules: &'a [SimpleRoutingRule],
     pub app_rules: &'a [AppProxyRule],
     pub extra_ports: &'a [InboundPort],
@@ -63,6 +65,52 @@ pub struct CompileInput<'a> {
     pub cache_db_path: Option<&'a Path>,
     pub rule_cache: Option<&'a RuleCache>,
     pub platform: CompilePlatform,
+}
+
+pub fn chain_outbound_tag(chain_id: &str) -> String {
+    let clean: String = chain_id
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = clean.trim_matches('-');
+    if trimmed.is_empty() {
+        "chain-default".to_string()
+    } else {
+        format!("chain-{}", trimmed)
+    }
+}
+
+pub fn validate_chain_hops(
+    chain: &ProxyChain,
+    node_map: &HashMap<&str, &NodeIR>,
+) -> std::result::Result<(), Vec<String>> {
+    if !chain.enabled || chain.hops.is_empty() {
+        return Err(Vec::new());
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut missing: Vec<String> = Vec::new();
+    for hop in &chain.hops {
+        let trimmed = hop.trim();
+        if trimmed.is_empty() || !seen.insert(trimmed) {
+            missing.push(hop.clone());
+            continue;
+        }
+        if !node_map.contains_key(trimmed) {
+            missing.push(trimmed.to_string());
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(missing)
+    }
 }
 
 pub fn sanitize_auth_suffix(raw: &str) -> String {
@@ -90,8 +138,10 @@ pub fn sanitize_auth_suffix(raw: &str) -> String {
 pub fn build_app_proxy_target_bindings(
     app_rules: &[AppProxyRule],
     nodes: &[NodeIR],
+    chains: &[ProxyChain],
 ) -> Vec<AppProxyTargetBinding> {
-    let node_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    let node_map: HashMap<&str, &NodeIR> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let chain_map: HashMap<&str, &ProxyChain> = chains.iter().map(|c| (c.id.as_str(), c)).collect();
     let mut map: BTreeMap<String, AppProxyTargetBinding> = BTreeMap::new();
     map.insert(
         "follow".to_string(),
@@ -140,9 +190,25 @@ pub fn build_app_proxy_target_bindings(
                     local_action: None,
                 },
             );
+        } else if let Some(chain_id) = t.strip_prefix("chain:") {
+            let valid = chain_map
+                .get(chain_id)
+                .is_some_and(|c| validate_chain_hops(c, &node_map).is_ok());
+            map.insert(
+                t.to_string(),
+                AppProxyTargetBinding {
+                    target: t.to_string(),
+                    auth_user: if valid {
+                        format!("bx_chain_{}", sanitize_auth_suffix(chain_id))
+                    } else {
+                        "bx_follow".to_string()
+                    },
+                    local_action: None,
+                },
+            );
         } else {
             let clean_id = t.strip_prefix("node:").unwrap_or(t);
-            if node_ids.contains(clean_id) {
+            if node_map.contains_key(clean_id) {
                 map.insert(
                     t.to_string(),
                     AppProxyTargetBinding {
@@ -178,24 +244,66 @@ impl SingBox114Compiler {
     pub fn compile(input: &CompileInput<'_>) -> Result<CompileOutput> {
         let node_map: HashMap<&str, &NodeIR> =
             input.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+        let chain_map: HashMap<&str, &ProxyChain> =
+            input.chains.iter().map(|c| (c.id.as_str(), c)).collect();
 
-        // Pick active main node (fall back to first node if unset or deleted).
-        let main_node_id: Option<String> = input
-            .settings
-            .main_node_id
-            .as_deref()
-            .filter(|id| node_map.contains_key(id))
-            .map(|s| s.to_string())
-            .or_else(|| input.nodes.first().map(|n| n.id.clone()));
-
-        // Collect all referenced logical auto-groups and node IDs.
+        // Collect all referenced logical auto-groups, concrete node IDs, and proxy chains.
         let mut needed_autos: BTreeSet<String> = BTreeSet::new();
         let mut reachable: BTreeSet<String> = BTreeSet::new();
+        let mut reachable_chains: BTreeSet<String> = BTreeSet::new();
         let mut missing_app_rule_targets: Vec<MissingAppTargetWarning> = Vec::new();
+        let mut missing_chain_warnings: Vec<MissingChainWarning> = Vec::new();
+        let mut warned_chains: HashSet<String> = HashSet::new();
 
-        if let Some(ref main_id) = main_node_id {
-            reachable.insert(main_id.clone());
-        }
+        // Pick active main exit (supports concrete node ID or `chain:<id>`, falling back to first node).
+        let default_member: String = match input.settings.main_node_id.as_deref() {
+            Some(raw) if raw.starts_with("chain:") => {
+                let cid = raw.trim_start_matches("chain:");
+                match chain_map.get(cid) {
+                    Some(c) => match validate_chain_hops(c, &node_map) {
+                        Ok(()) => {
+                            reachable_chains.insert(c.id.clone());
+                            chain_outbound_tag(&c.id)
+                        }
+                        Err(missing) => {
+                            if !missing.is_empty() && warned_chains.insert(c.id.clone()) {
+                                missing_chain_warnings.push(MissingChainWarning {
+                                    chain_id: c.id.clone(),
+                                    chain_name: c.name.clone(),
+                                    missing_hop_ids: missing,
+                                });
+                            }
+                            if let Some(first) = input.nodes.first() {
+                                reachable.insert(first.id.clone());
+                                first.id.clone()
+                            } else {
+                                "direct".to_string()
+                            }
+                        }
+                    },
+                    None => {
+                        if let Some(first) = input.nodes.first() {
+                            reachable.insert(first.id.clone());
+                            first.id.clone()
+                        } else {
+                            "direct".to_string()
+                        }
+                    }
+                }
+            }
+            Some(id) if node_map.contains_key(id) => {
+                reachable.insert(id.to_string());
+                id.to_string()
+            }
+            _ => {
+                if let Some(first) = input.nodes.first() {
+                    reachable.insert(first.id.clone());
+                    first.id.clone()
+                } else {
+                    "direct".to_string()
+                }
+            }
+        };
 
         // Always collect targets from enabled rules, extra ports, app rules, and remote DNS detour
         // so 0ms live `clash_mode` switching between direct / global / rule works without restarting core.
@@ -203,18 +311,26 @@ impl SingBox114Compiler {
             collect_target_reachability(
                 &port.target,
                 &node_map,
+                &chain_map,
                 input.nodes,
                 &mut needed_autos,
                 &mut reachable,
+                &mut reachable_chains,
+                &mut missing_chain_warnings,
+                &mut warned_chains,
             );
         }
         for rule in input.rules.iter().filter(|r| r.enabled) {
             collect_target_reachability(
                 &rule.target,
                 &node_map,
+                &chain_map,
                 input.nodes,
                 &mut needed_autos,
                 &mut reachable,
+                &mut reachable_chains,
+                &mut missing_chain_warnings,
+                &mut warned_chains,
             );
         }
         for app_rule in input.app_rules.iter().filter(|r| r.enabled) {
@@ -226,10 +342,42 @@ impl SingBox114Compiler {
                 collect_target_reachability(
                     target,
                     &node_map,
+                    &chain_map,
                     input.nodes,
                     &mut needed_autos,
                     &mut reachable,
+                    &mut reachable_chains,
+                    &mut missing_chain_warnings,
+                    &mut warned_chains,
                 );
+            } else if let Some(cid) = target.strip_prefix("chain:") {
+                let ok = chain_map
+                    .get(cid)
+                    .map(|c| match validate_chain_hops(c, &node_map) {
+                        Ok(()) => {
+                            reachable_chains.insert(c.id.clone());
+                            true
+                        }
+                        Err(missing) => {
+                            if !missing.is_empty() && warned_chains.insert(c.id.clone()) {
+                                missing_chain_warnings.push(MissingChainWarning {
+                                    chain_id: c.id.clone(),
+                                    chain_name: c.name.clone(),
+                                    missing_hop_ids: missing,
+                                });
+                            }
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !ok {
+                    missing_app_rule_targets.push(MissingAppTargetWarning {
+                        rule_id: app_rule.id.clone(),
+                        rule_name: app_rule.name.clone(),
+                        original_target: target.to_string(),
+                        fallback_target: "follow".to_string(),
+                    });
+                }
             } else {
                 let clean_id = target.strip_prefix("node:").unwrap_or(target);
                 if node_map.contains_key(clean_id) {
@@ -247,9 +395,13 @@ impl SingBox114Compiler {
         collect_target_reachability(
             &input.settings.dns_remote_detour,
             &node_map,
+            &chain_map,
             input.nodes,
             &mut needed_autos,
             &mut reachable,
+            &mut reachable_chains,
+            &mut missing_chain_warnings,
+            &mut warned_chains,
         );
 
         // Expand chained proxy detours transitively so no dangling detour tag is produced.
@@ -309,7 +461,8 @@ impl SingBox114Compiler {
 
         let mut win_app_auth_routes: Vec<(String, String)> = Vec::new();
         if windows_app_proxy_active {
-            let bindings = build_app_proxy_target_bindings(input.app_rules, input.nodes);
+            let bindings =
+                build_app_proxy_target_bindings(input.app_rules, input.nodes, input.chains);
             let mut users: Vec<Value> = Vec::new();
             let mut seen_users: BTreeSet<String> = BTreeSet::new();
 
@@ -428,16 +581,11 @@ impl SingBox114Compiler {
         let mut synthesized_groups: Vec<String> = Vec::new();
 
         // Always synthesize `main-exit` selector so Control API hot-switch works in 0ms.
-        let main_selector_members: Vec<String> = if reachable.is_empty() {
-            vec!["direct".to_string()]
-        } else {
-            let mut list: Vec<String> = reachable.iter().cloned().collect();
-            list.push("direct".to_string());
-            list
-        };
-        let default_member = main_node_id
-            .clone()
-            .unwrap_or_else(|| "direct".to_string());
+        let mut main_selector_members: Vec<String> = reachable.iter().cloned().collect();
+        for cid in &reachable_chains {
+            main_selector_members.push(chain_outbound_tag(cid));
+        }
+        main_selector_members.push("direct".to_string());
 
         outbounds.push(json!({
             "type": "selector",
@@ -492,6 +640,45 @@ impl SingBox114Compiler {
             }
         }
 
+        // Synthesize isolated detour hop chains for every reachable ProxyChain.
+        // Traffic flows hops[0] (entry) -> ... -> hops[k-1] (landing exit tagged `chain-<id>`),
+        // so in sing-box schema hops[i] sets `detour` pointing back to hops[i-1].
+        for cid in &reachable_chains {
+            if let Some(chain) = chain_map.get(cid.as_str()) {
+                let base_tag = chain_outbound_tag(&chain.id);
+                let hop_count = chain.hops.len();
+                for (idx, hop_id) in chain.hops.iter().enumerate() {
+                    if let Some(node) = node_map.get(hop_id.as_str()) {
+                        let is_last = idx + 1 == hop_count;
+                        let hop_tag = if is_last {
+                            base_tag.clone()
+                        } else {
+                            format!("{}-hop-{}", base_tag, idx)
+                        };
+                        let prev_detour = if idx == 0 {
+                            None
+                        } else {
+                            Some(format!("{}-hop-{}", base_tag, idx - 1))
+                        };
+                        if node.protocol == Protocol::Wireguard {
+                            endpoints.push(compile_wireguard_endpoint_with_overrides(
+                                node,
+                                Some(&hop_tag),
+                                prev_detour.as_deref(),
+                            ));
+                        } else {
+                            outbounds.push(compile_proxy_outbound_with_overrides(
+                                node,
+                                Some(&hop_tag),
+                                prev_detour.as_deref(),
+                            ));
+                        }
+                    }
+                }
+                synthesized_groups.push(base_tag);
+            }
+        }
+
         // Build route rules & optional local .srs rule sets (3-tier offline fallback).
         // `clash_mode` rules sit immediately after sniff / hijack-dns / private LAN bypass so
         // PATCH /configs {"mode":"direct"|"global"|"rule"} switches live traffic in 0ms.
@@ -518,7 +705,12 @@ impl SingBox114Compiler {
         if windows_app_proxy_active {
             for (auth_user, target) in &win_app_auth_routes {
                 let clean_target = target.strip_prefix("node:").unwrap_or(target);
-                let resolved = resolve_compiled_outbound(clean_target, &auto_tag_map, &reachable);
+                let resolved = resolve_compiled_outbound(
+                    clean_target,
+                    &auto_tag_map,
+                    &reachable,
+                    &reachable_chains,
+                );
                 if resolved == "reject" {
                     route_rules.push(json!({
                         "inbound": ["app-proxy-in"],
@@ -554,13 +746,22 @@ impl SingBox114Compiler {
                     None
                 } else {
                     let stripped = clean_target.strip_prefix("node:").unwrap_or(clean_target);
+                    let valid_chain = stripped
+                        .strip_prefix("chain:")
+                        .is_some_and(|cid| reachable_chains.contains(cid));
                     if matches!(stripped, "direct" | "reject" | "main")
                         || stripped.starts_with("auto:")
+                        || valid_chain
                         || reachable.contains(stripped)
                     {
-                        Some(resolve_compiled_outbound(stripped, &auto_tag_map, &reachable))
+                        Some(resolve_compiled_outbound(
+                            stripped,
+                            &auto_tag_map,
+                            &reachable,
+                            &reachable_chains,
+                        ))
                     } else {
-                        // Missing node safely falls back to `follow`.
+                        // Missing node or broken chain safely falls back to `follow`.
                         None
                     }
                 };
@@ -645,7 +846,12 @@ impl SingBox114Compiler {
 
         // Dedicated extra port bindings take priority over generic domain rules in rule mode.
         for port in input.extra_ports.iter().filter(|p| p.enabled && p.port != input.settings.mixed_port) {
-            let resolved = resolve_compiled_outbound(&port.target, &auto_tag_map, &reachable);
+            let resolved = resolve_compiled_outbound(
+                &port.target,
+                &auto_tag_map,
+                &reachable,
+                &reachable_chains,
+            );
             if resolved == "reject" {
                 route_rules.push(json!({
                     "inbound": [port.id],
@@ -766,7 +972,12 @@ impl SingBox114Compiler {
                 logical
             };
 
-            let resolved = resolve_compiled_outbound(&rule.target, &auto_tag_map, &reachable);
+            let resolved = resolve_compiled_outbound(
+                &rule.target,
+                &auto_tag_map,
+                &reachable,
+                &reachable_chains,
+            );
             if resolved == "reject" {
                 rule_obj.insert("action".to_string(), json!("reject"));
             } else {
@@ -785,8 +996,12 @@ impl SingBox114Compiler {
             &input.settings.dns_local_server,
             None,
         );
-        let remote_detour_resolved =
-            resolve_compiled_outbound(&input.settings.dns_remote_detour, &auto_tag_map, &reachable);
+        let remote_detour_resolved = resolve_compiled_outbound(
+            &input.settings.dns_remote_detour,
+            &auto_tag_map,
+            &reachable,
+            &reachable_chains,
+        );
         let remote_detour_opt = if remote_detour_resolved == "direct"
             || remote_detour_resolved == "reject"
             || input.settings.dns_remote_detour.trim().eq_ignore_ascii_case("direct")
@@ -1101,7 +1316,15 @@ impl SingBox114Compiler {
             }
         }
 
-        let reachable_node_ids: Vec<String> = reachable.into_iter().collect();
+        let mut reachable_count_set: BTreeSet<String> = reachable.clone();
+        for cid in &reachable_chains {
+            if let Some(c) = chain_map.get(cid.as_str()) {
+                for h in &c.hops {
+                    reachable_count_set.insert(h.clone());
+                }
+            }
+        }
+        let reachable_node_ids: Vec<String> = reachable_count_set.into_iter().collect();
         Ok(CompileOutput {
             config: config_value,
             total_nodes: input.nodes.len(),
@@ -1110,6 +1333,7 @@ impl SingBox114Compiler {
             synthesized_groups,
             control_secret: input.control_secret.to_string(),
             missing_app_rule_targets,
+            missing_chain_warnings,
         })
     }
 
@@ -1162,12 +1386,17 @@ impl SingBox114Compiler {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_target_reachability(
     target: &str,
     node_map: &HashMap<&str, &NodeIR>,
+    chain_map: &HashMap<&str, &ProxyChain>,
     all_nodes: &[NodeIR],
     needed_autos: &mut BTreeSet<String>,
     reachable: &mut BTreeSet<String>,
+    reachable_chains: &mut BTreeSet<String>,
+    missing_chain_warnings: &mut Vec<MissingChainWarning>,
+    warned_chains: &mut HashSet<String>,
 ) {
     if target == "direct" || target == "reject" || target == "main" {
         return;
@@ -1176,6 +1405,25 @@ fn collect_target_reachability(
         needed_autos.insert(target.to_string());
         for id in match_auto_nodes(target, all_nodes) {
             reachable.insert(id);
+        }
+        return;
+    }
+    if let Some(cid) = target.strip_prefix("chain:") {
+        if let Some(chain) = chain_map.get(cid) {
+            match validate_chain_hops(chain, node_map) {
+                Ok(()) => {
+                    reachable_chains.insert(chain.id.clone());
+                }
+                Err(missing) => {
+                    if !missing.is_empty() && warned_chains.insert(chain.id.clone()) {
+                        missing_chain_warnings.push(MissingChainWarning {
+                            chain_id: chain.id.clone(),
+                            chain_name: chain.name.clone(),
+                            missing_hop_ids: missing,
+                        });
+                    }
+                }
+            }
         }
         return;
     }
@@ -1226,6 +1474,7 @@ fn resolve_compiled_outbound(
     target: &str,
     auto_tag_map: &HashMap<String, String>,
     reachable: &BTreeSet<String>,
+    reachable_chains: &BTreeSet<String>,
 ) -> String {
     match target {
         "direct" => "direct".to_string(),
@@ -1235,6 +1484,14 @@ fn resolve_compiled_outbound(
             .get(t)
             .cloned()
             .unwrap_or_else(|| "main-exit".to_string()),
+        t if t.starts_with("chain:") => {
+            let cid = t.trim_start_matches("chain:");
+            if reachable_chains.contains(cid) {
+                chain_outbound_tag(cid)
+            } else {
+                "main-exit".to_string()
+            }
+        }
         id if reachable.contains(id) => id.to_string(),
         _ => "main-exit".to_string(),
     }
@@ -1316,9 +1573,20 @@ fn compile_transport(node: &NodeIR) -> Option<Value> {
 }
 
 pub fn compile_proxy_outbound(node: &NodeIR) -> Value {
+    compile_proxy_outbound_with_overrides(node, None, None)
+}
+
+pub fn compile_proxy_outbound_with_overrides(
+    node: &NodeIR,
+    tag_override: Option<&str>,
+    detour_override: Option<&str>,
+) -> Value {
     let mut obj = Map::new();
     obj.insert("type".to_string(), json!(node.protocol.as_singbox_type()));
-    obj.insert("tag".to_string(), json!(node.id));
+    obj.insert(
+        "tag".to_string(),
+        json!(tag_override.unwrap_or(node.id.as_str())),
+    );
     obj.insert("server".to_string(), json!(node.server));
     obj.insert("server_port".to_string(), json!(node.port));
 
@@ -1462,7 +1730,11 @@ pub fn compile_proxy_outbound(node: &NodeIR) -> Value {
         obj.insert("transport".to_string(), tr);
     }
 
-    if let Some(ref detour) = node.detour {
+    let effective_detour = match detour_override {
+        Some(d) => Some(d),
+        None => node.detour.as_deref(),
+    };
+    if let Some(detour) = effective_detour {
         if !detour.is_empty() {
             obj.insert("detour".to_string(), json!(detour));
         }
@@ -1472,6 +1744,14 @@ pub fn compile_proxy_outbound(node: &NodeIR) -> Value {
 }
 
 pub fn compile_wireguard_endpoint(node: &NodeIR) -> Value {
+    compile_wireguard_endpoint_with_overrides(node, None, None)
+}
+
+pub fn compile_wireguard_endpoint_with_overrides(
+    node: &NodeIR,
+    tag_override: Option<&str>,
+    detour_override: Option<&str>,
+) -> Value {
     let addresses = if node.wg_local_address.is_empty() {
         vec!["10.0.0.2/32".to_string()]
     } else {
@@ -1501,7 +1781,10 @@ pub fn compile_wireguard_endpoint(node: &NodeIR) -> Value {
 
     let mut obj = Map::new();
     obj.insert("type".to_string(), json!("wireguard"));
-    obj.insert("tag".to_string(), json!(node.id));
+    obj.insert(
+        "tag".to_string(),
+        json!(tag_override.unwrap_or(node.id.as_str())),
+    );
     obj.insert("address".to_string(), json!(addresses));
     obj.insert(
         "private_key".to_string(),
@@ -1512,6 +1795,15 @@ pub fn compile_wireguard_endpoint(node: &NodeIR) -> Value {
     );
     if let Some(mtu) = node.wg_mtu {
         obj.insert("mtu".to_string(), json!(mtu));
+    }
+    let effective_detour = match detour_override {
+        Some(d) => Some(d),
+        None => node.detour.as_deref(),
+    };
+    if let Some(detour) = effective_detour {
+        if !detour.is_empty() {
+            obj.insert("detour".to_string(), json!(detour));
+        }
     }
     obj.insert("peers".to_string(), Value::Array(vec![Value::Object(peer)]));
     Value::Object(obj)

@@ -140,18 +140,10 @@ async fn execute_tool(client: &AgentClient, name: &str, args: &Value) -> Result<
             let node_id = req_str(args, "node_id")?.to_string();
             CtlRequest::SelectNode { node_id }
         }
-        "bypax_test_latency" => {
-            let kind_raw = opt_str(args, "kind").unwrap_or_else(|| "tcping".to_string());
-            let kind = if kind_raw.eq_ignore_ascii_case("real_delay") {
-                "real".to_string()
-            } else {
-                kind_raw
-            };
-            CtlRequest::TestLatency {
-                node_ids: str_vec(args, "node_ids"),
-                kind,
-            }
-        }
+        "bypax_test_latency" => CtlRequest::TestLatency {
+            node_ids: str_vec(args, "node_ids"),
+            kind: "real".to_string(),
+        },
         "bypax_refresh_subscriptions" => CtlRequest::RefreshSubscriptions {
             subscription_id: opt_str(args, "subscription_id"),
         },
@@ -461,11 +453,11 @@ pub fn tool_definitions() -> Value {
         }),
         json!({
             "name": "bypax_test_latency",
-            "description": "Runs concurrent TCPing or isolated real-delay latency tests across selected or all nodes.",
+            "description": "Runs concurrent isolated real-delay latency tests across selected or all nodes (unreachable nodes return -1ms).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "kind": { "type": "string", "enum": ["tcping", "real", "real_delay"], "default": "tcping" },
+                    "kind": { "type": "string", "enum": ["real", "real_delay"], "default": "real" },
                     "node_ids": { "type": "array", "items": { "type": "string" }, "description": "Optional list of node IDs; omit to test all nodes" }
                 }
             }

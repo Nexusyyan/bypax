@@ -17,6 +17,7 @@ export type DomainOverrideAction = "proxy" | "direct" | "reject";
 export type PlatformKind = "windows" | "macos" | "linux";
 export type NavTab =
   | "nodes"
+  | "chains"
   | "apps"
   | "routing"
   | "dns"
@@ -76,10 +77,30 @@ export interface NodeIR {
   tls?: TlsConfig;
   transport?: TransportConfig;
   detour?: string;
-  tcpingMs?: number | null;
   realDelayMs?: number | null;
   rawUri?: string;
   createdAt: string;
+}
+
+export interface ProxyChain {
+  id: string;
+  name: string;
+  hops: string[];
+  enabled: boolean;
+  realDelayMs?: number | null;
+  description?: string | null;
+  createdAt: string;
+}
+
+export interface MissingChainWarning {
+  chainId: string;
+  chainName: string;
+  missingHopIds: string[];
+}
+
+export interface ChainMutationResult {
+  chains: ProxyChain[];
+  compiled: CompileOutput;
 }
 
 export interface SubscriptionGroup {
@@ -451,6 +472,7 @@ export interface CompileOutput {
   synthesizedGroups: string[];
   controlSecret: string;
   missingAppRuleTargets?: MissingAppTargetWarning[];
+  missingChainWarnings?: MissingChainWarning[];
 }
 
 export interface PreflightReport {
@@ -469,7 +491,7 @@ export interface LatencyResult {
 }
 
 export interface LatencyProgressEvent {
-  kind: "tcping" | "real";
+  kind: "real";
   phase: "starting" | "testing" | "done";
   completed: number;
   total: number;
@@ -648,6 +670,7 @@ export interface BootstrapPayload {
   coreInfo: CoreInfo;
   settings: AppSettings;
   nodes: NodeIR[];
+  chains: ProxyChain[];
   subscriptions: SubscriptionGroup[];
   rules: SimpleRoutingRule[];
   extraPorts: InboundPort[];

@@ -1,7 +1,9 @@
 use crate::compiler::{
     match_auto_nodes, offline_srs_fallback_domains, MESH_AND_LOCAL_DOMAIN_SUFFIXES,
 };
-use crate::model::{AppSettings, NodeIR, RouteMode, RouteTestResult, SimpleRoutingRule};
+use crate::model::{
+    AppSettings, NodeIR, ProxyChain, RouteMode, RouteTestResult, SimpleRoutingRule,
+};
 use crate::rule_cache::RuleCache;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
@@ -113,9 +115,40 @@ fn domain_matches_suffix(host: &str, suffix: &str) -> bool {
     host == clean || host.ends_with(&format!(".{}", clean))
 }
 
+pub fn latency_sort_key(ms: Option<i32>) -> i32 {
+    match ms {
+        Some(v) if v > 0 => v,
+        None => i32::MAX - 1,
+        Some(_) => i32::MAX,
+    }
+}
+
+fn resolve_chain_exit(
+    chain_id: &str,
+    chains: &[ProxyChain],
+    nodes: &[NodeIR],
+) -> Option<(String, String, Option<String>, Option<String>)> {
+    let chain = chains.iter().find(|c| c.id == chain_id && c.enabled)?;
+    if chain.hops.is_empty() {
+        return None;
+    }
+    let exit_region = chain
+        .hops
+        .last()
+        .and_then(|hid| nodes.iter().find(|n| n.id == *hid))
+        .map(|n| n.region.clone());
+    Some((
+        "chain".to_string(),
+        chain.name.clone(),
+        Some(format!("chain:{}", chain.id)),
+        exit_region,
+    ))
+}
+
 fn resolve_exit(
     target: &str,
     nodes: &[NodeIR],
+    chains: &[ProxyChain],
     main_node_id: Option<&str>,
 ) -> (String, String, Option<String>, Option<String>) {
     if target == "direct" {
@@ -125,10 +158,31 @@ fn resolve_exit(
         return ("reject".to_string(), "reject".to_string(), None, None);
     }
     let main_node = main_node_id
+        .filter(|id| !id.starts_with("chain:"))
         .and_then(|id| nodes.iter().find(|n| n.id == id))
         .or_else(|| nodes.first());
 
     if target == "main" {
+        if let Some(cid) = main_node_id.and_then(|id| id.strip_prefix("chain:")) {
+            if let Some(resolved) = resolve_chain_exit(cid, chains, nodes) {
+                return resolved;
+            }
+        }
+        return match main_node {
+            Some(n) => (
+                "node".to_string(),
+                n.remark.clone(),
+                Some(n.id.clone()),
+                Some(n.region.clone()),
+            ),
+            None => ("none".to_string(), "none".to_string(), None, None),
+        };
+    }
+
+    if let Some(cid) = target.strip_prefix("chain:") {
+        if let Some(resolved) = resolve_chain_exit(cid, chains, nodes) {
+            return resolved;
+        }
         return match main_node {
             Some(n) => (
                 "node".to_string(),
@@ -152,7 +206,7 @@ fn resolve_exit(
         };
         let best = candidates
             .into_iter()
-            .min_by_key(|n| n.real_delay_ms.or(n.tcping_ms).unwrap_or(u32::MAX));
+            .min_by_key(|n| latency_sort_key(n.real_delay_ms));
         return match best {
             Some(n) => (
                 "auto".to_string(),
@@ -251,12 +305,14 @@ fn evaluate_dns_decision(
 
 /// Evaluates how Bypax's compiled sing-box v1.14+ ruleset will route and resolve a target
 /// domain, URL, or IP address (including locally cached binary `.srs` rule-set checks).
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_route_target(
     raw_input: &str,
     process_name: Option<&str>,
     settings: &AppSettings,
     rules: &[SimpleRoutingRule],
     nodes: &[NodeIR],
+    chains: &[ProxyChain],
     rule_cache: Option<&RuleCache>,
     sing_box_path: Option<&Path>,
 ) -> RouteTestResult {
@@ -282,7 +338,7 @@ pub fn evaluate_route_target(
             _ => "ip_is_private".to_string(),
         };
         let (kind, label, node_id, region) =
-            resolve_exit("direct", nodes, settings.main_node_id.as_deref());
+            resolve_exit("direct", nodes, chains, settings.main_node_id.as_deref());
         return RouteTestResult {
             input: raw_input.to_string(),
             normalized_host: normalized,
@@ -309,7 +365,7 @@ pub fn evaluate_route_target(
             .find(|s| domain_matches_suffix(&normalized, s))
         {
             let (kind, label, node_id, region) =
-                resolve_exit("direct", nodes, settings.main_node_id.as_deref());
+                resolve_exit("direct", nodes, chains, settings.main_node_id.as_deref());
             return RouteTestResult {
                 input: raw_input.to_string(),
                 normalized_host: normalized,
@@ -333,7 +389,7 @@ pub fn evaluate_route_target(
     // 2. Global / Direct clash_mode overrides rule list.
     if settings.route_mode == RouteMode::Direct {
         let (kind, label, node_id, region) =
-            resolve_exit("direct", nodes, settings.main_node_id.as_deref());
+            resolve_exit("direct", nodes, chains, settings.main_node_id.as_deref());
         return RouteTestResult {
             input: raw_input.to_string(),
             normalized_host: normalized,
@@ -355,7 +411,7 @@ pub fn evaluate_route_target(
 
     if settings.route_mode == RouteMode::Global {
         let (kind, label, node_id, region) =
-            resolve_exit("main", nodes, settings.main_node_id.as_deref());
+            resolve_exit("main", nodes, chains, settings.main_node_id.as_deref());
         return RouteTestResult {
             input: raw_input.to_string(),
             normalized_host: normalized,
@@ -453,7 +509,7 @@ pub fn evaluate_route_target(
 
         if let Some(reason) = matched_by {
             let (kind, label, node_id, region) =
-                resolve_exit(&rule.target, nodes, settings.main_node_id.as_deref());
+                resolve_exit(&rule.target, nodes, chains, settings.main_node_id.as_deref());
             return RouteTestResult {
                 input: raw_input.to_string(),
                 normalized_host: normalized,
@@ -476,7 +532,7 @@ pub fn evaluate_route_target(
 
     // 4. Fallback (`final: main-exit`).
     let (kind, label, node_id, region) =
-        resolve_exit("main", nodes, settings.main_node_id.as_deref());
+        resolve_exit("main", nodes, chains, settings.main_node_id.as_deref());
     RouteTestResult {
         input: raw_input.to_string(),
         normalized_host: normalized,

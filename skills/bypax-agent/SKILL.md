@@ -51,7 +51,7 @@ bypax-cli ctl --json core start
 bypax-cli ctl --json mode rule
 bypax-cli ctl --json node list
 bypax-cli ctl --json node select <node_id>
-bypax-cli ctl --json node test --kind tcping
+bypax-cli ctl --json node test --kind real
 bypax-cli ctl --json app list-rules
 bypax-cli ctl --json app test --process Cursor.exe --host api.openai.com --port 443
 bypax-cli ctl --json route test --target https://github.com
@@ -82,7 +82,7 @@ bypax-cli service cleanup
 | `bypax_toggle_tun` | Enables or disables Global TUN capture (`enabled: boolean`); mutually exclusive with App Proxy. |
 | `bypax_list_nodes` | Lists proxy nodes with optional `group`, `region`, and `query` filters. |
 | `bypax_select_node` | Selects the active main exit node (`node_id`), hot-switching in 0ms when live. |
-| `bypax_test_latency` | Runs batch TCPing or real-delay latency tests (`kind: "tcping" \| "real_delay"`, optional `node_ids`). |
+| `bypax_test_latency` | Runs batch real-delay latency tests (`kind: "real"`, optional `node_ids`); failed/timed-out probes persist `-1ms`. |
 | `bypax_refresh_subscriptions` | Refreshes one subscription (`subscription_id`) or all subscriptions and reloads if running. |
 
 ### Routing & Monitor (5 tools)
@@ -114,6 +114,7 @@ bypax-cli service cleanup
 - `main`: Always route through the active main exit node.
 - `auto:<region>`: Auto-select lowest latency node in a region (e.g. `auto:US`, `auto:JP`, `auto:SG`).
 - `node:<id>`: Pin to a specific node ID from `bypax_list_nodes`.
+- `chain:<id>`: Route through a saved multi-hop proxy chain.
 - `direct`: Bypass proxy locally (zero proxy core hop on Windows).
 - `reject`: Block matching traffic immediately.
 

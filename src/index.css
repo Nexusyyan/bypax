@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "./styles/tokens.css";
+@import "@xyflow/react/dist/style.css";
 
 @layer base {
   html,
@@ -731,6 +732,120 @@
       display: none;
     }
   }
+
+  /* =========================================================================
+   * Visual Wiring Canvas (@xyflow/react Studio Slate Skin)
+   * ========================================================================= */
+
+  .bypax-flow {
+    background: var(--bg-subtle);
+    --xy-background-color: var(--bg-subtle);
+    --xy-background-pattern-color: var(--border-strong);
+    --xy-edge-stroke-default: var(--border-strong);
+    --xy-edge-stroke-selected-default: var(--accent-focus);
+    --xy-connectionline-stroke-default: var(--accent-focus);
+    --xy-controls-button-background-color: var(--bg-surface);
+    --xy-controls-button-background-color-hover: var(--bg-hover);
+    --xy-controls-button-color: var(--text-secondary);
+    --xy-controls-button-color-hover: var(--text-primary);
+    --xy-controls-button-border-color: var(--border-hairline);
+    --xy-minimap-background-color: var(--bg-surface);
+    --xy-minimap-mask-background-color: var(--bg-hover);
+    --xy-node-border-radius: var(--radius-card);
+    --xy-node-boxshadow-selected: 0 0 0 1.5px var(--accent-focus);
+  }
+
+  .bypax-flow .react-flow__controls {
+    border: 1px solid var(--border-hairline);
+    border-radius: var(--radius-control);
+    overflow: hidden;
+    box-shadow: var(--shadow-sm);
+    background: var(--bg-surface);
+  }
+
+  .bypax-flow .react-flow__controls-button {
+    width: 28px;
+    height: 28px;
+    border-bottom: 1px solid var(--border-hairline);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+  }
+
+  .bypax-flow .react-flow__controls-button:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .bypax-flow .react-flow__controls-button:last-child {
+    border-bottom: none;
+  }
+
+  .bypax-flow .react-flow__controls-button svg {
+    fill: currentColor;
+    max-width: 12px;
+    max-height: 12px;
+  }
+
+  .bypax-flow .react-flow__minimap {
+    border: 1px solid var(--border-hairline);
+    border-radius: var(--radius-control);
+    background: var(--bg-surface);
+    box-shadow: var(--shadow-sm);
+  }
+
+  .bypax-flow .react-flow__attribution {
+    display: none;
+  }
+
+  .bypax-flow .react-flow__connection-path {
+    stroke: var(--accent-focus);
+    stroke-width: 2.25;
+    stroke-dasharray: 6 4;
+  }
+
+  .bypax-flow-handle {
+    width: 11px !important;
+    height: 11px !important;
+    border-radius: 9999px !important;
+    background: var(--bg-surface) !important;
+    border: 2px solid var(--border-strong) !important;
+    transition:
+      transform var(--duration-fast) var(--ease-out),
+      border-color var(--duration-fast) var(--ease-out),
+      background-color var(--duration-fast) var(--ease-out);
+  }
+
+  .bypax-flow-handle:hover,
+  .bypax-flow-handle.connectingto,
+  .bypax-flow-handle.connectingfrom {
+    transform: scale(1.25);
+    border-color: var(--accent-focus) !important;
+    background: var(--accent-focus) !important;
+  }
+
+  .bypax-flow-handle-connected {
+    border-color: var(--accent-focus) !important;
+    background: var(--bg-surface) !important;
+  }
+
+  .bypax-flow-handle-success {
+    border-color: var(--success-dot) !important;
+  }
+
+  .bypax-flow-handle-danger {
+    border-color: var(--danger-dot) !important;
+  }
+
+  .flow-edge-animated {
+    stroke-dasharray: 7 5;
+    animation: flow-dash-march 0.9s linear infinite;
+  }
+}
+
+@keyframes flow-dash-march {
+  to {
+    stroke-dashoffset: -24;
+  }
 }
 
 @keyframes telemetry-sweep {
@@ -807,7 +922,8 @@
   .telemetry-radar,
   .boot-indeterminate,
   .signal-beacon-ring,
-  .signal-beacon-core {
+  .signal-beacon-core,
+  .flow-edge-animated {
     animation: none !important;
   }
   .signal-beacon-ring {

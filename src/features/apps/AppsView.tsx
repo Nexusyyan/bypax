@@ -18,6 +18,7 @@ import {
   Plus,
   ShieldAlert,
   Trash2,
+  Waypoints,
   X,
 } from "lucide-react";
 import { CustomSelect, type SelectGroup } from "../../components/CustomSelect";
@@ -40,9 +41,14 @@ import type {
   PlatformKind,
   PrivilegedServiceStatus,
   ProcessInfoDto,
+  ProxyChain,
   ServiceActionKind,
 } from "../../types";
-import { computeAvailableRegions, resolveActiveRecoveryFault } from "../../utils/nodes";
+import {
+  computeAvailableRegions,
+  formatLatency,
+  resolveActiveRecoveryFault,
+} from "../../utils/nodes";
 import { DryRunDrawer } from "./DryRunDrawer";
 import { ProcessPickerModal } from "./ProcessPickerModal";
 
@@ -52,6 +58,7 @@ interface AppsViewProps {
   captureMode: CaptureMode;
   captureSwitching: boolean;
   nodes: NodeIR[];
+  chains: ProxyChain[];
   mainNodeId?: string | null;
   appRules: AppProxyRule[];
   appPresets: AppPresetStatus[];
@@ -142,6 +149,7 @@ export function AppsView({
   captureMode,
   captureSwitching,
   nodes,
+  chains,
   mainNodeId,
   appRules,
   appPresets,
@@ -304,29 +312,48 @@ export function AppsView({
     };
 
     const groups: SelectGroup[] = [primaryGroup, autoGroup];
+    if (chains.length > 0) {
+      groups.push({
+        label: dict.apps.targetChain,
+        options: chains.map((c) => ({
+          value: `chain:${c.id}`,
+          label: c.name,
+          meta:
+            c.realDelayMs != null
+              ? `${c.hops.length}H \u00b7 ${formatLatency(c.realDelayMs)}`
+              : `${c.hops.length}H`,
+          icon: <Waypoints className="h-3 w-3 shrink-0 text-[var(--accent-focus)]" strokeWidth={1.6} />,
+        })),
+      });
+    }
     if (nodes.length > 0) {
       groups.push({
         label: dict.apps.targetNode,
         options: nodes.map((n) => {
           const parsed = parseFlagText(n.remark, n.region);
-          const ms = n.realDelayMs ?? n.tcpingMs;
           return {
             value: `node:${n.id}`,
             label: parsed.cleanText,
-            meta: ms != null ? `${ms} ms` : undefined,
+            meta: n.realDelayMs != null ? formatLatency(n.realDelayMs) : undefined,
             icon: parsed.isoCode ? <RegionFlag code={parsed.isoCode} size="xs" /> : undefined,
           };
         }),
       });
     }
     return groups;
-  }, [availableRegions, dict, mainNode, nodes, regionNames]);
+  }, [availableRegions, chains, dict, mainNode, nodes, regionNames]);
 
   const resolvePresetTargetHint = (target: string): string | null => {
     if (target === "direct" || target === "reject") return null;
     if (target === "follow" || target === "main") {
+      if (mainNodeId?.startsWith("chain:")) {
+        return chains.find((c) => c.id === mainNodeId.slice(6))?.name ?? null;
+      }
       if (!mainNode) return null;
       return parseFlagText(mainNode.remark, mainNode.region).cleanText;
+    }
+    if (target.startsWith("chain:")) {
+      return chains.find((c) => c.id === target.slice(6))?.name ?? null;
     }
     if (target === "auto:ALL") {
       return mainNode ? parseFlagText(mainNode.remark, mainNode.region).cleanText : null;

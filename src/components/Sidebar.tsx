@@ -10,10 +10,11 @@ import {
   Settings,
   ShieldCheck,
   Square,
+  Waypoints,
 } from "lucide-react";
 import type { Dict } from "../i18n";
-import type { CoreInfo, NavTab, NodeIR } from "../types";
-import { delayColorVar, PROTO_BADGES } from "../utils/nodes";
+import type { CoreInfo, NavTab, NodeIR, ProxyChain } from "../types";
+import { delayColorVar, formatLatency, PROTO_BADGES } from "../utils/nodes";
 import { NodeLabel } from "./RegionFlag";
 import { SignalBars } from "./SignalBars";
 
@@ -22,6 +23,7 @@ interface SidebarProps {
   activeTab: NavTab;
   onSelectTab: (tab: NavTab) => void;
   nodeCount: number;
+  chainCount: number;
   enabledAppCount: number;
   hasRecoveryFault: boolean;
   activeRuleCount: number;
@@ -30,6 +32,7 @@ interface SidebarProps {
   hasAppUpdate: boolean;
   takeoverSummary: string;
   mainNode: NodeIR | null;
+  mainChain: ProxyChain | null;
   mainNodeTesting: boolean;
   onRetestMainNode: () => void;
   mixedPort: number;
@@ -60,6 +63,7 @@ export function Sidebar({
   activeTab,
   onSelectTab,
   nodeCount,
+  chainCount,
   enabledAppCount,
   hasRecoveryFault,
   activeRuleCount,
@@ -68,6 +72,7 @@ export function Sidebar({
   hasAppUpdate,
   takeoverSummary,
   mainNode,
+  mainChain,
   mainNodeTesting,
   onRetestMainNode,
   mixedPort,
@@ -86,6 +91,7 @@ export function Sidebar({
   const navGroups: NavItemDef[][] = [
     [
       { id: "nodes", label: dict.nav.nodes, icon: Server, badge: String(nodeCount) },
+      { id: "chains", label: dict.nav.chains, icon: Waypoints, badge: String(chainCount) },
       {
         id: "apps",
         label: dict.nav.apps,
@@ -134,12 +140,17 @@ export function Sidebar({
     ],
   ];
 
-  const delay = mainNode ? (mainNode.realDelayMs ?? mainNode.tcpingMs ?? null) : null;
-  const delayKind = mainNode?.realDelayMs != null ? "real" : "tcping";
+  const hasActiveExit = Boolean(mainChain || mainNode);
+  const activeExitName = mainChain ? mainChain.name : mainNode ? mainNode.remark : "";
+  const delay = mainChain
+    ? mainChain.realDelayMs ?? null
+    : mainNode
+      ? mainNode.realDelayMs ?? null
+      : null;
   const beaconColorVar = mainNodeTesting
     ? "var(--accent-focus)"
     : delay != null
-      ? delayColorVar(delay, delayKind)
+      ? delayColorVar(delay)
       : coreInfo.running
         ? "var(--danger-dot)"
         : "var(--text-tertiary)";
@@ -228,15 +239,15 @@ export function Sidebar({
       {/* Bottom Active Exit & One-Line Takeover Summary Card */}
       {isRail ? (
         <div className="flex flex-col items-center gap-2 border-t border-[var(--border-hairline)] pt-2.5">
-          {mainNode ? (
+          {hasActiveExit ? (
             <button
               type="button"
               disabled={mainNodeTesting}
               onClick={onRetestMainNode}
               title={
                 delay != null
-                  ? `${mainNode.remark} (${delay} ms) - ${retestTitle}`
-                  : `${mainNode.remark} - ${retestTitle}`
+                  ? `${activeExitName} (${formatLatency(delay)}) - ${retestTitle}`
+                  : `${activeExitName} - ${retestTitle}`
               }
               aria-label={retestTitle}
               className="flex h-7 w-7 items-center justify-center rounded-full transition-colors hover:bg-[var(--bg-hover)] cursor-pointer disabled:cursor-wait"
@@ -295,9 +306,17 @@ export function Sidebar({
 
           <div
             className="flex min-w-0 text-[12.5px] font-semibold text-[var(--text-primary)]"
-            title={mainNode ? mainNode.remark : dict.nav.noNodeSelected}
+            title={hasActiveExit ? activeExitName : dict.nav.noNodeSelected}
           >
-            {mainNode ? (
+            {mainChain ? (
+              <span className="flex min-w-0 items-center gap-1.5">
+                <Waypoints
+                  className="h-3.5 w-3.5 shrink-0 text-[var(--accent-focus)]"
+                  strokeWidth={1.6}
+                />
+                <span className="truncate">{mainChain.name}</span>
+              </span>
+            ) : mainNode ? (
               <NodeLabel
                 remark={mainNode.remark}
                 region={mainNode.region}
@@ -311,10 +330,14 @@ export function Sidebar({
             )}
           </div>
 
-          {mainNode && (
+          {hasActiveExit && (
             <div className="flex items-center justify-between text-[11px]">
               <span className="rounded-[6px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-1.5 py-0.5 font-mono text-[var(--text-secondary)]">
-                {PROTO_BADGES[mainNode.protocol]}
+                {mainChain
+                  ? `${mainChain.hops.length}H`
+                  : mainNode
+                    ? PROTO_BADGES[mainNode.protocol]
+                    : ""}
               </span>
               <button
                 type="button"
@@ -332,16 +355,16 @@ export function Sidebar({
                   <span className="signal-beacon-ring" />
                   <span className="signal-beacon-core" />
                 </span>
-                <SignalBars ms={delay} kind={delayKind} />
+                <SignalBars ms={delay} />
                 <span
                   className="font-mono font-medium num-tabular"
                   style={{
                     color: mainNodeTesting
                       ? "var(--text-secondary)"
-                      : delayColorVar(delay, delayKind),
+                      : delayColorVar(delay),
                   }}
                 >
-                  {mainNodeTesting ? "..." : delay != null ? `${delay} ms` : "--"}
+                  {mainNodeTesting ? "..." : formatLatency(delay)}
                 </span>
               </button>
             </div>

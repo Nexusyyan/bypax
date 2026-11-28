@@ -1,15 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowRight, Check, Plus, Trash2 } from "lucide-react";
+import { ArrowRight, Check, Plus, Trash2, Waypoints } from "lucide-react";
 import { CustomSelect, type SelectGroup } from "../../components/CustomSelect";
 import { RegionFlag, parseFlagText } from "../../components/RegionFlag";
 import type { Dict } from "../../i18n";
-import type { AppSettings, DnsHostEntry, DnsRuleItem, NodeIR } from "../../types";
+import type { AppSettings, DnsHostEntry, DnsRuleItem, NodeIR, ProxyChain } from "../../types";
 import { computeAvailableRegions } from "../../utils/nodes";
 
 interface DnsViewProps {
   dict: Dict;
   settings: AppSettings;
   nodes: NodeIR[];
+  chains: ProxyChain[];
   onUpdateSettings: (next: AppSettings) => void;
 }
 
@@ -45,7 +46,7 @@ function detectDnsProtocol(spec: string): string {
   return "UDP";
 }
 
-export function DnsView({ dict, settings, nodes, onUpdateSettings }: DnsViewProps) {
+export function DnsView({ dict, settings, nodes, chains, onUpdateSettings }: DnsViewProps) {
   const [savedTick, setSavedTick] = useState(false);
 
   const [localDraft, setLocalDraft] = useState(settings.dnsLocalServer);
@@ -121,6 +122,17 @@ export function DnsView({ dict, settings, nodes, onUpdateSettings }: DnsViewProp
       });
       groups.push({ label: dict.routing.optAutoGroup, options: autoOpts });
     }
+    if (chains.length > 0) {
+      groups.push({
+        label: dict.routing.optChainsGroup,
+        options: chains.map((c) => ({
+          value: `chain:${c.id}`,
+          label: c.name,
+          meta: `${c.hops.length}H`,
+          icon: <Waypoints className="h-3 w-3 shrink-0 text-[var(--accent-focus)]" strokeWidth={1.6} />,
+        })),
+      });
+    }
     if (nodes.length > 0) {
       groups.push({
         label: dict.routing.optNodesGroup,
@@ -135,7 +147,7 @@ export function DnsView({ dict, settings, nodes, onUpdateSettings }: DnsViewProp
       });
     }
     return groups;
-  }, [availableRegions, nodes, dict, regionNames]);
+  }, [availableRegions, chains, nodes, dict, regionNames]);
 
   const dnsRuleServerGroups: SelectGroup[] = useMemo(() => {
     const opts = [

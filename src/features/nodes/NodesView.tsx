@@ -12,7 +12,6 @@ import {
   RefreshCw,
   Search,
   Trash2,
-  Wifi,
   X,
 } from "lucide-react";
 import { BrandLogo } from "../../components/BrandLogo";
@@ -29,6 +28,7 @@ import type {
 import {
   delayColorVar,
   filterAndSortNodes,
+  formatLatency,
   middleTruncate,
   PROTO_BADGES,
   resolveTargetExit,
@@ -43,7 +43,7 @@ interface NodesViewProps {
   subscriptions: SubscriptionGroup[];
   rules: SimpleRoutingRule[];
   mainNodeId?: string | null;
-  testingKind: "tcping" | "real" | null;
+  testingLatency: boolean;
   testProgress: LatencyProgressEvent | null;
   testAvgMs?: number | null;
   downloadingCore: boolean;
@@ -53,7 +53,7 @@ interface NodesViewProps {
   onSelectMainNode: (id: string) => void;
   onDeleteNode: (id: string) => void;
   onCopyText: (text: string) => void;
-  onRunBatchTest: (kind: "tcping" | "real", nodeIds: string[]) => void;
+  onRunRealDelayTest: (nodeIds: string[]) => void;
   onImportPayload: (payload: string, groupName: string) => Promise<void>;
   onImportSubscription: (name: string, url: string) => Promise<void>;
   onRefreshSubscription: (id: string) => Promise<void>;
@@ -71,7 +71,7 @@ export function NodesView({
   subscriptions,
   rules,
   mainNodeId,
-  testingKind,
+  testingLatency,
   testProgress,
   testAvgMs,
   downloadingCore,
@@ -81,7 +81,7 @@ export function NodesView({
   onSelectMainNode,
   onDeleteNode,
   onCopyText,
-  onRunBatchTest,
+  onRunRealDelayTest,
   onImportPayload,
   onImportSubscription,
   onRefreshSubscription,
@@ -256,13 +256,11 @@ export function NodesView({
   const progressDone = testProgress?.completed ?? 0;
   const progressPct =
     progressTotal > 0 ? Math.min(100, Math.round((progressDone / progressTotal) * 100)) : 0;
-  const isStartingPhase = testingKind === "real" && testProgress?.phase === "starting";
+  const isStartingPhase = testingLatency && testProgress?.phase === "starting";
   const modeTag =
-    testingKind === "tcping"
-      ? dict.nodes.testingTcpingTag
-      : testProgress?.stripHandshake === false
-        ? dict.nodes.testingColdTag
-        : dict.nodes.testingUnifiedTag;
+    testProgress?.stripHandshake === false
+      ? dict.nodes.testingColdTag
+      : dict.nodes.testingUnifiedTag;
   const latestNode = useMemo(() => {
     const id = testProgress?.latest?.nodeId;
     if (!id) return null;
@@ -281,28 +279,8 @@ export function NodesView({
         <div className="flex flex-wrap items-center gap-1.5">
           <button
             type="button"
-            disabled={testingKind !== null || visibleNodes.length === 0}
-            onClick={() =>
-              onRunBatchTest(
-                "tcping",
-                visibleNodes.map((n) => n.id),
-              )
-            }
-            className="ui-btn-secondary h-8"
-          >
-            <Wifi className="h-3.5 w-3.5 text-[var(--text-secondary)]" strokeWidth={1.5} />
-            {dict.nodes.tcping}
-          </button>
-
-          <button
-            type="button"
-            disabled={testingKind !== null || visibleNodes.length === 0}
-            onClick={() =>
-              onRunBatchTest(
-                "real",
-                visibleNodes.map((n) => n.id),
-              )
-            }
+            disabled={testingLatency || visibleNodes.length === 0}
+            onClick={() => onRunRealDelayTest(visibleNodes.map((n) => n.id))}
             className={nodes.length === 0 ? "ui-btn-secondary h-8" : "ui-btn-primary h-8"}
           >
             <Gauge
@@ -425,7 +403,7 @@ export function NodesView({
       )}
 
       {/* Precision Telemetry Progress HUD */}
-      {testingKind && (
+      {testingLatency && (
         <div className="telemetry-panel shrink-0 space-y-2 border-b border-[var(--border-hairline)] px-4 py-3 text-[12px] lg:px-5">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex min-w-0 items-center gap-2">
@@ -434,11 +412,7 @@ export function NodesView({
                 style={{ backgroundColor: "var(--success-dot)" }}
               />
               <span className="font-medium text-[var(--text-primary)]">
-                {isStartingPhase
-                  ? dict.nodes.testingStarting
-                  : testingKind === "real"
-                    ? dict.nodes.testingReal
-                    : dict.nodes.testingTcping}
+                {isStartingPhase ? dict.nodes.testingStarting : dict.nodes.testingReal}
               </span>
               <span className="rounded-[6px] border border-[var(--border-strong)] bg-[var(--bg-surface)] px-1.5 py-0.5 font-mono text-[11.5px] font-semibold tracking-wider text-[var(--text-primary)]">
                 {modeTag}
@@ -487,12 +461,14 @@ export function NodesView({
                     className="shrink-0 font-medium"
                     style={{
                       color:
-                        latestDelayMs != null
-                          ? delayColorVar(latestDelayMs, testingKind)
+                        latestDelayMs != null && latestDelayMs > 0
+                          ? delayColorVar(latestDelayMs)
                           : "var(--danger-text)",
                     }}
                   >
-                    {latestDelayMs != null ? `${latestDelayMs} ms` : dict.nodes.testingTimeout}
+                    {latestDelayMs != null && latestDelayMs > 0
+                      ? `${latestDelayMs} ms`
+                      : "-1ms"}
                   </span>
                 </>
               ) : (
@@ -574,8 +550,7 @@ export function NodesView({
                 const isMain = n.id === mainNodeId;
                 const isContextTarget = contextMenu?.node.id === n.id;
                 const tags = ruleUsageMap.get(n.id) ?? [];
-                const displayMs = n.realDelayMs ?? n.tcpingMs ?? null;
-                const delayKind = n.realDelayMs != null ? "real" : "tcping";
+                const displayMs = n.realDelayMs ?? null;
                 const addrText = `${n.server}:${n.port}`;
 
                 return (
@@ -700,18 +675,18 @@ export function NodesView({
                       )}
                     </div>
 
-                    {/* P1: Dual-Encoded Latency (SignalBars + ms) */}
+                    {/* P1: Dual-Encoded Latency (SignalBars + ms, -1ms on failure) */}
                     <div
                       className="relative flex items-center justify-end gap-1.5 font-mono text-[12px] font-medium num-tabular"
                       title={
-                        n.tcpingMs != null || n.realDelayMs != null
-                          ? `TCPing: ${n.tcpingMs ?? "--"} ms | Real: ${n.realDelayMs ?? "--"} ms`
+                        displayMs != null
+                          ? `${dict.nodes.colReal}: ${formatLatency(displayMs)}`
                           : undefined
                       }
                     >
-                      <SignalBars ms={displayMs} kind={delayKind} />
-                      <span style={{ color: delayColorVar(displayMs, delayKind) }}>
-                        {displayMs != null ? `${displayMs} ms` : "--"}
+                      <SignalBars ms={displayMs} />
+                      <span style={{ color: delayColorVar(displayMs) }}>
+                        {formatLatency(displayMs)}
                       </span>
 
                       {/* Narrow < 760px Hover-Overlay Actions over Latency cell */}
@@ -860,23 +835,9 @@ export function NodesView({
           <button
             type="button"
             role="menuitem"
-            disabled={testingKind !== null}
+            disabled={testingLatency}
             onClick={() => {
-              onRunBatchTest("tcping", [contextMenu.node.id]);
-              setContextMenu(null);
-            }}
-            className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed"
-          >
-            <Wifi className="h-3.5 w-3.5 shrink-0 text-[var(--text-secondary)]" strokeWidth={1.5} />
-            <span>{dict.nodes.ctxTcping}</span>
-          </button>
-
-          <button
-            type="button"
-            role="menuitem"
-            disabled={testingKind !== null}
-            onClick={() => {
-              onRunBatchTest("real", [contextMenu.node.id]);
+              onRunRealDelayTest([contextMenu.node.id]);
               setContextMenu(null);
             }}
             className="flex w-full items-center gap-2 whitespace-nowrap rounded-[8px] px-2.5 py-1.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed"

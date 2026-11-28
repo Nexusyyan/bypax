@@ -2,15 +2,16 @@ use anyhow::Result;
 use bypax_core::compiler::{CompileInput, CompilePlatform, SingBox114Compiler};
 use bypax_core::control::ControlClient;
 use bypax_core::model::{
-    AppProxyRule, AppSettings, DomainOverride, DomainOverrideAction, InboundPort, NetworkSnapshot,
-    NodeIR, Protocol, RouteMode, SimpleRoutingRule, TlsConfig, TransportConfig,
+    AppProxyRule, AppSettings, DomainOverride, DomainOverrideAction, InboundPort, LatencyResult,
+    NetworkSnapshot, NodeIR, Protocol, ProxyChain, RouteMode, SimpleRoutingRule, TlsConfig,
+    TransportConfig,
 };
 use bypax_core::netguard::{NetGuard, SystemNetworkAdapter};
 use bypax_core::parser::parse_payload;
 use bypax_core::rule_cache::RuleCache;
 use bypax_core::storage::{default_simple_rules, DataPaths, Store};
 use bypax_core::supervisor::{CoreSupervisor, LogRing};
-use bypax_core::tester::{batch_real_delay, batch_tcping};
+use bypax_core::tester::batch_real_delay;
 use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -310,6 +311,7 @@ fn test_tree_shaking_2000_nodes_and_dynamic_matcher() {
 
     let compiled = SingBox114Compiler::compile(&CompileInput {
         nodes: &nodes,
+        chains: &[],
         rules: &rules,
         app_rules: &[],
         extra_ports: &[],
@@ -329,6 +331,7 @@ fn test_tree_shaking_2000_nodes_and_dynamic_matcher() {
     nodes[1].remark = "US-NewName-SJ".to_string();
     let recompiled = SingBox114Compiler::compile(&CompileInput {
         nodes: &nodes,
+        chains: &[],
         rules: &[SimpleRoutingRule {
             target: "auto:regex:NewName".to_string(),
             ..rules[0].clone()
@@ -360,6 +363,7 @@ fn test_windows_app_proxy_single_port_auth_user_and_missing_node_fallback() {
 
     let compiled = SingBox114Compiler::compile(&CompileInput {
         nodes: &nodes,
+        chains: &[],
         rules: &rules,
         app_rules: &app_rules,
         extra_ports: &[],
@@ -439,6 +443,7 @@ fn test_macos_utun_app_proxy_nested_invert_gate_and_preflight() {
 
     let compiled = SingBox114Compiler::compile(&CompileInput {
         nodes: &nodes,
+        chains: &[],
         rules: &rules,
         app_rules: &app_rules,
         extra_ports: &[],
@@ -750,16 +755,6 @@ async fn test_srs_offline_graceful_degradation() {
     assert!(!status.cached_locally);
 }
 
-#[tokio::test]
-async fn test_tcping_against_local_listener() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().unwrap().port();
-    let node = NodeIR::new("n-local", Protocol::Vless, "Local", "127.0.0.1", port, "Test");
-    let results = batch_tcping(&[node], 1500, 4).await;
-    assert_eq!(results.len(), 1);
-    assert!(results[0].delay_ms.is_some());
-}
-
 #[test]
 fn test_singbox_v114_all_8_protocols_strict_check() {
     let Some(sb) = find_test_singbox() else {
@@ -798,6 +793,7 @@ fn test_singbox_v114_all_8_protocols_strict_check() {
         };
         let compiled = SingBox114Compiler::compile(&CompileInput {
             nodes: &nodes,
+            chains: &[],
             rules: &rules,
             app_rules: &[],
             extra_ports: &extra_ports,
@@ -872,6 +868,7 @@ async fn test_real_singbox_multiport_hotswitch_and_bad_config_rollback() {
     let cache_db = tmp.path().join("cache.db");
     let compiled = SingBox114Compiler::compile(&CompileInput {
         nodes: &nodes,
+        chains: &[],
         rules: &rules,
         app_rules: &[],
         extra_ports: &extra_ports,
@@ -1036,6 +1033,7 @@ fn test_route_eval_history_platform_and_extended_dns_v114_check() {
         &settings,
         &rules,
         &nodes,
+        &[],
         None,
         None,
     );
@@ -1048,6 +1046,7 @@ fn test_route_eval_history_platform_and_extended_dns_v114_check() {
         &settings,
         &rules,
         &nodes,
+        &[],
         None,
         None,
     );
@@ -1061,6 +1060,7 @@ fn test_route_eval_history_platform_and_extended_dns_v114_check() {
         &settings,
         &rules,
         &nodes,
+        &[],
         None,
         None,
     );
@@ -1068,7 +1068,7 @@ fn test_route_eval_history_platform_and_extended_dns_v114_check() {
     assert_eq!(res_lan.target, "direct");
 
     let res_host =
-        evaluate_route_target("nas.internal", None, &settings, &rules, &nodes, None, None);
+        evaluate_route_target("nas.internal", None, &settings, &rules, &nodes, &[], None, None);
     assert_eq!(res_host.dns_server, "dns-hosts");
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1118,6 +1118,7 @@ fn test_route_eval_history_platform_and_extended_dns_v114_check() {
     if let Some(sb) = find_test_singbox() {
         let compiled = SingBox114Compiler::compile(&CompileInput {
             nodes: &nodes,
+            chains: &[],
             rules: &rules,
             app_rules: &[],
             extra_ports: &[],
@@ -1206,6 +1207,7 @@ async fn test_unified_rtt_strips_first_handshake_overhead() {
     let cold = batch_real_delay_with_progress(
         &sb,
         std::slice::from_ref(&node),
+        std::slice::from_ref(&node),
         test_url,
         3000,
         2,
@@ -1221,6 +1223,7 @@ async fn test_unified_rtt_strips_first_handshake_overhead() {
 
     let unified = batch_real_delay_with_progress(
         &sb,
+        std::slice::from_ref(&node),
         std::slice::from_ref(&node),
         test_url,
         3000,
@@ -1584,6 +1587,7 @@ proxies:
         rules[0].target = "auto:ALL".to_string();
         let compiled = SingBox114Compiler::compile(&CompileInput {
             nodes: &all_hy2,
+            chains: &[],
             rules: &rules,
             app_rules: &[],
             extra_ports: &[],
@@ -1678,6 +1682,7 @@ fn test_cgnat_mesh_vpn_bypass_compiler_dns_and_rule_set_mirrors() {
 
     let compiled = SingBox114Compiler::compile(&CompileInput {
         nodes: &nodes,
+        chains: &[],
         rules: &rules,
         app_rules: &[],
         extra_ports: &[],
@@ -1754,6 +1759,7 @@ fn test_cgnat_mesh_vpn_bypass_compiler_dns_and_rule_set_mirrors() {
         &settings,
         &rules,
         &nodes,
+        &[],
         None,
         None,
     );
@@ -1769,6 +1775,7 @@ fn test_cgnat_mesh_vpn_bypass_compiler_dns_and_rule_set_mirrors() {
         &global_settings,
         &rules,
         &nodes,
+        &[],
         None,
         None,
     );
@@ -1780,6 +1787,7 @@ fn test_cgnat_mesh_vpn_bypass_compiler_dns_and_rule_set_mirrors() {
     if let Some(sb) = find_test_singbox() {
         let compiled_real = SingBox114Compiler::compile(&CompileInput {
             nodes: &nodes,
+            chains: &[],
             rules: &rules,
             app_rules: &[],
             extra_ports: &[],
@@ -1835,6 +1843,7 @@ fn test_tun_route_exclude_subtracts_tun_subnet_and_fakeip_pool() {
 
     let compiled = SingBox114Compiler::compile(&CompileInput {
         nodes: std::slice::from_ref(&node),
+        chains: &[],
         rules: &[],
         app_rules: &[],
         extra_ports: &[],
@@ -1904,4 +1913,267 @@ fn test_tun_route_exclude_subtracts_tun_subnet_and_fakeip_pool() {
             report.stderr
         );
     }
+}
+
+#[test]
+fn test_proxy_chains_compilation_wireguard_tree_shaking_and_fallback() {
+    use bypax_core::route_eval::{evaluate_route_target, latency_sort_key};
+
+    let nodes = build_all_8_protocol_nodes();
+    let chains = vec![
+        // 3-hop chain ending with WireGuard endpoint -> emitted into `endpoints[]` with detour!
+        ProxyChain {
+            id: "c-hk-jp-wg".to_string(),
+            name: "HK -> JP -> DE WG".to_string(),
+            hops: vec![
+                "n-ss".to_string(),
+                "n-vless".to_string(),
+                "n-wg".to_string(),
+            ],
+            enabled: true,
+            real_delay_ms: Some(142),
+            description: None,
+            created_at: "2026-11-27T00:00:00Z".to_string(),
+        },
+        // Unused 2-hop chain must be tree-shaken out of compiled outbounds.
+        ProxyChain {
+            id: "c-unused".to_string(),
+            name: "Unused Chain".to_string(),
+            hops: vec!["n-vmess".to_string(), "n-trojan".to_string()],
+            enabled: true,
+            real_delay_ms: None,
+            description: None,
+            created_at: "2026-11-27T00:00:00Z".to_string(),
+        },
+        // Broken chain referencing a deleted hop node must emit a warning and fall back cleanly.
+        ProxyChain {
+            id: "c-broken".to_string(),
+            name: "Broken Chain".to_string(),
+            hops: vec!["n-ss".to_string(), "n-deleted-hop".to_string()],
+            enabled: true,
+            real_delay_ms: Some(-1),
+            description: None,
+            created_at: "2026-11-27T00:00:00Z".to_string(),
+        },
+    ];
+
+    let rules = vec![
+        SimpleRoutingRule {
+            id: "r-ai".to_string(),
+            title: "AI".to_string(),
+            title_en: "AI".to_string(),
+            description: "OpenAI".to_string(),
+            patterns: vec!["openai.com".to_string()],
+            domain_keywords: Vec::new(),
+            ip_cidrs: Vec::new(),
+            process_names: Vec::new(),
+            rule_set: None,
+            target: "chain:c-hk-jp-wg".to_string(),
+            enabled: true,
+            priority: 1,
+        },
+        SimpleRoutingRule {
+            id: "r-broken".to_string(),
+            title: "Broken".to_string(),
+            title_en: "Broken".to_string(),
+            description: "Fallback check".to_string(),
+            patterns: vec!["broken.example".to_string()],
+            domain_keywords: Vec::new(),
+            ip_cidrs: Vec::new(),
+            process_names: Vec::new(),
+            rule_set: None,
+            target: "chain:c-broken".to_string(),
+            enabled: true,
+            priority: 2,
+        },
+    ];
+
+    let settings = AppSettings {
+        main_node_id: Some("n-hy2".to_string()),
+        ..Default::default()
+    };
+
+    let compiled = SingBox114Compiler::compile(&CompileInput {
+        nodes: &nodes,
+        chains: &chains,
+        rules: &rules,
+        app_rules: &[],
+        extra_ports: &[],
+        settings: &settings,
+        control_secret: "chain-secret",
+        cache_db_path: None,
+        rule_cache: None,
+        platform: CompilePlatform::Windows,
+    })
+    .expect("compile chains");
+
+    // 1. Outbounds contain hop-0 (ss, no detour) and hop-1 (vless, detour -> hop-0).
+    let outbounds = compiled.config["outbounds"].as_array().unwrap();
+    let hop0 = outbounds
+        .iter()
+        .find(|o| o["tag"] == "chain-c-hk-jp-wg-hop-0")
+        .expect("hop-0 outbound must exist");
+    assert_eq!(hop0["type"], "shadowsocks");
+    assert!(hop0.get("detour").is_none());
+
+    let hop1 = outbounds
+        .iter()
+        .find(|o| o["tag"] == "chain-c-hk-jp-wg-hop-1")
+        .expect("hop-1 outbound must exist");
+    assert_eq!(hop1["type"], "vless");
+    assert_eq!(hop1["detour"], "chain-c-hk-jp-wg-hop-0");
+
+    // 2. Final WireGuard hop is emitted into `endpoints[]` with detour -> hop-1.
+    let endpoints = compiled.config["endpoints"]
+        .as_array()
+        .expect("endpoints array must exist for WireGuard chain exit");
+    let wg_exit = endpoints
+        .iter()
+        .find(|e| e["tag"] == "chain-c-hk-jp-wg")
+        .expect("WireGuard chain exit endpoint must exist");
+    assert_eq!(wg_exit["type"], "wireguard");
+    assert_eq!(wg_exit["detour"], "chain-c-hk-jp-wg-hop-1");
+
+    // 3. Unused chain must be tree-shaken out completely.
+    assert!(!outbounds
+        .iter()
+        .any(|o| o["tag"].as_str().unwrap_or("").contains("c-unused")));
+
+    // 4. Broken chain triggers a structured warning and its rule falls back to main-exit.
+    assert_eq!(compiled.missing_chain_warnings.len(), 1);
+    assert_eq!(compiled.missing_chain_warnings[0].chain_id, "c-broken");
+    assert_eq!(
+        compiled.missing_chain_warnings[0].missing_hop_ids,
+        vec!["n-deleted-hop".to_string()]
+    );
+    let route_rules = compiled.config["route"]["rules"].as_array().unwrap();
+    assert!(route_rules.iter().any(|r| {
+        r["domain_suffix"] == serde_json::json!(["openai.com"])
+            && r["outbound"] == "chain-c-hk-jp-wg"
+    }));
+    assert!(route_rules.iter().any(|r| {
+        r["domain_suffix"] == serde_json::json!(["broken.example"])
+            && r["outbound"] == "main-exit"
+    }));
+
+    // 5. Route evaluator resolves `chain:<id>` and `latency_sort_key` keeps `-1ms` strictly last.
+    let eval = evaluate_route_target(
+        "https://api.openai.com/v1/models",
+        None,
+        &settings,
+        &rules,
+        &nodes,
+        &chains,
+        None,
+        None,
+    );
+    assert_eq!(eval.target, "chain:c-hk-jp-wg");
+    assert_eq!(eval.resolved_exit_kind, "chain");
+    assert_eq!(eval.resolved_node_id.as_deref(), Some("chain:c-hk-jp-wg"));
+    assert!(eval.resolved_exit_label.contains("HK -> JP -> DE WG"));
+
+    assert!(latency_sort_key(Some(45)) < latency_sort_key(Some(180)));
+    assert!(latency_sort_key(Some(180)) < latency_sort_key(None));
+    assert!(latency_sort_key(None) < latency_sort_key(Some(-1)));
+
+    // 6. Validate compiled multi-hop detour + WireGuard endpoint chain config with real sing-box 1.14+.
+    if let Some(sb) = find_test_singbox() {
+        let report = SingBox114Compiler::preflight_check(&sb, &compiled.config)
+            .expect("preflight check on proxy chain config");
+        assert!(
+            report.ok,
+            "sing-box check failed on multi-hop proxy chain config: {}",
+            report.stderr
+        );
+    }
+}
+
+#[test]
+fn test_subscription_refresh_preserves_node_ids_and_signed_latency_persistence() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let mut store = Store::open(&tmp.path().join("chains.db"))?;
+
+    let mut hk = NodeIR::new(
+        "stable-hk-id",
+        Protocol::Vless,
+        "HK-IPLC-01",
+        "hk1.example.com",
+        443,
+        "MainSub",
+    );
+    hk.real_delay_ms = Some(48);
+    let mut us = NodeIR::new(
+        "stable-us-id",
+        Protocol::Trojan,
+        "US-LA-01",
+        "us1.example.com",
+        443,
+        "MainSub",
+    );
+    us.real_delay_ms = Some(-1);
+    store.upsert_nodes(&[hk, us])?;
+
+    // Save a ProxyChain referencing the stable node IDs.
+    let chain = ProxyChain {
+        id: "c-hk-us".to_string(),
+        name: "HK -> US".to_string(),
+        hops: vec!["stable-hk-id".to_string(), "stable-us-id".to_string()],
+        enabled: true,
+        real_delay_ms: None,
+        description: None,
+        created_at: "2026-11-27T00:00:00Z".to_string(),
+    };
+    store.upsert_proxy_chain(&chain)?;
+
+    // Record a failed latency result (delay_ms: None -> persisted as Some(-1)) on the chain.
+    store.record_latency_result(&LatencyResult {
+        node_id: "chain:c-hk-us".to_string(),
+        kind: "real".to_string(),
+        delay_ms: None,
+        error: Some("timeout".to_string()),
+    })?;
+    let loaded_chains = store.list_proxy_chains()?;
+    assert_eq!(loaded_chains.len(), 1);
+    assert_eq!(loaded_chains[0].real_delay_ms, Some(-1));
+
+    // Simulate subscription refresh generating brand-new UUIDs for the exact same servers.
+    let refreshed_hk = NodeIR::new(
+        "brand-new-uuid-1",
+        Protocol::Vless,
+        "HK-IPLC-01",
+        "HK1.EXAMPLE.COM",
+        443,
+        "MainSub",
+    );
+    let refreshed_us = NodeIR::new(
+        "brand-new-uuid-2",
+        Protocol::Trojan,
+        "US-LA-01",
+        "us1.example.com",
+        443,
+        "MainSub",
+    );
+    let refreshed_jp = NodeIR::new(
+        "brand-new-uuid-3",
+        Protocol::Hysteria2,
+        "JP-Tokyo-01",
+        "jp1.example.com",
+        8443,
+        "MainSub",
+    );
+    store.replace_group_nodes("MainSub", &[refreshed_hk, refreshed_us, refreshed_jp])?;
+
+    let after = store.list_nodes()?;
+    assert_eq!(after.len(), 3);
+    let after_hk = after.iter().find(|n| n.remark == "HK-IPLC-01").unwrap();
+    let after_us = after.iter().find(|n| n.remark == "US-LA-01").unwrap();
+    let after_jp = after.iter().find(|n| n.remark == "JP-Tokyo-01").unwrap();
+    assert_eq!(after_hk.id, "stable-hk-id");
+    assert_eq!(after_hk.real_delay_ms, Some(48));
+    assert_eq!(after_us.id, "stable-us-id");
+    assert_eq!(after_us.real_delay_ms, Some(-1));
+    assert_eq!(after_jp.id, "brand-new-uuid-3");
+    assert_eq!(after_jp.real_delay_ms, None);
+
+    Ok(())
 }

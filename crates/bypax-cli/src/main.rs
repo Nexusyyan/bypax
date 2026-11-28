@@ -189,9 +189,9 @@ enum NodeAction {
     },
     /// Select active main exit node by ID
     Select { node_id: String },
-    /// Run batch latency test across selected or all nodes
+    /// Run batch real-delay latency test across selected or all nodes
     Test {
-        #[arg(long, default_value = "tcping")]
+        #[arg(long, default_value = "real")]
         kind: String,
         #[arg(long = "node-id")]
         node_ids: Vec<String>,

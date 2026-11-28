@@ -463,22 +463,52 @@ function buildTraySvg(cfg) {
 </svg>`;
 }
 
-function buildTrayRasterSvg(cfg, opts) {
-  const { strokeColor, dotColor, ringColor, size } = opts;
+function buildRainbowTrayRasterSvg(cfg, opts) {
+  const { dotColor, size, idPrefix = "bypax-tray" } = opts;
+  const pal = getPalette(cfg);
   const paths = buildTrayPaths(cfg);
+  const maskDef = dotColor
+    ? `
+    <mask id="${idPrefix}-dot-cut" maskUnits="userSpaceOnUse" x="0" y="0" width="24" height="24">
+      <rect x="0" y="0" width="24" height="24" fill="#FFFFFF" />
+      <circle cx="20.4" cy="20.4" r="3.45" fill="#000000" />
+    </mask>`
+    : "";
+  const maskAttr = dotColor ? ` mask="url(#${idPrefix}-dot-cut)"` : "";
+  const ribbonTransform = dotColor ? ' transform="translate(-0.45 -0.55) scale(0.95)"' : "";
   const dotMarkup = dotColor
-    ? ringColor
-      ? `
-  <circle cx="19.6" cy="19.6" r="4.1" fill="${ringColor}" />
-  <circle cx="19.6" cy="19.6" r="2.9" fill="${dotColor}" />`
-      : `
-  <circle cx="19.6" cy="19.6" r="3.2" fill="${dotColor}" />`
+    ? `
+  <circle cx="20.4" cy="20.4" r="2.55" fill="${dotColor}" />`
     : "";
 
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none">
-  <path d="${paths.lowerLeft}" stroke="${strokeColor}" stroke-width="2.65" stroke-linecap="round" />
-  <path d="${paths.lowerRight}" stroke="${strokeColor}" stroke-width="2.65" stroke-linecap="round" />
-  <path d="${paths.upper}" stroke="${strokeColor}" stroke-width="2.75" stroke-linecap="round" />${dotMarkup}
+  <defs>
+    <linearGradient id="${idPrefix}-lower" x1="3.4" y1="5.8" x2="20.6" y2="18.2" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="${pal.emerald}" />
+      <stop offset="35%" stop-color="${pal.gold}" />
+      <stop offset="68%" stop-color="${pal.cobalt}" />
+      <stop offset="100%" stop-color="${pal.sky}" />
+    </linearGradient>
+    <linearGradient id="${idPrefix}-upper" x1="3.4" y1="18.2" x2="20.6" y2="5.8" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="${pal.sky}" />
+      <stop offset="28%" stop-color="${pal.emerald}" />
+      <stop offset="52%" stop-color="${pal.gold}" />
+      <stop offset="76%" stop-color="${pal.tangerine}" />
+      <stop offset="100%" stop-color="${pal.coral}" />
+    </linearGradient>
+    <radialGradient id="${idPrefix}-hl" cx="12" cy="12" r="5.6" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="${pal.cobalt}" stop-opacity="0.34" />
+      <stop offset="100%" stop-color="${pal.cobalt}" stop-opacity="0" />
+    </radialGradient>${maskDef}
+  </defs>
+  <g${maskAttr}>
+    <g${ribbonTransform}>
+      <path d="${paths.lowerLeft}" stroke="url(#${idPrefix}-lower)" stroke-width="2.95" stroke-linecap="round" />
+      <path d="${paths.lowerRight}" stroke="url(#${idPrefix}-lower)" stroke-width="2.95" stroke-linecap="round" />
+      <path d="${paths.upper}" stroke="url(#${idPrefix}-upper)" stroke-width="3.05" stroke-linecap="round" />
+      <path d="${paths.upper}" stroke="url(#${idPrefix}-hl)" stroke-width="3.05" stroke-linecap="round" />
+    </g>
+  </g>${dotMarkup}
 </svg>`;
 }
 
@@ -999,80 +1029,42 @@ async function main() {
     { id: "mesh-256", width: 256, height: 256, svg: logoMeshSvg },
     { id: "mesh-512", width: 512, height: 512, svg: logoMeshSvg },
     { id: "mesh-1024", width: 1024, height: 1024, svg: logoMeshSvg },
-    // System tray variants (9 files)
+    // System tray variants (6 transparent full-rainbow Overpass X PNGs: 44px @2x macOS + 32px Win/Linux)
     {
-      id: "tray-template",
+      id: "tray-color-2x",
       width: 44,
       height: 44,
-      svg: buildTrayRasterSvg(cfg, { strokeColor: "#000000", size: 44 }),
+      svg: buildRainbowTrayRasterSvg(cfg, { size: 44, idPrefix: "tr2x" }),
     },
     {
-      id: "tray-template-active",
+      id: "tray-color-2x-active",
       width: 44,
       height: 44,
-      svg: buildTrayRasterSvg(cfg, { strokeColor: "#000000", dotColor: "#10B981", size: 44 }),
+      svg: buildRainbowTrayRasterSvg(cfg, { dotColor: "#10B981", size: 44, idPrefix: "tr2xa" }),
     },
     {
-      id: "tray-template-warn",
+      id: "tray-color-2x-warn",
       width: 44,
       height: 44,
-      svg: buildTrayRasterSvg(cfg, { strokeColor: "#000000", dotColor: "#F59E0B", size: 44 }),
+      svg: buildRainbowTrayRasterSvg(cfg, { dotColor: "#F59E0B", size: 44, idPrefix: "tr2xw" }),
     },
     {
-      id: "tray-light",
+      id: "tray-color",
       width: 32,
       height: 32,
-      svg: buildTrayRasterSvg(cfg, { strokeColor: "#0F172A", size: 32 }),
+      svg: buildRainbowTrayRasterSvg(cfg, { size: 32, idPrefix: "tr1x" }),
     },
     {
-      id: "tray-light-active",
+      id: "tray-color-active",
       width: 32,
       height: 32,
-      svg: buildTrayRasterSvg(cfg, {
-        strokeColor: "#0F172A",
-        dotColor: "#10B981",
-        ringColor: "#FFFFFF",
-        size: 32,
-      }),
+      svg: buildRainbowTrayRasterSvg(cfg, { dotColor: "#10B981", size: 32, idPrefix: "tr1xa" }),
     },
     {
-      id: "tray-light-warn",
+      id: "tray-color-warn",
       width: 32,
       height: 32,
-      svg: buildTrayRasterSvg(cfg, {
-        strokeColor: "#0F172A",
-        dotColor: "#F59E0B",
-        ringColor: "#FFFFFF",
-        size: 32,
-      }),
-    },
-    {
-      id: "tray-dark",
-      width: 32,
-      height: 32,
-      svg: buildTrayRasterSvg(cfg, { strokeColor: "#FFFFFF", size: 32 }),
-    },
-    {
-      id: "tray-dark-active",
-      width: 32,
-      height: 32,
-      svg: buildTrayRasterSvg(cfg, {
-        strokeColor: "#FFFFFF",
-        dotColor: "#34D399",
-        ringColor: "#0F172A",
-        size: 32,
-      }),
-    },
-    {
-      id: "tray-dark-warn",
-      width: 32,
-      height: 32,
-      svg: buildTrayRasterSvg(cfg, {
-        strokeColor: "#FFFFFF",
-        dotColor: "#FBBF24",
-        ringColor: "#0F172A",
-        size: 32,
-      }),
+      svg: buildRainbowTrayRasterSvg(cfg, { dotColor: "#F59E0B", size: 32, idPrefix: "tr1xw" }),
     },
     // GitHub Social Preview (1280x640 PNG)
     { id: "social-preview", width: 1280, height: 640, svg: socialSvg },
@@ -1088,15 +1080,12 @@ async function main() {
   written.push(writeBinaryFile("src-tauri/icons/icon.png", raster.get("mesh-1024").png));
 
   for (const name of [
-    "tray-template",
-    "tray-template-active",
-    "tray-template-warn",
-    "tray-light",
-    "tray-light-active",
-    "tray-light-warn",
-    "tray-dark",
-    "tray-dark-active",
-    "tray-dark-warn",
+    "tray-color-2x",
+    "tray-color-2x-active",
+    "tray-color-2x-warn",
+    "tray-color",
+    "tray-color-active",
+    "tray-color-warn",
   ]) {
     written.push(writeBinaryFile(`src-tauri/icons/${name}.png`, raster.get(name).png));
   }

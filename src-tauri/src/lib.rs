@@ -516,12 +516,21 @@ pub fn run() {
                         .and_then(|store| {
                             let settings = store.load_settings().ok()?;
                             let nodes = store.list_nodes().ok().unwrap_or_default();
+                            let chains = store.list_proxy_chains().ok().unwrap_or_default();
                             let active = settings
                                 .main_node_id
                                 .as_deref()
-                                .and_then(|id| nodes.iter().find(|n| n.id == id))
-                                .or_else(|| nodes.first())
-                                .map(|n| n.remark.clone())
+                                .and_then(|id| {
+                                    if let Some(cid) = id.strip_prefix("chain:") {
+                                        chains
+                                            .iter()
+                                            .find(|c| c.id == cid)
+                                            .map(|c| c.name.clone())
+                                    } else {
+                                        nodes.iter().find(|n| n.id == id).map(|n| n.remark.clone())
+                                    }
+                                })
+                                .or_else(|| nodes.first().map(|n| n.remark.clone()))
                                 .unwrap_or_default();
                             Some((settings.control_port, settings.system_proxy_enabled, active))
                         })
@@ -618,7 +627,9 @@ pub fn run() {
             commands::consume_update_result,
             commands::restart_to_update,
             commands::open_external_url,
-            commands::run_batch_tcping,
+            commands::save_proxy_chain,
+            commands::delete_proxy_chain,
+            commands::test_proxy_chain_delay,
             commands::run_batch_real_delay,
             commands::get_live_monitor,
             commands::get_connection_history,

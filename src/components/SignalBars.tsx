@@ -1,31 +1,29 @@
 interface SignalBarsProps {
   ms?: number | null;
-  kind?: "tcping" | "real";
   className?: string;
 }
 
-export function latencyTier(
-  ms?: number | null,
-  kind: "tcping" | "real" = "real",
-): { bars: number; colorVar: string } {
-  if (ms == null || ms <= 0) {
+export function latencyTier(ms?: number | null): { bars: number; colorVar: string } {
+  if (ms == null) {
     return { bars: 0, colorVar: "var(--latency-none)" };
   }
-  const t1 = kind === "real" ? 120 : 80;
-  const t2 = kind === "real" ? 260 : 180;
-  const t3 = kind === "real" ? 500 : 350;
-  if (ms <= t1) return { bars: 4, colorVar: "var(--latency-fast)" };
-  if (ms <= t2) return { bars: 3, colorVar: "var(--latency-ok)" };
-  if (ms <= t3) return { bars: 2, colorVar: "var(--latency-slow)" };
+  if (ms < 0) {
+    return { bars: 0, colorVar: "var(--latency-bad)" };
+  }
+  if (ms <= 120) return { bars: 4, colorVar: "var(--latency-fast)" };
+  if (ms <= 260) return { bars: 3, colorVar: "var(--latency-ok)" };
+  if (ms <= 500) return { bars: 2, colorVar: "var(--latency-slow)" };
   return { bars: 1, colorVar: "var(--latency-bad)" };
 }
 
 /**
  * Dual-encoded latency indicator (1-4 signal bars + semantic color) so speed
- * tiers are immediately distinguishable without relying on color alone.
+ * tiers and unreachable `-1ms` failures are immediately distinguishable without
+ * relying on color alone.
  */
-export function SignalBars({ ms, kind = "real", className = "" }: SignalBarsProps) {
-  const { bars, colorVar } = latencyTier(ms, kind);
+export function SignalBars({ ms, className = "" }: SignalBarsProps) {
+  const { bars, colorVar } = latencyTier(ms);
+  const failed = ms != null && ms < 0;
   const heights = [4, 6, 8, 10];
   return (
     <span
@@ -42,7 +40,11 @@ export function SignalBars({ ms, kind = "real", className = "" }: SignalBarsProp
               width: "2px",
               height: `${h}px`,
               borderRadius: "1px",
-              backgroundColor: lit ? colorVar : "var(--bg-track)",
+              backgroundColor: lit
+                ? colorVar
+                : failed
+                  ? "var(--danger-border)"
+                  : "var(--bg-track)",
             }}
           />
         );

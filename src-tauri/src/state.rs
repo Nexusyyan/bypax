@@ -369,6 +369,7 @@ impl AppState {
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
         let nodes = store.list_nodes().map_err(|e| e.to_string())?;
+        let chains = store.list_proxy_chains().map_err(|e| e.to_string())?;
         let rules = store.list_rules().map_err(|e| e.to_string())?;
         let app_rules = store.list_app_proxy_rules().map_err(|e| e.to_string())?;
         let extra_ports = store.list_inbound_ports().map_err(|e| e.to_string())?;
@@ -377,6 +378,7 @@ impl AppState {
 
         SingBox114Compiler::compile(&CompileInput {
             nodes: &nodes,
+            chains: &chains,
             rules: &rules,
             app_rules: &app_rules,
             extra_ports: &extra_ports,
@@ -1070,14 +1072,17 @@ impl AppState {
         app_rules: &[AppProxyRule],
         sing_box_pid: u32,
     ) -> Result<AppProxyStartConfig, String> {
-        let nodes = {
+        let (nodes, chains) = {
             let store = self
                 .store
                 .lock()
                 .map_err(|_| "store lock poisoned".to_string())?;
-            store.list_nodes().map_err(|e| e.to_string())?
+            (
+                store.list_nodes().map_err(|e| e.to_string())?,
+                store.list_proxy_chains().map_err(|e| e.to_string())?,
+            )
         };
-        let bindings = build_app_proxy_target_bindings(app_rules, &nodes);
+        let bindings = build_app_proxy_target_bindings(app_rules, &nodes, &chains);
         let wire_rules: Vec<AppProxyRuleWire> =
             app_rules.iter().map(AppProxyRuleWire::from).collect();
         let mut exempt_pids = vec![std::process::id()];
@@ -1419,7 +1424,11 @@ impl AppState {
             if client.wait_ready(2000).await {
                 let _ = client.set_mode(settings.route_mode.as_str()).await;
                 if let Some(ref main_id) = settings.main_node_id {
-                    let _ = client.select_proxy("main-exit", main_id).await;
+                    let selector_tag = main_id
+                        .strip_prefix("chain:")
+                        .map(bypax_core::compiler::chain_outbound_tag)
+                        .unwrap_or_else(|| main_id.clone());
+                    let _ = client.select_proxy("main-exit", &selector_tag).await;
                 }
             }
         }
